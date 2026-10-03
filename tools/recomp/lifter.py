@@ -1814,6 +1814,31 @@ class Lifter:
                     f"  /* {m} */",
                 ]
 
+        # IN / OUT: the chipset that is not in the NV2A aperture.
+        #
+        # A title with its hardware libraries linked in reaches the
+        # southbridge's ACPI, GPIO and SMBus blocks through I/O space. These
+        # used to fall through to the TODO below, which is worse than leaving
+        # them out: the destination register kept whatever the previous
+        # instruction left in it, so a status read returned a different answer
+        # on every call and nothing in the output said so.
+        #
+        # The port is either an immediate or DX and the data register is AL,
+        # AX or EAX, which is the whole of the encoding.
+        if m in ("in", "out"):
+            port_op = ops[1] if m == "in" else ops[0]
+            data_op = ops[0] if m == "in" else ops[1]
+            port = (_fmt_imm(port_op.imm) if port_op.type == "imm"
+                    else "LO16(edx)")
+            bits = (_operand_width(data_op) or 4) * 8
+            if m == "in":
+                call = f"xbox_IoRead{bits}((uint16_t)({port}))"
+                return [_fmt_operand_write(data_op, call)
+                        + f"  /* {m} {insn.op_str} */"]
+            return [f"xbox_IoWrite{bits}((uint16_t)({port}), "
+                    f"({_fmt_operand_read(data_op)}));"
+                    f"  /* {m} {insn.op_str} */"]
+
         # ── Unhandled ──
         #
         # Recorded, not merely commented -- see self.unimplemented.
