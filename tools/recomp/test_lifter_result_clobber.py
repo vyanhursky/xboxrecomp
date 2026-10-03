@@ -127,15 +127,20 @@ int main(void) {{
 ''')
 
 
-def _build_and_run(source):
+def _build_and_run(source, extra_sources=None):
     cc = _cc()
     with tempfile.TemporaryDirectory(prefix="result-clobber-") as tmp:
         c = Path(tmp) / "t.c"
-        c.write_text(source)
+        c.write_text(source, encoding='utf-8')
+        sources = [str(c)]
+        for name, contents in (extra_sources or {}).items():
+            other = Path(tmp) / name
+            other.write_text(contents, encoding='utf-8')
+            sources.append(str(other))
         exe = Path(tmp) / "t.exe"
-        args = ([cc, "/nologo", "/W0", "/O2", str(c), "/Fe:" + str(exe)]
+        args = ([cc, "/nologo", "/W0", "/O2", *sources, "/Fe:" + str(exe)]
                 if Path(cc).stem.lower() == "cl"
-                else [cc, "-w", "-O2", str(c), "-o", str(exe)])
+                else [cc, "-w", "-O2", *sources, "-o", str(exe)])
         built = subprocess.run(args, cwd=tmp, capture_output=True, text=True)
         assert built.returncode == 0, built.stdout + built.stderr + "\n" + source
         return subprocess.run([str(exe)], capture_output=True, text=True)
