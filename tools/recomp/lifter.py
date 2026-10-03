@@ -2765,6 +2765,30 @@ class Lifter:
             targets.append(got[0])
         return targets
 
+    def _switch_index_pairs(self, op, targets):
+        """Recover guest slot ordinals only from an exact matching XBE table.
+
+        Upstream may recover arms above or below the operand displacement.
+        List order alone is not an index: prove its slot address explicitly.
+        """
+        if (op.type != "mem" or op.mem_size != 4 or op.mem_scale != 4
+                or not op.mem_index or op.mem_base or not op.mem_disp
+                or not 2 <= len(targets) <= 64):
+            return []
+        base = op.mem_disp
+        possibilities = [
+            (self._leading_arms(self._read_jump_table(base)), 0, 1),
+            (self._leading_arms(self._read_jump_table(base + 4)), 1, 1),
+            (self._leading_arms(self._read_jump_table_backward(base - 4)), -1, -1),
+        ]
+        for actual, first, step in possibilities:
+            if len(actual) >= 2:
+                # Match the same first qualifying census that upstream used.
+                if actual != targets:
+                    return []
+                return [(first + i * step, target) for i, target in enumerate(actual)]
+        return []
+
     def _lift_jmp(self, insn, ops):
         if insn.jump_target:
             if self._is_external_target(insn.jump_target):
@@ -2804,7 +2828,9 @@ class Lifter:
                 lines = [f"{{ uint32_t _jt = {target_expr}; /* switch: {len(switch_targets)} entries, {len(unique_targets)} targets */"]
                 for t in unique_targets:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
+                for index, target in self._switch_index_pairs(ops[0], switch_targets):
+                    lines.append(f"if ((int32_t){ops[0].mem_index} == {index}) goto loc_{target:08X}; /* proven switch slot */")
+                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL_AT(_jt, 0x{insn.address:08X}u); return; }}")
                 return lines
             # `jmp <reg>` where the register was loaded with an address
             # inside this same function: a hand-written continuation chain,
@@ -2829,11 +2855,11 @@ class Lifter:
                              f" {len(inside)} targets */"]
                     for t in inside:
                         lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL_AT(_jt, 0x{insn.address:08X}u); return; }}")
                     return lines
             target = _fmt_operand_read(ops[0])
             return [self._forced_tail(
-                f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
+                f"g_seh_ebp = ebp; RECOMP_ITAIL_AT({target}, 0x{insn.address:08X}u); return;"
                 f" /* indirect tail jmp */")]
         return ["/* jmp: no target */"]
 

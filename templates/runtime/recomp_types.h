@@ -1105,6 +1105,15 @@ extern volatile uint64_t g_icall_guard_misses;
  * Used for tail-call optimization where the original code uses
  * jmp [reg] instead of call [reg].
  */
+/* Runtime-owned per-thread site shared by all generated translation units. */
+#define RECOMP_ITAIL_RUNTIME_OWNED 1
+extern RECOMP_TLS uint32_t g_itail_site;
+#define RECOMP_ITAIL_AT(xbox_va, site) do { \
+    g_itail_site = (uint32_t)(site); \
+    RECOMP_ITAIL(xbox_va); \
+    g_itail_site = 0; \
+} while (0)
+
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
