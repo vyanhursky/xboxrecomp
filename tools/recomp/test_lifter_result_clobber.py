@@ -78,6 +78,8 @@ def _cc():
     if not cc and Path(r"C:\Program Files\LLVM\bin\clang.exe").exists():
         cc = r"C:\Program Files\LLVM\bin\clang.exe"
     if not cc:
+        cc = shutil.which("cl")
+    if not cc:
         pytest.skip("C compiler unavailable")
     return cc
 
@@ -131,8 +133,10 @@ def _build_and_run(source):
         c = Path(tmp) / "t.c"
         c.write_text(source)
         exe = Path(tmp) / "t.exe"
-        built = subprocess.run([cc, "-w", "-O2", str(c), "-o", str(exe)],
-                               capture_output=True, text=True)
+        args = ([cc, "/nologo", "/W0", "/O2", str(c), "/Fe:" + str(exe)]
+                if Path(cc).stem.lower() == "cl"
+                else [cc, "-w", "-O2", str(c), "-o", str(exe)])
+        built = subprocess.run(args, cwd=tmp, capture_output=True, text=True)
         assert built.returncode == 0, built.stderr + "\n" + source
         return subprocess.run([str(exe)], capture_output=True, text=True)
 
