@@ -63,8 +63,8 @@ def test_loop_head_inherits_flags_from_both_predecessors():
              b"\xEB\xFA"          # jmp -6 -> the jz
              b"\xC3")             # ret
     code = _translate(image)
-    assert "_flags" not in code.replace("int _flags = 0", ""), code
-    assert "CMP_EQ" in code or "== 0" in code, code
+    assert "if ((_fa == 0))" in code, code
+    assert "if (((_fv" not in code, code  # fixed point still finds the compatible snapshot
 
 
 def test_disagreeing_predecessors_keep_the_fallback():
@@ -81,7 +81,7 @@ def test_disagreeing_predecessors_keep_the_fallback():
              b"\x74\x00"          # jz +0 -> +7
              b"\xC3")             # ret
     code = _translate(image)
-    assert "_flags /*" in code, code
+    assert "(_fv & 1u) == 1u && (_flags)" in code, code
 
 
 if __name__ == "__main__":

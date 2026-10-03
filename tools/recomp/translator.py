@@ -1236,11 +1236,7 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
-            if (cc in FunctionTranslator._CARRY_CC
-                    and (last_setter in CF_TRACKED
-                         or last_setter in ("inc", "dec")
-                         or last_setter in BT_MODIFY
-                         or last_setter == "rep-compare")):
+            if cc in FunctionTranslator._CARRY_CC:
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
@@ -2147,12 +2143,13 @@ class FunctionTranslator:
         # String compares write _flags themselves (the rep forms, and since
         # they are lifted, the bare ones), with or without a jcc after them.
         has_conditionals = any(
-            insn.is_cond_jump or insn.mnemonic.startswith("set")
+            insn.is_cond_jump or insn.mnemonic in ("loope", "loopne") or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
             or "cmps" in insn.mnemonic or "scas" in insn.mnemonic
             for insn in instructions)
         if has_conditionals:
-            lines.append(f"    int _flags = 0; /* fallback flag var */")
+            lines.append("    int _flags = 0, _sf = 0, _of = 0;")
+            lines.append("    unsigned _fv = 0; /* dynamic ZF/SF/OF validity */")
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -2164,7 +2161,7 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec")
+                                 "lock cmpxchg", "xadd", "lock xadd", "inc", "dec")
                or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
@@ -2208,6 +2205,7 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
+        self.lifter.needs_dynamic_flags = has_conditionals
         self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
         # SSE and MMX are architectural state, declared globally by the

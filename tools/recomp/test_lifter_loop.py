@@ -69,7 +69,7 @@ def test_loope_without_a_tracked_setter_keeps_the_fallback():
     # invent a termination condition, but ECX still counts down.
     code = _translate(b"\x90\xE1\x04\x90\x90\x90\x90\xC3")
     assert "ecx -= 1;" in code, code
-    assert "(ecx != 0) && (_flags)" in code, code
+    assert "(ecx != 0)" in code and "(_fv & 1u) == 1u && (_flags)" in code, code
 
 
 if __name__ == "__main__":

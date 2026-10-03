@@ -233,9 +233,8 @@ class NeedsCarryTest(unittest.TestCase):
         self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("add"), self._insn("jae")]))
 
-    def test_carry_branch_after_cmp_does_not(self):
-        # cmp lowers jae directly from its own operands.
-        self.assertFalse(FunctionTranslator._function_needs_cf(
+    def test_carry_branch_after_cmp_keeps_dynamic_cf_for_other_incoming_edges(self):
+        self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("add"), self._insn("cmp"), self._insn("jae")]))
 
     def test_carry_cmov_after_add_needs_cf(self):
@@ -244,8 +243,8 @@ class NeedsCarryTest(unittest.TestCase):
         self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("add"), self._insn("cmovb")]))
 
-    def test_carry_cmov_after_cmp_does_not(self):
-        self.assertFalse(FunctionTranslator._function_needs_cf(
+    def test_carry_cmov_after_cmp_keeps_dynamic_cf(self):
+        self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("add"), self._insn("cmp"), self._insn("cmovb")]))
 
     def test_signed_cmov_after_add_does_not(self):
@@ -259,4 +258,3 @@ class NeedsCarryTest(unittest.TestCase):
     def test_adc_alone_needs_cf(self):
         self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("adc")]))
-

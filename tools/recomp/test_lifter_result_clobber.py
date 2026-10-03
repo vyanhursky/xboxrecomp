@@ -137,7 +137,7 @@ def _build_and_run(source):
                 if Path(cc).stem.lower() == "cl"
                 else [cc, "-w", "-O2", str(c), "-o", str(exe)])
         built = subprocess.run(args, cwd=tmp, capture_output=True, text=True)
-        assert built.returncode == 0, built.stderr + "\n" + source
+        assert built.returncode == 0, built.stdout + built.stderr + "\n" + source
         return subprocess.run([str(exe)], capture_output=True, text=True)
 
 
