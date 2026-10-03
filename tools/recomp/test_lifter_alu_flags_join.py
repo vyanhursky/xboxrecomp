@@ -25,7 +25,7 @@ def test_and_publishes_zero_flag_for_a_join():
     and_at = code.index('eax & 0x8000003Fu')
     zf_at = code.index('_flags = (_fa == 0);', and_at)
     assert zf_at < code.index('jns'), code
-    assert 'if ((_fa == 0))' in code, code
+    assert '(_fv & 1u) == 1u && (_flags)' in code, code
 
 
 def test_sub_publishes_a_compare():

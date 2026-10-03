@@ -1746,6 +1746,8 @@ class Lifter:
                 init, cond, step = "0", f"_bs_i < {width}", "_bs_i++"
             return [
                 f"{{ uint32_t _bs_v = (uint32_t)({src}); int _bs_i;",
+                *( ["  _flags = (_bs_v == 0); _fv = 1u; /* only ZF is defined */"]
+                   if self.needs_dynamic_flags else []),
                 f"  _fa = _bs_v; _fb = 0; _fas = (int32_t)_fa; _fbs = 0;"
                 f" /* {m}: ZF = src == 0 */",
                 "  if (_bs_v) {",
@@ -2114,6 +2116,17 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         cnt = _fmt_operand_read(ops[2])
         w = (_operand_width(ops[0]) or 4) * 8
+        if self.needs_dynamic_flags:
+            mask = self._SNAP_MASK[w // 8]
+            expr = (f"(_v << _c) | (_src >> ({w} - _c))" if m == "shld"
+                    else f"(_v >> _c) | (_src << ({w} - _c))")
+            carry = (f"(_v >> ({w} - _c))" if m == "shld" else "(_v >> (_c - 1))")
+            return [f"{{ uint32_t _c = (uint32_t)({cnt}) & 31u; if (_c && _c <= {w}u) {{"
+                    f" uint32_t _v = (uint32_t)({dst}) & {mask};"
+                    f" uint32_t _src = (uint32_t)({src}) & {mask}; "
+                    + (f"_cf = (int)({carry} & 1u); " if self.needs_cf else "")
+                    + _fmt_operand_write(ops[0], expr) + self._result_snapshot(ops, m)
+                    + f" if (_c == 1) {{ _of = (((_v ^ _fa) >> {w-1}) & 1u); _fv = 7; }} }} }}"]
         expr = (f"({dst} << _c) | ({src} >> ({w} - _c))" if m == "shld"
                 else f"({dst} >> _c) | ({src} << ({w} - _c))")
         # A masked count of zero leaves the destination AND the flags alone,
@@ -2276,6 +2289,12 @@ class Lifter:
         cnt = _fmt_operand_read(ops[1])
         left = 1 if m == "rcl" else 0
         write = _fmt_operand_write(ops[0], "_rcv")
+        if self.needs_dynamic_flags:
+            overflow = (f"((_rcv >> {width-1}) ^ (unsigned)_cf) & 1u" if left
+                        else f"((_rcv >> {width-1}) ^ (_rcv >> {width-2})) & 1u")
+            return [f"{{ uint32_t _c = (uint32_t)({cnt}) & 31u; if (_c) {{"
+                    f" uint32_t _rcv = RC_ROT((uint32_t)({dst}), _c, &_cf, {width}, {left}); "
+                    + write + f" _fv &= 3u; if (_c == 1) {{ _of = {overflow}; _fv |= 4u; }} }} }}"]
         return [
             f"{{ uint32_t _rcv = RC_ROT((uint32_t)({dst}), (unsigned)({cnt}),"
             f" &_cf, {width}, {left});",
@@ -2305,6 +2324,15 @@ class Lifter:
         bits = (_operand_width(ops[0]) or 4) * 8
         suffix = {8: "8", 16: "16"}.get(bits, "32")
         func = ("ROL" if m == "rol" else "ROR") + suffix
+        if self.needs_dynamic_flags:
+            carry = "(_rv & 1u)" if m == "rol" else f"((_rv >> {bits-1}) & 1u)"
+            overflow = (f"((_rv >> {bits-1}) ^ (_rv & 1u)) & 1u" if m == "rol"
+                        else f"((_rv >> {bits-1}) ^ (_rv >> {bits-2})) & 1u")
+            return [f"{{ uint32_t _c = (uint32_t)({cnt}) & 31u; if (_c) {{"
+                    f" uint32_t _rv = {func}({dst}, _c); "
+                    + _fmt_operand_write(ops[0], "_rv")
+                    + (f" _cf = (int){carry};" if self.needs_cf else "")
+                    + f" _fv &= 3u; if (_c == 1) {{ _of = {overflow}; _fv |= 4u; }} }} }}"]
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
     # ── Compare / Test (standalone) ──
@@ -3959,6 +3987,22 @@ def lift_basic_block(lifter, bb, flag_state=None):
         last_flag_setter = None
         last_flag_ops = []
 
+    def condition(jcc):
+        # Published flags carry the actual taken path, including count-zero
+        # shifts and arithmetic overflow. Static operand comparisons do not.
+        canonical = {"cmp", "test", "add", "sub", "and", "or", "xor", "inc", "dec",
+            "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd",
+            "rol", "ror", "rcl", "rcr", "bt", "bts", "btr", "btc", "bsf", "bsr",
+            "xadd", "cmpxchg", "__zf_from_dest"}
+        producer = last_flag_setter or ""
+        if (lifter.needs_dynamic_flags and
+                (producer in canonical or producer in _BARE_STRING_COMPARES
+                 or producer.startswith("rep"))):
+            dynamic = _dynamic_condition(jcc, lifter.needs_cf)
+            if dynamic != "0":
+                return dynamic, "published flags"
+        return _make_condition(jcc, last_flag_setter, last_flag_ops)
+
     while i < len(insns):
         curr = insns[i]
 
@@ -3995,9 +4039,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if curr.mnemonic in LOOP_JUMPS:
             zf_expr = None
             if curr.mnemonic != "loop" and last_flag_setter:
-                probe = _make_condition(
-                    "je" if curr.mnemonic == "loope" else "jne",
-                    last_flag_setter, last_flag_ops)
+                probe = condition("je" if curr.mnemonic == "loope" else "jne")
                 if probe:
                     zf_expr = probe[0]
             stmts.extend(lifter._lift_loop(curr, zf_expr))
@@ -4016,7 +4058,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
             bits = []
             for jcc, bit in (("js", 0x80), ("je", 0x40), ("jp", 0x04),
                              ("jb", 0x01)):
-                probe = _make_condition(jcc, last_flag_setter, last_flag_ops)
+                probe = condition(jcc)
                 if probe:
                     bits.append(f"(({probe[0]}) ? 0x{bit:02X}u : 0u)")
             stmts.append("eax = (eax & 0xFFFF00FFu) | ((uint32_t)("
@@ -4027,8 +4069,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         # Check if this instruction uses flags (jcc, setcc, cmovcc)
         if curr.is_cond_jump and last_flag_setter:
-            result = _make_condition(
-                curr.mnemonic, last_flag_setter, last_flag_ops)
+            result = condition(curr.mnemonic)
             if result:
                 cond_expr, desc = result
                 target = curr.jump_target
@@ -4042,8 +4083,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                               "seta", "setl", "setge", "setle", "setg",
                               "sets", "setns", "seto", "setno")
                 and last_flag_setter and len(curr.operands) >= 1):
-            cond = _make_setcc_value(
-                curr.mnemonic, last_flag_setter, last_flag_ops)
+            result = condition("j" + curr.mnemonic[3:])
+            cond = result[0] if result else None
             if cond:
                 stmts.append(
                     _fmt_operand_write(curr.operands[0],
@@ -4056,8 +4097,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                               "cmovbe", "cmova", "cmovl", "cmovge",
                               "cmovle", "cmovg", "cmovs", "cmovns", "cmovo", "cmovno")
                 and last_flag_setter and len(curr.operands) >= 2):
-            cond = _make_cmovcc_cond(
-                curr.mnemonic, last_flag_setter, last_flag_ops)
+            result = condition("j" + curr.mnemonic[4:])
+            cond = result[0] if result else None
             if cond:
                 src = _fmt_operand_read(curr.operands[1])
                 stmts.append(
@@ -4086,10 +4127,6 @@ def lift_basic_block(lifter, bb, flag_state=None):
             results = lifter._lift_neg(
                 curr, curr.operands, preserve_carry=preserve)
         else:
-            if (lifter.needs_dynamic_flags and curr.mnemonic in ("rol", "ror", "rcl", "rcr")
-                    and len(curr.operands) >= 2):
-                stmts.append("{ uint32_t _rot_count = (uint32_t)("
-                             + _fmt_operand_read(curr.operands[1]) + ") & 31u;")
             results = lifter.lift_instruction(insns[i])
             # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
             # but `_flags` would keep whatever it last held -- 0 on entry --
@@ -4099,14 +4136,20 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # length, so comparing against an empty string took the wrong
             # arm. Load the incoming ZF first, when a tracked setter has one.
             if _is_rep_compare(curr) and last_flag_setter:
-                zf = _make_condition("je", last_flag_setter, last_flag_ops)
+                zf = condition("je")
                 if zf:
                     stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
                                  " /* ZF in: a zero count keeps it */")
         stmts.extend(results)
 
+        atomic_m = curr.mnemonic.removeprefix("lock ")
+        unsupported_atomic = (atomic_m in ("xadd", "cmpxchg") and
+            (len(curr.operands) < 2 or curr.operands[0].type != "mem"
+             or (_operand_width(curr.operands[0]) or 4) != 4))
         # Track flag-setting instructions
-        if (curr.mnemonic in _BARE_STRING_COMPARES
+        if unsupported_atomic:
+            last_flag_setter, last_flag_ops = None, []
+        elif (curr.mnemonic in _BARE_STRING_COMPARES
                 and not _has_xmm_operand(curr.operands)):
             # A single cmps/scas sets the flags like cmp. "cmpsd" is also
             # the SSE2 scalar compare, which is why it sits in
@@ -4170,15 +4213,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if lifter.needs_dynamic_flags:
             m = curr.mnemonic
             published = m in {"xadd", "lock xadd", "cmpxchg", "lock cmpxchg", "cmp", "test", "add", "sub", "and", "or", "xor",
-                "inc", "dec", "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd"}
-            preserving = (m in _EFLAGS_PRESERVE or m in ("in", "out", "stc", "clc", "cmc", "bt", "bts", "btr", "btc")
+                "inc", "dec", "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd", "bsf", "bsr"}
+            preserving = (m in _EFLAGS_PRESERVE or m in ("in", "out", "rdtsc", "cpuid", "lfence", "mfence", "stc", "clc", "cmc", "bt", "bts", "btr", "btc")
                 or curr.is_cond_jump or m.startswith(("j", "set", "cmov"))
                 or (m.startswith("f") and m not in ("fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"))
                 or (m.startswith("rep") and not _is_rep_compare(curr)))
-            if m in ("rol", "ror", "rcl", "rcr"):
-                if len(curr.operands) >= 2:
-                    stmts.append("if (_rot_count) _fv &= 3u; } /* rotations preserve ZF/SF */")
-            elif not (published or preserving or _is_rep_compare(curr)
+            if m in ("bt", "bts", "btr", "btc"):
+                stmts.append("_fv &= 1u; /* bit tests preserve only ZF */")
+            elif m in ("rol", "ror", "rcl", "rcr"):
+                pass  # Emitters publish CF/OF without disturbing ZF/SF.
+            elif unsupported_atomic or not (published or preserving or _is_rep_compare(curr)
                       or m in _BARE_STRING_COMPARES):
                 stmts.append("_fv = 0; /* unsupported dynamic flag producer */")
         if last_flag_setter and last_flag_setter.startswith("lock "):

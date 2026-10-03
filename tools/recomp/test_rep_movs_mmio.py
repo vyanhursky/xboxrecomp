@@ -27,7 +27,7 @@ void* access(uint32_t a){accesses++;return mem+index(a);}
 int main(void){
     void(*copies[])(void)={copy_1,copy_2,copy_4};
     const unsigned sizes[]={1,2,4};
-    for(unsigned w=0;w<3;w++) for(unsigned mode=0;mode<8;mode++) for(unsigned n=0;n<=8;n++){
+    for(unsigned w=0;w<3;w++) for(unsigned mode=0;mode<14;mode++) for(unsigned n=0;n<=8;n++){
         unsigned z=sizes[w];
         uint32_t s=0x100,d=0x400;
         int df=0;
@@ -38,6 +38,12 @@ int main(void){
         if(mode==5){s=0xFD000100;d=0xFD000400;}
         if(mode==6)s=0xFD000000-2*z;        /* range crosses into hardware */
         if(mode==7)d=0xFD000000-2*z;
+        if(mode==8)s=0xFD000000-n*z;        /* source ends exactly at MMIO */
+        if(mode==9)d=0xFD000000-n*z;
+        if(mode==10)s=0xFD000000-n*z+1;     /* source ends one byte into MMIO */
+        if(mode==11)d=0xFD000000-n*z+1;
+        if(mode==12)s=0xfffffff0u;          /* wrap must stay on volatile path */
+        if(mode==13)d=0xfffffff0u;
         for(unsigned i=0;i<sizeof mem;i++)mem[i]=refmem[i]=(uint8_t)(i*37+13);
         uint32_t rs=s,rd=d;
         for(unsigned i=0;i<n;i++){

@@ -63,8 +63,8 @@ def test_loop_head_inherits_flags_from_both_predecessors():
              b"\xEB\xFA"          # jmp -6 -> the jz
              b"\xC3")             # ret
     code = _translate(image)
-    assert "if ((_fa == 0))" in code, code
-    assert "if (((_fv" not in code, code  # fixed point still finds the compatible snapshot
+    assert "(_fv & 1u) == 1u && (_flags)" in code, code
+    assert "_fa = (uint32_t)(eax)" in code, code  # both paths publish their own result
 
 
 def test_disagreeing_predecessors_keep_the_fallback():
