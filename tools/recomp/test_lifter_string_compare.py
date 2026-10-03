@@ -13,7 +13,7 @@ class StringCompareLifterTest(unittest.TestCase):
         generated = "\n".join(lifted)
 
         self.assertIn("while (ecx != 0)", generated)
-        self.assertIn("_flags = (LO8(eax) == MEM8(edi));", generated)
+        self.assertIn("_flags = (_a == _b);", generated)
         self.assertIn("edi += _st; ecx--;", generated)
         self.assertIn("if (_flags) break;", generated)
         self.assertLess(
@@ -39,7 +39,7 @@ class StringCompareLifterTest(unittest.TestCase):
             lifter, BasicBlock(start=0, instructions=[compare, jump]))
         generated = "\n".join(lifted)
 
-        self.assertIn("_flags = (MEM8(esi) == MEM8(edi));", generated)
+        self.assertIn("_flags = (_a == _b);", generated)
         self.assertIn("esi += _st; edi += _st; ecx--;", generated)
         self.assertIn("if (!_flags) break;", generated)
         self.assertIn("if ((_flags != 0)) goto loc_00000010;", generated)
@@ -65,7 +65,7 @@ class StringCompareLifterTest(unittest.TestCase):
         # Was a bare comment, so the jcc after it read whatever the previous
         # instruction had left in the flags. It compares four bytes at a time
         # and steps esi/edi by four, and the following je reads _flags.
-        self.assertIn("_flags = (MEM32(esi) == MEM32(edi));", generated)
+        self.assertIn("_flags = (_a == _b);", generated)
         self.assertIn("esi += _st; edi += _st; ecx--;", generated)
         # The step is four bytes, in whichever direction EFLAGS.DF says.
         self.assertIn("RECOMP_DF_STEP(4)", generated)

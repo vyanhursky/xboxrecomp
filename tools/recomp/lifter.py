@@ -355,13 +355,13 @@ FLAG_SETTERS = frozenset({
 _RESULT_SNAPSHOT_SETTERS = frozenset({
     "and", "or", "xor", "adc", "sbb", "neg",
     "shl", "sal", "shr", "sar", "shld", "shrd",
-    "add", "sub",
+    "add", "sub", "xadd",
 })
 # ...and the two whose conditions also need the SOURCE, to recover the
 # original destination from the result. Theirs goes into _fb, captured before
 # the write because `sub eax, eax` would otherwise snapshot an operand it has
 # already destroyed.
-_RESULT_SRC_SETTERS = frozenset({"add", "sub"})
+_RESULT_SRC_SETTERS = frozenset({"add", "sub", "xadd"})
 
 CF_TRACKED = frozenset({
     "add", "sub", "adc", "sbb", "shl", "shr", "sar",
@@ -390,14 +390,13 @@ _EFLAGS_SETTERS = frozenset({
     "bsf", "bsr",       # Bit scan sets ZF
     "bt", "bts", "btr", "btc",  # Bit test sets CF
     "cmpxchg",           # Compare-and-exchange sets ZF
-    "xadd",              # Exchange-and-add sets flags
+    "xadd", "lock xadd", "lock cmpxchg",  # Atomic forms set flags
 })
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
     # popfd REPLACES every flag with whatever was pushed. Its flags are not
     # architecturally undefined -- they are simply not knowable from the
     # instruction stream -- but the tracking action is the same: whatever the
@@ -501,6 +500,31 @@ def _has_xmm_operand(ops):
                for op in (ops or ()))
 
 
+def _dynamic_condition(jcc, needs_cf=True):
+    """Conditions at an unknown CFG join read flags published by the path taken.
+
+    Unsupported producers clear validity rather than expose stale arithmetic
+    flags. Parity remains on upstream's tracked-producer path.
+    """
+    aliases = {"jz": "je", "jnz": "jne", "jnae": "jb", "jc": "jb",
+               "jnb": "jae", "jnc": "jae", "jna": "jbe", "jnbe": "ja",
+               "jnge": "jl", "jnl": "jge", "jng": "jle", "jnle": "jg"}
+    jcc = aliases.get(jcc, jcc)
+    if needs_cf and jcc in ("jb", "jae"):
+        return "_cf" if jcc == "jb" else "!_cf"
+    flags = {"je": (1, "_flags"), "jne": (1, "!_flags"),
+             "js": (2, "_sf"), "jns": (2, "!_sf"),
+             "jo": (4, "_of"), "jno": (4, "!_of"),
+             "jl": (6, "_sf != _of"), "jge": (6, "_sf == _of"),
+             "jle": (7, "_flags || _sf != _of"),
+             "jg": (7, "!_flags && _sf == _of")}
+    if needs_cf:
+        flags.update({"jbe": (1, "_cf || _flags"),
+                      "ja": (1, "!_cf && !_flags")})
+    required, predicate = flags.get(jcc, (0, "0"))
+    return f"((_fv & {required}u) == {required}u && ({predicate}))" if required else "0"
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -523,12 +547,16 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # same join would be reading a flag one predecessor never set; returning
     # None there leaves the existing fallback in place.
     if flag_setter == "__zf_from_dest" and flag_ops:
-        dest = _fmt_operand_read(flag_ops[0])
+        dest = "_fa"  # Every compatible producer snapshots before a later MOV.
         if jcc in ("je", "jz"):
             return f"({dest} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({dest} != 0)", desc
         return None
+
+    if ("cmps" in flag_setter or "scas" in flag_setter) and jcc in (
+            "js", "jns", "jo", "jno", "jl", "jge", "jle", "jg"):
+        return _dynamic_condition(jcc), desc
 
     # A cmp/test that is not fused with its jcc snapshots its operands into
     # _fa/_fb (zero-extended) and _fas/_fbs (sign-extended) at the point the
@@ -1294,7 +1322,8 @@ class Lifter:
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
-        self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        self.needs_cf = False
+        self.needs_dynamic_flags = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
         self.force_return_value = None   # Set per-function by --force-return
@@ -1573,6 +1602,11 @@ class Lifter:
             return self._lift_shrd(insn, ops)
         if m == "bt":
             if len(ops) >= 2:
+                if self.needs_cf:
+                    source, bit = _fmt_operand_read(ops[0]), _fmt_operand_read(ops[1])
+                    if ops[0].type == "mem" and ops[1].type != "imm":
+                        source = f"MEM32(({_fmt_mem(ops[0])}) + (((int32_t)({bit}) >> 5) * 4))"
+                    return [f"_cf = (int)((({source}) >> (({bit}) & 31u)) & 1u); /* bt */"]
                 return [f"/* bt {_fmt_operand_read(ops[0])}, {_fmt_operand_read(ops[1])} - bit test */"]
             return [f"/* bt {insn.op_str} */"]
         if m == "emms":
@@ -1591,10 +1625,10 @@ class Lifter:
                 address = "ebx + LO8(eax)"
             return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
         if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
-                 "setl", "setge", "setle", "setg", "sets", "setns"):
+                 "setl", "setge", "setle", "setg", "sets", "setns", "seto", "setno"):
             return self._lift_setcc(insn, ops, m)
         if m in ("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
-                 "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns"):
+                 "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns", "cmovo", "cmovno"):
             return self._lift_cmovcc(insn, ops, m)
 
         # ── SSE (scalar float) ──
@@ -1742,8 +1776,14 @@ class Lifter:
                 if atomic_m == "xadd":
                     # dst = dst + src, and src receives dst's old value.
                     return [
-                        "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
-                        f"XBOX_PTR({addr}), {src});",
+                        f"{{ uint32_t _addend = (uint32_t)({src});"
+                        " uint32_t _old = RECOMP_ATOMIC_ADD32("
+                        f"XBOX_PTR({addr}), _addend);",
+                        "  _fa = _old + _addend; _fb = _addend; _fas = (int32_t)_fa; _fbs = (int32_t)_fb;",
+                        ("  _flags = (_fa == 0); _sf = (_fas < 0);"
+                         " _of = ((~(_old ^ _addend) & (_old ^ _fa) & 0x80000000u) != 0); _fv = 7;"
+                         if self.needs_dynamic_flags else ""),
+                        ("  _cf = ((uint64_t)_old + _addend > 0xFFFFFFFFu);" if self.needs_cf else ""),
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
@@ -1758,6 +1798,11 @@ class Lifter:
                     f"XBOX_PTR({addr}), _cmp, {src});",
                     "  _fa = _old; _fb = _cmp;",
                     "  _fas = (int32_t)_fa; _fbs = (int32_t)_fb;",
+                    ("  _flags = (_cmp == _old);"
+                     " _sf = (((_cmp - _old) & 0x80000000u) != 0);"
+                     " _of = (((_cmp ^ _old) & (_cmp ^ (_cmp - _old)) & 0x80000000u) != 0); _fv = 7;"
+                     if self.needs_dynamic_flags else ""),
+                    ("  _cf = (_cmp < _old);" if self.needs_cf else ""),
                     "  if (_old != _cmp) eax = _old; }"
                     f"  /* {m} */",
                 ]
@@ -1901,8 +1946,23 @@ class Lifter:
                     f" _fbs = (int32_t){sx}(_fb);"
                     f" /* {m} source, before the write */")
         dst = _fmt_operand_read(ops[0])
-        return (f"_fa = (uint32_t)({dst}) & {mask};"
-                f" _fas = (int32_t){sx}(_fa); /* {m} result */")
+        snapshot = (f"_fa = (uint32_t)({dst}) & {mask};"
+                    f" _fas = (int32_t){sx}(_fa); /* {m} result */")
+        if self.needs_dynamic_flags:
+            sign = f"0x{1 << (size*8-1):X}u"
+            snapshot += " _flags = (_fa == 0); _sf = (_fas < 0);"
+            if m in ("and", "or", "xor"):
+                snapshot += " _of = 0; _fv = 7;"
+            elif m in ("add", "sub"):
+                recover = "-" if m == "add" else "+"
+                inversion = "~" if m == "add" else ""
+                snapshot += (f" {{ uint32_t _a = (_fa {recover} _fb) & {mask};"
+                    f" _of = (({inversion}(_a ^ _fb) & (_a ^ _fa) & {sign}) != 0); _fv = 7; }}")
+            elif m == "neg":
+                snapshot += f" _of = (_fa == {sign}); _fv = 7;"
+            else:
+                snapshot += " _fv = 3; /* OF not modelled for this producer */"
+        return snapshot
 
     def _lift_alu_binop(self, insn, ops, m):
         if len(ops) < 2:
@@ -1950,6 +2010,8 @@ class Lifter:
         overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
         out += [f"_fa = (uint32_t)({val}) & {mask};",
                 f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
+        if self.needs_dynamic_flags:
+            out.append("_flags = (_fa == 0); _sf = (_fas < 0); _of = (_fb != 0); _fv = 7;")
         return out
 
     def _lift_neg(self, insn, ops, preserve_carry=False):
@@ -1976,6 +2038,8 @@ class Lifter:
             return ["/* sbb: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
+        if self.needs_dynamic_flags:
+            return self._lift_carry_flags(ops, "sbb")
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
@@ -1993,11 +2057,28 @@ class Lifter:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
+        if self.needs_dynamic_flags:
+            return self._lift_carry_flags(ops, "adc")
         w = (_operand_width(ops[0]) or 4) * 8
         return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
                 " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
                 % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
                 self._result_snapshot(ops, "adc")]
+
+    def _lift_carry_flags(self, ops, m):
+        """Read both original operands and incoming carry once before the write."""
+        width = (_operand_width(ops[0]) or 4) * 8
+        mask = self._SNAP_MASK[width // 8]
+        sign = f"0x{1 << (width-1):X}u"
+        op = "+" if m == "adc" else "-"
+        invert = "~" if m == "adc" else ""
+        return [f"{{ uint32_t _a = (uint32_t)({_fmt_operand_read(ops[0])}) & {mask};"
+                f" uint32_t _b = (uint32_t)({_fmt_operand_read(ops[1])}) & {mask};"
+                f" uint64_t _t = (uint64_t)_a {op} (uint64_t)_b {op} (uint64_t)_cf;"
+                f" _cf = (int)((_t >> {width}) & 1u); "
+                + _fmt_operand_write(ops[0], "(uint32_t)_t")
+                + self._result_snapshot(ops, m)
+                + f" _of = (({invert}(_a ^ _b) & (_a ^ _fa) & {sign}) != 0); _fv = 7; }}"]
 
     def _lift_double_shift(self, insn, ops, m):
         """SHLD/SHRD, with x86's count rules rather than C's.
@@ -2088,6 +2169,19 @@ class Lifter:
         return [f"/* {m}: unhandled */"]
 
     def _lift_shift(self, insn, ops, c_op):
+        if self.needs_dynamic_flags and len(ops) >= 2:
+            dst, cnt = _fmt_operand_read(ops[0]), _fmt_operand_read(ops[1])
+            width = (_operand_width(ops[0]) or 4) * 8
+            bit = f"{width}u - _c" if c_op == "<<" else "_c - 1u"
+            carry = (f"_cf = (_c <= {width}u) ? ((_v >> ({bit})) & 1u) : 0;"
+                     if self.needs_cf else "")
+            of = (f"((_fa ^ _v) >> {width-1}) & 1u" if c_op == "<<"
+                  else f"(_v >> {width-1}) & 1u")
+            return [f"{{ uint32_t _c = (uint32_t)({cnt}) & 31u, _v = (uint32_t)({dst});"
+                    f" if (_c) {{ {carry} "
+                    + _fmt_operand_write(ops[0], f"_v {c_op} _c")
+                    + self._result_snapshot(ops, "shift")
+                    + f" if (_c == 1) {{ _of = {of}; _fv = 7; }} }} }}"]
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
@@ -2133,6 +2227,15 @@ class Lifter:
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
+        if self.needs_dynamic_flags:
+            cnt = _fmt_operand_read(ops[1])
+            width = (_operand_width(ops[0]) or 4) * 8
+            carry = "_cf = ((uint32_t)_v >> (_c - 1u)) & 1u;" if self.needs_cf else ""
+            return [f"{{ uint32_t _c = (uint32_t)({cnt}) & 31u;"
+                    f" int32_t _v = (int32_t)(int{width}_t)({dst}); if (_c) {{ {carry} "
+                    + _fmt_operand_write(ops[0], "(uint32_t)(_v >> _c)")
+                    + self._result_snapshot(ops, "sar")
+                    + " if (_c == 1) { _of = 0; _fv = 7; } } }"]
         cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         width = (_operand_width(ops[0]) or 4) * 8
         signed = f"(int32_t)(int{width}_t)({dst})"
@@ -2263,6 +2366,14 @@ class Lifter:
                 # it cannot borrow -- which is also why `test X, X` normalises
                 # onto this form without disturbing CF.
                 out.append("_cf = 0; /* nothing borrows from zero */")
+        if self.needs_dynamic_flags:
+            op = "-" if kind == "cmp" else "&"
+            sign = f"0x{1 << (size*8-1):X}u"
+            overflow = (f"(((_fa ^ _fb) & (_fa ^ _r) & {sign}) != 0)"
+                        if kind == "cmp" else "0")
+            out.append(f"{{ uint32_t _r = (_fa {op} _fb) & {mask};"
+                       f" _flags = (_r == 0); _sf = ((_r & {sign}) != 0);"
+                       f" _of = {overflow}; _fv = 7; }}")
         return out
 
     def _lift_cmp(self, insn, ops):
@@ -2698,7 +2809,8 @@ class Lifter:
         # right bit while the generic _flags fallback -- which nothing ever
         # assigns -- is silently always false. The XCompress bit reader jumps
         # into the middle of its refill exactly this way.
-        cond = "_flags"
+        cond = (_dynamic_condition(jcc, self.needs_cf)
+                if self.needs_dynamic_flags else "_flags")
         if self.needs_cf:
             if jcc in ("jb", "jnae", "jc"):
                 cond = "_cf"
@@ -2731,7 +2843,9 @@ class Lifter:
         if jcc == "loop":
             cond, desc = "ecx != 0", "ecx is non-zero"
         else:
-            cond = f"(ecx != 0) && ({zf_expr or '_flags'})"
+            fallback = (_dynamic_condition("je" if jcc == "loope" else "jne", self.needs_cf)
+                        if self.needs_dynamic_flags else "_flags")
+            cond = f"(ecx != 0) && ({zf_expr or fallback})"
             desc = ("ecx is non-zero and zero flag set" if jcc == "loope"
                     else "ecx is non-zero and zero flag clear")
         target = insn.jump_target
@@ -2744,13 +2858,17 @@ class Lifter:
     def _lift_setcc(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
-        return [_fmt_operand_write(ops[0], f"_flags /* {m} */")]
+        cond = (_dynamic_condition("j" + m[3:], self.needs_cf)
+                if self.needs_dynamic_flags else "_flags")
+        return [_fmt_operand_write(ops[0], f"({cond}) ? 1 : 0 /* {m} */")]
 
     def _lift_cmovcc(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
         src = _fmt_operand_read(ops[1])
-        return [f"if (_flags /* {m} */) {_fmt_operand_write(ops[0], src)}"]
+        cond = (_dynamic_condition("j" + m[4:], self.needs_cf)
+                if self.needs_dynamic_flags else "_flags")
+        return [f"if ({cond} /* {m} */) {_fmt_operand_write(ops[0], src)}"]
 
     # ── String operations ──
 
@@ -2868,13 +2986,21 @@ class Lifter:
         stop_condition = "!_flags" if continue_on_equal else "_flags"
         advance = ("esi += _st; edi += _st; ecx--;" if uses_esi
                    else "edi += _st; ecx--;")
+        mask = self._SNAP_MASK[step]
+        sign = f"0x{1 << (step*8-1):X}u"
         lines = [
             f"{{ int32_t _st = RECOMP_DF_STEP({step});",
             "while (ecx != 0) {",
-            f"    _flags = ({first} == {second});",
+            f"    uint32_t _a = (uint32_t)({first}) & {mask};",
+            f"    uint32_t _b = (uint32_t)({second}) & {mask};",
+            "    _flags = (_a == _b);",
         ]
+        if self.needs_dynamic_flags:
+            lines.append(f"    {{ uint32_t _r = (_a - _b) & {mask};"
+                         f" _sf = ((_r & {sign}) != 0);"
+                         f" _of = (((_a ^ _b) & (_a ^ _r) & {sign}) != 0); _fv = 7; }}")
         if self.needs_cf:
-            lines.append(f"    _cf = ({first} < {second});")
+            lines.append("    _cf = (_a < _b);")
         lines += [
             f"    {advance}",
             f"    if ({stop_condition}) break;",
@@ -3912,7 +4038,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
                               "seta", "setl", "setge", "setle", "setg",
-                              "sets", "setns")
+                              "sets", "setns", "seto", "setno")
                 and last_flag_setter and len(curr.operands) >= 1):
             cond = _make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -3926,7 +4052,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
                               "cmovbe", "cmova", "cmovl", "cmovge",
-                              "cmovle", "cmovg", "cmovs", "cmovns")
+                              "cmovle", "cmovg", "cmovs", "cmovns", "cmovo", "cmovno")
                 and last_flag_setter and len(curr.operands) >= 2):
             cond = _make_cmovcc_cond(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -3958,6 +4084,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             results = lifter._lift_neg(
                 curr, curr.operands, preserve_carry=preserve)
         else:
+            if (lifter.needs_dynamic_flags and curr.mnemonic in ("rol", "ror", "rcl", "rcr")
+                    and len(curr.operands) >= 2):
+                stmts.append("{ uint32_t _rot_count = (uint32_t)("
+                             + _fmt_operand_read(curr.operands[1]) + ") & 31u;")
             results = lifter.lift_instruction(insns[i])
             # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
             # but `_flags` would keep whatever it last held -- 0 on entry --
@@ -4035,6 +4165,22 @@ def lift_basic_block(lifter, bb, flag_state=None):
             last_flag_setter = None
             last_flag_ops = []
 
+        if lifter.needs_dynamic_flags:
+            m = curr.mnemonic
+            published = m in {"xadd", "lock xadd", "cmpxchg", "lock cmpxchg", "cmp", "test", "add", "sub", "and", "or", "xor",
+                "inc", "dec", "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd"}
+            preserving = (m in _EFLAGS_PRESERVE or m in ("in", "out", "stc", "clc", "cmc", "bt", "bts", "btr", "btc")
+                or curr.is_cond_jump or m.startswith(("j", "set", "cmov"))
+                or (m.startswith("f") and m not in ("fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"))
+                or (m.startswith("rep") and not _is_rep_compare(curr)))
+            if m in ("rol", "ror", "rcl", "rcr"):
+                if len(curr.operands) >= 2:
+                    stmts.append("if (_rot_count) _fv &= 3u; } /* rotations preserve ZF/SF */")
+            elif not (published or preserving or _is_rep_compare(curr)
+                      or m in _BARE_STRING_COMPARES):
+                stmts.append("_fv = 0; /* unsupported dynamic flag producer */")
+        if last_flag_setter and last_flag_setter.startswith("lock "):
+            last_flag_setter = last_flag_setter[5:]
         i += 1
 
     out_flag_state = (last_flag_setter, last_flag_ops) if last_flag_setter else None

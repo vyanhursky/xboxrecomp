@@ -59,6 +59,8 @@ class BareStringCompareTest(unittest.TestCase):
         out = "\n".join(lift_basic_block(
             Lifter(), BasicBlock(start=0, instructions=[insn, jne]))[0])
         self.assertIn("uint32_t _rc = ecx; ecx = 1;", out)
-        self.assertIn("_flags = (MEM32(esi) == MEM32(edi));", out)
+        self.assertIn("_flags = (_a == _b);", out)
+        self.assertIn("uint32_t _a = (uint32_t)(MEM32(esi))", out)
+        self.assertIn("uint32_t _b = (uint32_t)(MEM32(edi))", out)
         self.assertIn("ecx = _rc;", out)
         self.assertNotIn("RECOMP_UNIMPL", out)

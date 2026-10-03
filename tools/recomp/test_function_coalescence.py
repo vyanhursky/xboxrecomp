@@ -44,7 +44,7 @@ def translator(body=CLAMP, splits=SPLITS):
 def test_repaired_clamp_matches_unsplit_translation():
     split = translator()
     old = split.translate_function(SPLITS[1], split.func_db[SPLITS[1]])
-    assert "if (_flags /* jge" in old
+    assert "(_fv & 6u) == 6u && (_sf == _of)" in old
     # Translation does not discover ownership, so it is safe to recover here.
     split.coalesce_function(BASE, END, SPLITS)
     repaired = split.translate_function(BASE, split.func_db[BASE])
@@ -52,7 +52,7 @@ def test_repaired_clamp_matches_unsplit_translation():
     reference = whole.translate_function(BASE, whole.func_db[BASE])
     assert repaired == reference
     assert "CMP_GE(" in repaired
-    assert "if (_flags /* jge" not in repaired
+    assert "(_fv & 6u) == 6u" not in repaired
     assert list(split.func_db) == [BASE]
     assert split.coalesced_function_starts == {BASE}
     assert split.func_db[BASE]["detection_method"] == "external_coalescence"
