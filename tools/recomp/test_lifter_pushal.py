@@ -56,7 +56,7 @@ int main(void) {
 
 def test_popal_preserves_a_preceding_comparison():
     code = translate('39c8 60 61 7401 c3 c3')
-    assert 'CMP_EQ' in code
+    assert '(_fv & 1u) == 1u && (_flags)' in code
 
 def _build_and_run(source):
     import shutil

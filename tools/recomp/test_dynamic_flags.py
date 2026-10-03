@@ -22,6 +22,7 @@ unsigned reads;
 #define CMP_EQ(a,b) ((a)==(b))
 #define CMP_NE(a,b) ((a)!=(b))
 #define TEST_Z(a,b) (((a)&(b))==0)
+#define RECOMP_UNIMPL(a,m) ((void)0)
 '''
 LOCALS = 'uint32_t _fa=0,_fb=0; int32_t _fas=0,_fbs=0; int _cf=c,_flags=0,_sf=0,_of=0; unsigned _fv=0;'
 CONDITIONS = ('je','jne','js','jns','jo','jno','jl','jge','jle','jg','jb','jae','jbe','ja')
@@ -220,3 +221,134 @@ def test_xadd_zero_flag_uses_atomic_result_before_memory_and_register_clobbers()
     source+='int main(void){const uint32_t v[]={0,1,0xffffffff,0x80000000};for(unsigned i=0;i<4;i++)for(unsigned j=0;j<4;j++)if(test(v[i],v[j])!=((uint32_t)(v[i]+v[j])==0))return 1;return 0;}'
     ran=_build_and_run(source)
     assert ran.returncode == 0,ran.stdout+ran.stderr
+
+
+
+def test_translated_known_arithmetic_and_partial_flag_writers():
+    from tools.recomp import config
+    from tools.recomp.translator import FunctionTranslator
+    sources, checks = [], []
+    vals = (0, 1, 0x7fffffff, 0x80000000, 0xffffffff)
+    cases = [
+        ('add32', '01c8', 'add', 32), ('sub32', '29c8', 'sub', 32),
+        ('neg32', 'f7d8', 'neg', 32), ('add16', '6601c8', 'add', 16),
+        ('sub16', '6629c8', 'sub', 16), ('neg16', '66f7d8', 'neg', 16),
+        ('add8', '00c8', 'add', 8), ('sub8', '28c8', 'sub', 8),
+        ('neg8', 'f6d8', 'neg', 8),
+        ('shift0', '39c8 c1e200', 'cmp', 32),
+        ('shift32', '39c8 c1ea20', 'cmp', 32),
+        ('shift_cl0', '39c8 b900000000 d3fa', 'cmp', 32),
+        ('rdtsc', '39c8 0f31', 'cmp', 32),
+        ('cpuid', '39c8 0fa2', 'cmp', 32),
+        ('lfence', '39c8 0faee8', 'cmp', 32),
+        ('mfence', '39c8 0faef0', 'cmp', 32),
+        ('bsf', '0fbcc1', 'bsf', 32), ('bsr', '0fbdc1', 'bsr', 32),
+    ]
+    for tag, producer, kind, bits in cases:
+        for consumer in ('jl', 'setl', 'cmovl', 'je', 'sete', 'cmove', 'loopne'):
+            if kind in ('bsf','bsr') and consumer in ('jl','setl','cmovl'):
+                continue  # SF/OF are architecturally undefined after bit scans.
+            image = bytearray.fromhex(producer)
+            # Clobber operands before consuming flags; MOV preserves EFLAGS.
+            image.extend(bytes.fromhex('b899000000 b999000000'))
+            if consumer.startswith('set'):
+                image.extend(bytes.fromhex('0f9cc0' if consumer=='setl' else '0f94c0'))
+                image.extend(bytes.fromhex('0fb6c0 c3'))
+            elif consumer.startswith('cmov'):
+                image.extend(bytes.fromhex('b800000000 b901000000'))
+                image.extend(bytes.fromhex('0f4cc1' if consumer=='cmovl' else '0f44c1'))
+                image.extend(bytes.fromhex('c3'))
+            else:
+                if consumer=='loopne': image.extend(bytes.fromhex('b902000000'))
+                image.extend(bytes.fromhex({'jl':'7c','je':'74','loopne':'e0'}[consumer]+'06'))
+                image.extend(bytes.fromhex('b800000000 c3 b801000000 c3'))
+            base=0x10000
+            config._install([config.Section('.text',base,len(image),0,len(image),True)],
+                            entry_point=base,kernel_thunk_addr=base,origin='known-flags-test')
+            db={base:{'end':base+len(image),'size':len(image)}}
+            code=FunctionTranslator(bytes(image),db).translate_function(base,db[base])
+            name='known_'+tag+'_'+consumer
+            sources.append(code.replace('sub_00010000',name))
+            for a in vals:
+                for b in vals:
+                    flags=answer(kind,a,b,0,bits) if kind not in ('bsf','bsr') else int(b==0)
+                    bit=6 if consumer in ('jl','setl','cmovl') else 1 if consumer=='loopne' else 0
+                    want=(flags>>bit)&1
+                    if kind in ('bsf','bsr') and consumer=='loopne': want=not (b==0)
+                    checks.append(f'eax=0x{a:X}u;ecx=0x{b:X}u;edx=0x99;esp=0x1000;{name}();'
+                        +f'if(eax!={int(want)}){{printf("{tag} {consumer} {a:X} {b:X}\\n");return 1;}}')
+    prelude=PRELUDE+'\nuint64_t xbox_ReadTimeStampCounter(void){return 123;}\n'
+    ran=_build_and_run(prelude+'\n'.join(sources)+'int main(void){'+''.join(checks)+'return 0;}')
+    assert ran.returncode == 0, ran.stdout+ran.stderr
+
+
+def test_translated_double_shifts_and_rotations_publish_carry_and_overflow():
+    from pathlib import Path
+    from tools.recomp import config
+    from tools.recomp.translator import FunctionTranslator
+    header=(Path(__file__).resolve().parents[2]/'templates/runtime/recomp_types.h').read_text(encoding='utf-8')
+    helpers=header[header.index('static inline uint32_t ROL32'):header.index('/* ================================================================',header.index('static inline uint16_t ROR16'))]
+    sources, checks=[],[]
+    vals=(0,1,0x7fffffff,0x80000000,0xffffffff)
+    for bits,prefix in ((16,'66'),(32,'')):
+        mask=(1<<bits)-1
+        for kind,opcode in (('shld','0fa4d0'),('shrd','0facd0'),('rol','c1c0'),('ror','c1c8'),('rcl','c1d0'),('rcr','c1d8')):
+            for count in (0,1,2,16,32):
+                for carry in (0,1):
+                    for cc,consumer in (('cf','0f92c0'),('of','0f90c0')):
+                        if cc=='of' and count not in (0,1,32): continue
+                        image=bytes.fromhex('39c8 '+('f9' if carry else 'f8')+' '+prefix+opcode+f'{count:02x}'+' '+consumer+' 0fb6c0 c3')
+                        base=0x10000
+                        config._install([config.Section('.text',base,len(image),0,len(image),True)],entry_point=base,kernel_thunk_addr=base,origin='partial-flags-test')
+                        db={base:{'end':base+len(image),'size':len(image)}}
+                        name=f'partial_{kind}_{bits}_{count}_{carry}_{cc}'
+                        code=FunctionTranslator(image,db).translate_function(base,db[base])
+                        sources.append(code.replace('sub_00010000',name))
+                        for a in vals:
+                            for b in vals:
+                                n=count&31
+                                v=a&mask
+                                cf=carry
+                                of=(answer('cmp',a,b,0,32)>>4)&1
+                                if n:
+                                    if kind in ('shld','shrd'):
+                                        if kind=='shld':
+                                            cf=(v>>(bits-n))&1
+                                            out=((v<<n)|((b&mask)>>(bits-n)))&mask
+                                        else:
+                                            cf=(v>>(n-1))&1
+                                            out=((v>>n)|((b&mask)<<(bits-n)))&mask
+                                        if n==1: of=((out^v)>>(bits-1))&1
+                                    else:
+                                        out=v
+                                        for _ in range(n):
+                                            if kind in ('rol','rcl'):
+                                                incoming=cf if kind=='rcl' else (out>>(bits-1))&1
+                                                cf=(out>>(bits-1))&1
+                                                out=((out<<1)|incoming)&mask
+                                            else:
+                                                incoming=cf if kind=='rcr' else out&1
+                                                cf=out&1
+                                                out=(out>>1)|(incoming<<(bits-1))
+                                        if n==1:
+                                            of=((out>>(bits-1))^(cf if kind in ('rol','rcl') else (out>>(bits-2))))&1
+                                want=cf if cc=='cf' else of
+                                checks.append(f'eax=0x{a:X}u;ecx=0x{b:X}u;edx=ecx;esp=0x1000;{name}();if(eax!={want}){{printf("{name} {a:X} {b:X}\\n");return 1;}}')
+    ran=_build_and_run(PRELUDE+'\n'+helpers+'\n'.join(sources)+'int main(void){'+''.join(checks)+'return 0;}')
+    assert ran.returncode==0,ran.stdout+ran.stderr
+
+
+def test_unsupported_atomics_and_bit_tests_clear_undefined_validity():
+    from tools.recomp.disasm import BasicBlock
+    from tools.recomp.lifter import lift_basic_block
+    for m in ('xadd','cmpxchg','lock xadd','lock cmpxchg'):
+        for dst in (Operand(type='reg',reg='eax'),Operand(type='mem',mem_base='esi',mem_size=1)):
+            instruction=Instruction(0,3,m,'','',operands=[dst,Operand(type='reg',reg='ecx')])
+            block=BasicBlock(0,[instruction])
+            code,state=lift_basic_block(emitter(),block,('cmp',[]))
+            assert state is None
+            assert '_fv = 0;' in '\n'.join(code)
+    for m in ('bt','bts','btr','btc'):
+        instruction=Instruction(0,3,m,'','',operands=[Operand(type='reg',reg='eax'),Operand(type='imm',imm=3)])
+        code,_=lift_basic_block(emitter(),BasicBlock(0,[instruction]))
+        assert '_fv &= 1u;' in '\n'.join(code)

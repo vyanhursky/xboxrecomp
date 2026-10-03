@@ -51,8 +51,8 @@ def test_repaired_clamp_matches_unsplit_translation():
     whole = translator(splits=[])
     reference = whole.translate_function(BASE, whole.func_db[BASE])
     assert repaired == reference
-    assert "CMP_GE(" in repaired
-    assert "(_fv & 6u) == 6u" not in repaired
+    assert "_fa = (uint32_t)(eax)" in repaired
+    assert "_sf == _of" in repaired
     assert list(split.func_db) == [BASE]
     assert split.coalesced_function_starts == {BASE}
     assert split.func_db[BASE]["detection_method"] == "external_coalescence"
@@ -333,7 +333,7 @@ def test_unreachable_padding_does_not_discard_incoming_comparison_flags():
     subject = translator(body, [BASE + 7])
     subject.coalesce_function(BASE, BASE + len(body), [BASE + 7])
     code = subject.translate_function(BASE, subject.func_db[BASE])
-    assert "CMP_GE(" in code
+    assert "_fa = (uint32_t)(eax)" in code
     assert "if (_flags /* jge" not in code
     assert BASE + 5 not in {
         insn.address for insn in subject._recovered_cfg[BASE]["instructions"]}
@@ -879,7 +879,7 @@ def test_backward_computed_edge_preserves_flag_state():
     assert f"goto loc_{target:08X};" in code
     target_body = code.split(f"loc_{target:08X}:", 1)[1]
     target_body = target_body.split(f"loc_{done:08X}:", 1)[0]
-    assert "CMP_GE(" in target_body
+    assert "_sf == _of" in target_body
     assert "if (_flags /* jge" not in target_body
 
 
@@ -1038,7 +1038,7 @@ def test_batch_wires_repair_before_ownership_and_emission(tmp_path):
     batch = batch_translator(tmp_path, translator(), END, SPLITS,
                              seh_prolog=0, seh_epilog=0)
     assert list(batch.func_db) == [BASE]
-    assert "CMP_GE(" in batch.translate_single(BASE)
+    assert "_fa = (uint32_t)(eax)" in batch.translate_single(BASE)
     assert batch.translate_single(SPLITS[0]) is None
 
 

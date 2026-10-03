@@ -27,7 +27,7 @@ void* touch(uint32_t a){accesses++;return mem+slot(a);}
 int main(void){
     void(*copies[])(void)={copy_1,copy_2,copy_4};
     const unsigned sizes[]={1,2,4};
-    for(unsigned w=0;w<3;w++) for(unsigned mode=0;mode<14;mode++) for(unsigned n=0;n<=8;n++){
+    for(unsigned w=0;w<3;w++) for(unsigned mode=0;mode<16;mode++) for(unsigned n=0;n<=8;n++){
         unsigned z=sizes[w];
         uint32_t s=0x100,d=0x400;
         int df=0;
@@ -44,6 +44,8 @@ int main(void){
         if(mode==11)d=s;                    /* same address */
         if(mode==12)s=0xFD000000-n*z;       /* ends at aperture */
         if(mode==13)d=0xFD000000-n*z;
+        if(mode==14)s=0xFD000000-n*z+1;    /* one byte into MMIO */
+        if(mode==15)d=0xFD000000-n*z+1;
         for(unsigned i=0;i<sizeof mem;i++)mem[i]=refmem[i]=(uint8_t)(i*37+13);
         uint32_t rs=s,rd=d;
         for(unsigned i=0;i<n;i++){
