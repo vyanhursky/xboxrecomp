@@ -250,6 +250,18 @@ extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS int g_df;
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
+/* Legacy I/O ports. A title whose hardware libraries are linked into it
+   reaches the southbridge's ACPI, GPIO and SMBus blocks through `in` and
+   `out` rather than through the 0xFD000000 aperture, so the lifter translates
+   those instructions into these. The runtime models them in kernel_hal.c. */
+uint8_t  xbox_IoRead8 (uint16_t port);
+uint16_t xbox_IoRead16(uint16_t port);
+uint32_t xbox_IoRead32(uint16_t port);
+void     xbox_IoWrite8 (uint16_t port, uint8_t  value);
+void     xbox_IoWrite16(uint16_t port, uint16_t value);
+void     xbox_IoWrite32(uint16_t port, uint32_t value);
+
+
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
