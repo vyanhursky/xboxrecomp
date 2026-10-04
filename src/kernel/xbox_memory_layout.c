@@ -178,6 +178,80 @@ static volatile LONG g_nv2a_ack_stop = 0;
  * that is not listed still hangs -- run the title and the watchdog sample will
  * name the register.
  */
+/* Non-zero while a GPU interrupt is being delivered, set by the raising code
+ * in kernel_bridge.c. PMC_INTR_0 is not a status a driver acknowledges: it is
+ * a read-only summary of which block is asserting, and the title's deferred
+ * routine reads it again to decide what to service. Erasing it between the
+ * service routine and the deferred routine leaves the deferred routine with
+ * nothing to do, which is how this title's frame clock stopped after a single
+ * alarm. Outside that window the loop still holds it at zero, because nothing
+ * else here asserts. */
+volatile long g_nv2a_intr_inflight;
+
+/*
+ * Register pages a title's own code has taken over.
+ *
+ * Some NV2A registers cannot be plain memory -- a write-1-to-clear status, a
+ * flush bit the hardware drops -- and a title port traps their page and models
+ * it (the game's src/hooks/nv2a_regs.c). Once a page is trapped, runtime
+ * threads touching it directly fault, which is how the ack thread below
+ * crashed at start-up reading the PFB page. The owner registers the page here,
+ * before protecting it; runtime code then goes through xbox_Nv2aRegRead/Write,
+ * and the ack loop leaves the page to its owner.
+ */
+#define NV2A_MAX_HOOKED_PAGES 8
+static struct {
+    uint32_t page_va;
+    uint32_t (*read)(uint32_t va);
+    void     (*write)(uint32_t va, uint32_t value);
+} g_nv2a_hooked[NV2A_MAX_HOOKED_PAGES];
+static volatile long g_nv2a_hooked_count;
+
+void xbox_Nv2aSetPageHooks(uint32_t page_va, uint32_t (*rd)(uint32_t va),
+                           void (*wr)(uint32_t va, uint32_t value))
+{
+    long n = g_nv2a_hooked_count;
+    if (n >= NV2A_MAX_HOOKED_PAGES)
+        return;
+    g_nv2a_hooked[n].page_va = page_va & ~0xFFFu;
+    g_nv2a_hooked[n].read = rd;
+    g_nv2a_hooked[n].write = wr;
+    MemoryBarrier();
+    g_nv2a_hooked_count = n + 1;
+}
+
+static int nv2a_hooked_index(uint32_t va)
+{
+    for (long i = 0; i < g_nv2a_hooked_count; i++)
+        if (g_nv2a_hooked[i].page_va == (va & ~0xFFFu))
+            return (int)i;
+    return -1;
+}
+
+/* Whether a title port models this register's page (and so its semantics). */
+int xbox_Nv2aRegIsHooked(uint32_t va)
+{
+    return nv2a_hooked_index(va) >= 0;
+}
+
+uint32_t xbox_Nv2aRegRead(uint32_t va)
+{
+    int i = nv2a_hooked_index(va);
+    if (i >= 0)
+        return g_nv2a_hooked[i].read(va);
+    return *(volatile uint32_t *)((uintptr_t)va + g_memory_offset);
+}
+
+void xbox_Nv2aRegWrite(uint32_t va, uint32_t value)
+{
+    int i = nv2a_hooked_index(va);
+    if (i >= 0) {
+        g_nv2a_hooked[i].write(va, value);
+        return;
+    }
+    *(volatile uint32_t *)((uintptr_t)va + g_memory_offset) = value;
+}
+
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
 
@@ -785,8 +859,324 @@ static void frame_counters_tick(void)
     }
 }
 
-static void fence_mirrors_tick(void)
+/*
+ * D3D's second view of GPU progress, kept consistent with the fence.
+ *
+ * Besides the fence in memory, Direct3D tracks the GPU through PGRAPH's
+ * PATT_COLOR0 (0xFD400B10): at each fence it sends an NV04 pattern object
+ * SET_MONOCHROME_COLOR0 with (push-buffer address << 5) | (reference & 0x1F)
+ * << 2, and reads the register back -- as the GPU's read position when DMA_GET
+ * is outside the push buffer, and in a spin that waits until the register's
+ * reference bits equal the fence's (Def Jam: Fight for NY, sub_0021E830 and
+ * sub_0021E8B0; 0x0310 values decoded to exactly that layout).
+ *
+ * The mirror's model is "the GPU completes everything as it is submitted", so
+ * the register has to say the same thing the fence does: the submitted
+ * reference, at the current read position. It used to be plain memory nobody
+ * wrote, and the spin exited only when the reference happened to be a
+ * multiple of 32 -- which this title stopped surviving once MmQueryStatistics
+ * reported real memory and its push buffer moved. Writing the register from
+ * the executor instead, in execution order, was tried: it is then consistent
+ * with nothing, because the fence is not executed (D3D also completes
+ * references through software-method NOPs the runtime does not model).
+ */
+#define NV2A_PGRAPH_PATT_COLOR0_VA 0xFD400B10u
+#define NV2A_USER_DMA_GET_VA       0xFD800044u
+
+/* The fence is a reference count, not a position: D3D numbers each fence it
+ * inserts ([device+0x2C] is the last one) and the GPU writes the number to
+ * the polled location when it reaches the fence's semaphore release. This
+ * completes every reference on submit. Once the executor has shown it runs
+ * the releases itself (xbox_Nv2aSemaphoreRelease), it stops -- a fence
+ * completed ahead of the executor let D3D reuse push-buffer space and fixup
+ * records the executor had not reached, and it then ran what replaced them:
+ * one was a NOP whose parameter was text, which D3D's DPC followed into a
+ * crash. RECOMP_FENCE_ON_SUBMIT=1 keeps completing on submit. */
+static int s_semaphore_seen;
+
+static volatile uint32_t *fence_location(int i, uint32_t *submitted)
 {
+    uint32_t dev, get_ptr;
+
+    if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+        return NULL;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                 + g_memory_offset);
+    if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)
+            || !fence_readable(dev + g_fence_mirrors[i].put_off, 4))
+        return NULL;
+    get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+                                     + g_memory_offset);
+    if (!fence_readable(get_ptr, 4))
+        return NULL;
+    if (submitted)
+        *submitted = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
+                                            + g_memory_offset);
+    return (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
+}
+
+/* NV097_BACK_END_WRITE_SEMAPHORE_RELEASE, run by the executor in push-buffer
+ * order. The semaphore offset this title sets is 0, the fence itself. */
+static volatile uint32_t s_last_release, s_releases;
+
+/* The GPU's prefetch. The NV2A pusher reads ahead of what PGRAPH executes, so
+ * by the time a fence's release runs, the commands after it are already in the
+ * GPU's FIFO; Direct3D counts on that and reuses ring space up to a completed
+ * fence plus a little -- its next lap lands 0x158 to 0x1B84 bytes past the
+ * release. An executor that completed the fence as it ran the release then read
+ * those bytes from the next lap: a float where a header belonged (a fight,
+ * 2,890 skips). So a release takes effect only once the walk has consumed
+ * RECOMP_PB_PREFETCH bytes past it (8 KB; 0 = at once), or has caught up with
+ * PUT, where there is nothing more to read. */
+static void semaphore_release_now(uint32_t value);
+
+/* Who last moved the fence, and to what: the executor's release, the follow,
+ * the idle catch-up, or the title itself (a change none of those made --
+ * Direct3D completes some references in its own software-method handler).
+ * Printed with each overrun, since an overrun means the fence said the GPU
+ * was past commands it had not read. */
+static const char *s_fence_by = "none";
+static uint32_t s_fence_by_val, s_fence_seen;
+static void fence_note(const char *by, uint32_t v)
+{
+    s_fence_by = by;
+    s_fence_by_val = v;
+    s_fence_seen = v;
+}
+static struct { uint32_t value, words; } s_pending[64];
+static volatile LONG s_pend_head, s_pend_tail;
+static uint32_t prefetch_words(void)
+{
+    static int w = -1;
+    if (w < 0) {
+        const char *e = getenv("RECOMP_PB_PREFETCH");
+        w = (int)((e && *e ? strtoul(e, NULL, 0) : 8192u) / 4u);
+    }
+    return (uint32_t)w;
+}
+
+/* Apply the releases the walk has read far enough past, or all of them. Only
+ * the executor's thread calls this and xbox_Nv2aSemaphoreRelease. */
+void xbox_Nv2aReleasePump(int at_put)
+{
+    extern volatile uint32_t g_pb_words;
+    while (s_pend_head != s_pend_tail) {
+        LONG h = s_pend_head;
+        if (!at_put && (int32_t)(g_pb_words - s_pending[h].words) < (int32_t)prefetch_words())
+            break;
+        semaphore_release_now(s_pending[h].value);
+        s_pend_head = (h + 1) % 64;
+    }
+}
+
+void xbox_Nv2aSemaphoreRelease(uint32_t value)
+{
+    extern volatile uint32_t g_pb_words;
+    LONG t = s_pend_tail, next = (t + 1) % 64;
+
+    if (!prefetch_words() || !s_semaphore_seen) {
+        semaphore_release_now(value);
+        return;
+    }
+    if (next == s_pend_head)            /* full: the oldest goes now */
+        xbox_Nv2aReleasePump(1);
+    s_pending[t].value = value;
+    s_pending[t].words = g_pb_words;
+    s_pend_tail = next;
+}
+
+static void semaphore_release_now(uint32_t value)
+{
+    int i;
+    s_last_release = value;
+    s_releases++;
+    /* The first release the executor meets ends completion-on-submit, whether
+     * or not it is accepted below. It used to end only at the first accepted
+     * one -- but completion-on-submit had already put the fence past the
+     * executor's releases, so they were all refused, and it went on bumping the
+     * fence to Direct3D's latest reference every tick: thousands of references
+     * ahead of the commands actually run, for most of the first minute (the
+     * first accepted release was 0x921 in one run). Direct3D reuses push-buffer
+     * space by that fence, so it wrote its next lap over commands the executor
+     * had not reached, and the executor then read the new lap from the middle
+     * of a packet: the first "skipping to PUT" of every run. */
+    if (!s_semaphore_seen) {
+        s_semaphore_seen = 1;
+        fprintf(stderr, "  [FENCE] the executor runs semaphore releases (first 0x%X);"
+                        " fences now complete in push-buffer order\n", value);
+    }
+    /* Only a reference Direct3D has issued and not yet seen complete: one
+     * read from memory that is not the command stream (text, once --
+     * 0x64656D63) put the fence past every reference and hung its waits. */
+    if (g_fence_mirror_count) {
+        uint32_t latest = 0;
+        volatile uint32_t *f = fence_location(0, &latest);
+        if (f && (value - *f - 1u) >= (latest - *f)) {
+            static int told;
+            if (told++ < 10)
+                fprintf(stderr, "  [FENCE] ignoring release 0x%X: fence 0x%X, latest 0x%X\n",
+                        value, *f, latest);
+            return;
+        }
+    }
+    for (i = 0; i < g_fence_mirror_count; i++) {
+        volatile uint32_t *f = fence_location(i, NULL);
+        if (f)
+            *f = value;
+    }
+    fence_note("the executor's release", value);
+}
+
+/* The executor is level with PUT and not waiting: every fence whose commands
+ * lie before PUT has been run, so the fence is at least the newest of those.
+ * Direct3D keeps the last 64 it inserted as {reference, push-buffer address}
+ * at [device + 0x64 + ((ref >> 1) & 63) * 8] (Def Jam: sub_0021EB90).
+ *
+ * This is the safety net under the in-order releases, not the model: when
+ * the executor loses its way in the stream (a transfer into memory that is
+ * not push buffer, then a skip to PUT), the releases it passed over are never
+ * run, and Direct3D's block-on-fence, which judges the GPU close enough to
+ * just spin, spins for ever. Fences after PUT are left alone: the GPU has
+ * not been given them. */
+/* Completing a fence here, rather than by the executor running its release.
+ * PGRAPH PATT_COLOR0 carries the fence's low five bits in bits 6:2 (the lap in
+ * 1:0, a ring position above), written by the pattern-colour method Direct3D
+ * pairs with every release; its block-on-fence spins until the two agree
+ * (Def Jam: sub_0021E8B0, "((fence << 2) ^ PATT) & 0x7C"). */
+static void fence_complete(volatile uint32_t *f, uint32_t v)
+{
+    *f = v;
+    xbox_Nv2aRegWrite(NV2A_PGRAPH_PATT_COLOR0_VA,
+                      (xbox_Nv2aRegRead(NV2A_PGRAPH_PATT_COLOR0_VA) & ~0x7Cu) | ((v & 0x1Fu) << 2));
+}
+
+/* Whether a fence record's commands are behind a ring position, lap-aware.
+ * Positions are ring addresses, so one numerically behind may be on the next
+ * lap: a fence Direct3D inserted after wrapping, before PUT crossed the wrap.
+ * The catch-up completed exactly those ("0x3AD at 0x82A0E000, behind PUT
+ * 0x82A8822C" with the executor near the end of the previous lap). Laps from
+ * Direct3D's own state: its wrap count [dev+0x40] and write pointer [dev]; a
+ * record at or below the write pointer is on Direct3D's lap, above it on the
+ * one before (records older than a lap are gone from its table); PUT is on
+ * Direct3D's lap unless Direct3D wrapped after kicking it; a position above
+ * PUT is on the lap before PUT's. */
+static int fence_record_behind(uint32_t dev, uint32_t rpos, uint32_t at_va, uint32_t put_va)
+{
+    uint32_t lap = *(volatile uint32_t *)((uintptr_t)(dev + 0x40) + g_memory_offset);
+    uint32_t wp = *(volatile uint32_t *)((uintptr_t)dev + g_memory_offset);
+    uint32_t rec_lap = lap - (rpos > wp ? 1u : 0u);
+    uint32_t put_lap = lap - (wp < put_va ? 1u : 0u);
+    uint32_t at_lap = put_lap - (at_va > put_va ? 1u : 0u);
+    int behind = (int32_t)(rec_lap - at_lap) < 0 || (rec_lap == at_lap && rpos <= at_va);
+    return behind;
+}
+
+static void fence_catch_up(uint32_t put_va, uint32_t pb_size)
+{
+    uint32_t dev, latest = 0, ref;
+    volatile uint32_t *f;
+    int n;
+
+    {
+        static int off = -1;
+        if (off < 0)
+            off = getenv("RECOMP_NO_FENCE_CATCHUP") != NULL;
+        if (off)
+            return;
+    }
+    if (!g_fence_mirror_count || !(f = fence_location(0, &latest)))
+        return;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[0].device_ptr_va + g_memory_offset);
+    for (ref = latest, n = 0; n < 64 && (int32_t)(ref - *f) > 0; ref -= 2, n++) {
+        uint32_t rec = dev + 0x64 + ((ref >> 1) & 63u) * 8u, rref, rpos;
+        if (!fence_readable(rec, 8))
+            return;
+        rref = *(volatile uint32_t *)((uintptr_t)rec + g_memory_offset);
+        rpos = *(volatile uint32_t *)((uintptr_t)rec + 4 + g_memory_offset);
+        if (rref != ref)
+            continue;
+        /* Before PUT in the current lap: behind it by less than the buffer. */
+        if (put_va - rpos - 1u < pb_size && fence_record_behind(dev, rpos, put_va, put_va)) {
+            static int told;
+            if (told++ < 10)
+                fprintf(stderr, "  [FENCE] caught up with PUT; completing 0x%X -> 0x%X"
+                                " (its commands at 0x%08X are behind PUT 0x%08X)\n",
+                        *f, ref, rpos, put_va);
+            fence_note("catch-up", ref);
+            fence_complete(f, ref);
+            return;
+        }
+    }
+}
+
+/* Every reference whose commands the executor has passed is complete, whether
+ * or not the executor ran its release -- the model the hardware implies, where
+ * a fence completes as the GPU's read position goes by it. Walks Direct3D's
+ * {reference, position} records up from the fence while their positions keep
+ * increasing (one lap) and stay behind the executor, and completes the last
+ * one. Never past the executor, so it cannot let Direct3D reuse space the
+ * executor has not read (see xbox_Nv2aSemaphoreRelease).
+ *
+ * Needed because some references are never released by a command the
+ * executor sees -- at start-up the first ones arrive before the executor runs
+ * releases at all, and Direct3D inserts others through software methods -- and
+ * a Direct3D handler that waits for one of them while the executor is stopped
+ * at its software method waits for ever (one start-up in about twelve stopped
+ * at frame 32 with the fence at 0x7 and 0xD issued). */
+static void fence_follow_executor(uint32_t exec_va, uint32_t put_va, int no_margin)
+{
+    uint32_t dev, latest = 0, ref, prev_pos = 0, done = 0;
+    volatile uint32_t *f;
+    int n;
+
+    {
+        static int off = -1;               /* RECOMP_NO_FENCE_FOLLOW=1 */
+        if (off < 0)
+            off = getenv("RECOMP_NO_FENCE_FOLLOW") != NULL;
+        if (off)
+            return;
+    }
+
+    if (!g_fence_mirror_count || !(f = fence_location(0, &latest)))
+        return;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[0].device_ptr_va + g_memory_offset);
+    {
+        /* Past a record by the prefetch distance, as a release is (above). */
+        uint32_t margin = prefetch_words() * 4u, base = 0;
+        if (fence_readable(dev + 0x24, 4))
+            base = *(volatile uint32_t *)((uintptr_t)(dev + 0x24) + g_memory_offset);
+        if (margin && !no_margin) {
+            if (exec_va - margin < base || exec_va - margin > exec_va)
+                return;
+            exec_va -= margin;
+        }
+    }
+    for (ref = *f + 2, n = 0; n < 64 && (int32_t)(latest - ref) >= 0; ref += 2, n++) {
+        uint32_t rec = dev + 0x64 + ((ref >> 1) & 63u) * 8u, rref, rpos;
+        if (!fence_readable(rec, 8))
+            return;
+        rref = *(volatile uint32_t *)((uintptr_t)rec + g_memory_offset);
+        rpos = *(volatile uint32_t *)((uintptr_t)rec + 4 + g_memory_offset);
+        if (rref != ref || rpos >= exec_va || (prev_pos && rpos < prev_pos)
+                || !fence_record_behind(dev, rpos, exec_va, put_va))
+            break;
+        prev_pos = rpos;
+        done = ref;
+    }
+    if (done) {
+        static int told;
+        if (told++ < 10)
+            fprintf(stderr, "  [FENCE] executor passed 0x%X..0x%X (commands before 0x%08X);"
+                            " completing\n", *f + 2, done, exec_va);
+        fence_note("follow", done);
+        fence_complete(f, done);
+    }
+}
+
+static void fence_mirrors_tick(int on_submit)
+{
+    if (s_semaphore_seen && !on_submit)
+        return;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -809,6 +1199,11 @@ static void fence_mirrors_tick(void)
                                        + g_memory_offset);
             if (*fence != put)
                 *fence = put;
+            {
+                uint32_t get = xbox_Nv2aRegRead(NV2A_USER_DMA_GET_VA);
+                xbox_Nv2aRegWrite(NV2A_PGRAPH_PATT_COLOR0_VA,
+                                  ((get & 0x07FFFFFCu) << 5) | ((put & 0x1Fu) << 2));
+            }
         }
     }
 }
@@ -873,13 +1268,68 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* Where the executor has got to in the push buffer, as a physical address
+ * like PUT; 0 until the first PUT is seen. It is GET: the GPU's read
+ * position, behind PUT while the executor is stopped at a software method
+ * (nv2a_pb_stall), level with it otherwise. */
+static uint32_t s_run_pos;
+static volatile uint32_t *s_put_reg;
+
+/* How far the executor is behind PUT, in bytes of Direct3D's ring: from where
+ * its current run began, so an overestimate by up to the run in progress. 0
+ * when it cannot tell (no device seen yet, or either position outside the
+ * ring, as inside a precompiled push buffer). On the console the GPU keeps
+ * pace and this stays small; Direct3D's space checks assume it does. */
+uint32_t xbox_Nv2aBacklog(void)
+{
+    uint32_t dev, base, limit, put, at;
+
+    if (!g_fence_mirror_count || !s_run_pos || !s_put_reg
+            || !fence_readable(g_fence_mirrors[0].device_ptr_va, 4))
+        return 0;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[0].device_ptr_va + g_memory_offset);
+    if (!fence_readable(dev + 0x24, 8))
+        return 0;
+    base = *(volatile uint32_t *)((uintptr_t)(dev + 0x24) + g_memory_offset) & 0x0FFFFFFFu;
+    limit = *(volatile uint32_t *)((uintptr_t)(dev + 0x28) + g_memory_offset) & 0x0FFFFFFFu;
+    put = *s_put_reg & 0x0FFFFFFFu;
+    at = s_run_pos;
+    {
+        /* The walk's own position while a run is in progress, if it is in the
+         * ring (inside a subroutine it is not; the run's start stands). */
+        extern volatile uint32_t g_pb_live_va;
+        uint32_t live = g_pb_live_va & 0x0FFFFFFFu;
+        uint32_t ahead = live >= at ? live - at : live + (limit - base) - at;
+        if (live >= base && live < limit && limit > base && ahead < 0x40000u)
+            at = live;
+    }
+    if (limit <= base || put < base || put > limit || at < base || at > limit)
+        return 0;
+    /* A little past PUT is caught up, not a lap behind: a run can end past
+     * it, finishing a packet PUT cut off, and a title that rewinds PUT puts it
+     * behind the executor. Read as a lap, it held the title for ever -- and a
+     * held title never moves PUT. */
+    if (at > put && at - put < 0x10000u)
+        return 0;
+    return put >= at ? put - at : put + (limit - base) - at;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    s_put_reg = (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            /* The summary belongs to the interrupt model once the status
+             * registers behind it are modelled (kernel_bridge.c); holding it
+             * at zero is only right while nothing raises anything. */
+            if (NV2A_ACK[i].offset == 0x000100
+                    && (g_nv2a_intr_inflight || nv2a_hooked_index(0xFD600100u) >= 0))
+                continue;
+            if (nv2a_hooked_index(0xFD000000u + NV2A_ACK[i].offset) >= 0)
+                continue;          /* modelled by the page's owner */
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
@@ -891,20 +1341,256 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *r |= NV2A_IDLE[i].idle_mask;
             }
         }
-        /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
-         * before the scan below had executed anything.
-         *
-         * GET is what tells the title how far the GPU has consumed, and D3D
-         * waits on it before reusing the ring. Reporting "all consumed"
-         * while the commands were still unread gave the title permission to
-         * overwrite them, and it took it: the executor then read whatever
-         * part of the segment had survived, so each pass drew a different
-         * subset of the frame. It looks like unstable geometry and is a
-         * lost-command race.
-         *
-         * The advance now happens after the scan, further down, which is
-         * also the only ordering that gives the title real back-pressure. */
-        fence_mirrors_tick();
+        {
+            volatile uint32_t *put =
+                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            volatile uint32_t *get =
+                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+            extern uint32_t nv2a_pb_run(uint32_t, uint32_t, int *);
+            extern int kernel_nv2a_swm_busy(void);
+            uint32_t p = *put & 0x0FFFFFFFu;
+
+            /* Run the push buffer from where the executor stopped, unless it
+             * stopped at a software method the title has not handled yet.
+             * Every tick, not only when PUT moves: the stall ends when the
+             * title acknowledges, whether or not it has submitted more. */
+            static int s_waiting;
+            static LARGE_INTEGER s_stall_t0, s_freq;
+            static double s_stall_ms;
+            static unsigned s_stalls, s_passes;
+            /* What the title does to the pointers behind the executor's back:
+             * GET changed from what this loop last wrote (the title rewinding
+             * the GPU), and PUT moving backwards (a wrap if the stream jumps,
+             * anything else if it does not). Counted and budgeted. */
+            static uint32_t s_get_written, s_last_put;
+            static unsigned s_get_writes, s_put_back;
+            {
+                uint32_t g = *get & 0x0FFFFFFFu;
+                if (s_get_written && g != s_get_written) {
+                    s_get_writes++;
+                    if (s_get_writes <= 20 || s_get_writes % 500 == 0)
+                        fprintf(stderr, "  [PB] title wrote GET 0x%08X (was 0x%08X), PUT 0x%08X,"
+                                        " executor at 0x%08X (#%u)\n",
+                                g, s_get_written, p, s_run_pos, s_get_writes);
+                }
+                /* Direct3D writing over commands the executor has not run: the
+                 * newly kicked range [last PUT, PUT) covers the executor's
+                 * position while the executor is still a lap behind. It only
+                 * does that if the fence says the GPU is past them. */
+                if (s_last_put && s_run_pos && p != s_last_put
+                        && ((p > s_last_put && s_last_put < s_run_pos && s_run_pos < p)
+                            || (p < s_last_put && s_run_pos < p))) {
+                    static unsigned overruns;
+                    uint32_t latest = 0;
+                    volatile uint32_t *f = g_fence_mirror_count ? fence_location(0, &latest) : NULL;
+                    overruns++;
+                    if (f && *f != s_fence_seen)
+                        fence_note("the title", *f);
+                    if (overruns <= 20 || overruns % 500 == 0)
+                        fprintf(stderr, "  [PB] D3D overran the executor: PUT 0x%08X -> 0x%08X"
+                                        " over executor 0x%08X; fence 0x%X, latest 0x%X,"
+                                        " last release 0x%X; fence last moved by %s, to 0x%X (#%u)\n",
+                                s_last_put, p, s_run_pos, f ? *f : 0, latest,
+                                s_last_release, s_fence_by, s_fence_by_val, overruns);
+                }
+                if (s_last_put && p < s_last_put) {
+                    s_put_back++;
+                    if (s_put_back <= 20 || s_put_back % 500 == 0)
+                        fprintf(stderr, "  [PB] PUT moved back 0x%08X -> 0x%08X, executor at 0x%08X"
+                                        " GET 0x%08X (#%u)\n",
+                                s_last_put, p, s_run_pos, g, s_put_back);
+                }
+                s_last_put = p;
+            }
+            s_passes++;
+            if (g_fence_mirror_count) {
+                /* A fence the title moved itself (see fence_note). */
+                volatile uint32_t *fw = fence_location(0, NULL);
+                if (fw && *fw != s_fence_seen)
+                    fence_note("the title", *fw);
+            }
+            if (!s_freq.QuadPart)
+                QueryPerformanceFrequency(&s_freq);
+            if (!s_run_pos) {
+                s_run_pos = p;
+            } else if (s_run_pos != p && !(s_waiting && kernel_nv2a_swm_busy())) {
+                int stalled;
+                uint32_t at;
+                if (s_waiting) {                 /* resuming: how long it waited */
+                    LARGE_INTEGER t1;
+                    QueryPerformanceCounter(&t1);
+                    s_stall_ms += (double)(t1.QuadPart - s_stall_t0.QuadPart) * 1000.0
+                                  / (double)s_freq.QuadPart;
+                }
+                at = nv2a_pb_run(XBOX_CONTIG_BASE | s_run_pos,
+                                 XBOX_CONTIG_BASE | p, &stalled);
+                /* At PUT with nothing more to read, what was held back for the
+                 * prefetch model takes effect. */
+                xbox_Nv2aReleasePump(!stalled && (at & 0x0FFFFFFFu) == p);
+                s_waiting = stalled;
+                if (stalled) {
+                    s_stalls++;
+                    QueryPerformanceCounter(&s_stall_t0);
+                }
+                if (!stalled && (at & 0x0FFFFFFFu) != p) {
+                    /* Stopped short of PUT without a software method: whatever
+                     * lies between is skipped, fences included. Say so. */
+                    static int told;
+                    if (told++ < 20 || told % 10 == 0)
+                        fprintf(stderr, "  [PB] run from 0x%08X stopped at 0x%08X, PUT 0x%08X;"
+                                        " skipping to PUT (#%d)\n", s_run_pos, at, p, told);
+                    {
+                        /* RECOMP_PB_SKIP_HISTORY=N: the transfer and run history
+                         * for the first N skips (3 by default). */
+                        static int hist = -1;
+                        if (hist < 0) {
+                            const char *h = getenv("RECOMP_PB_SKIP_HISTORY");
+                            hist = h ? atoi(h) : 3;
+                        }
+                        if (told <= hist) {
+                            extern void nv2a_pb_dump_history(void);
+                            nv2a_pb_dump_history();
+                        }
+                    }
+                    if (told <= 3 && getenv("RECOMP_PB_DUMP_XFER")) {
+                        /* RECOMP_PB_DUMP_XFER=1: the 64 words before the newest
+                         * transfer the walk took from this run's stretch of ring,
+                         * headers found the way the walker finds them, from the
+                         * run's start -- what the packet before a bad CALL said
+                         * its length was, and what memory holds now. */
+                        extern uint32_t nv2a_pb_last_ring_xfer(uint32_t lo, uint32_t hi);
+                        uint32_t from = XBOX_CONTIG_BASE | s_run_pos, to = XBOX_CONTIG_BASE | p;
+                        uint32_t x = nv2a_pb_last_ring_xfer(from, to > from ? to : from + 0x80000u);
+                        if (x) {
+                            uint32_t va = from, next = from;
+                            while (va <= x && va - from < 0x80000u) {
+                                uint32_t v = *(const uint32_t *)((uintptr_t)va + g_memory_offset);
+                                int hdr = (va == next);
+                                if (hdr)
+                                    next = va + 4 + 4 * ((((v & 0xE0030003u) == 0 || (v & 0xE0030003u) == 0x40000000u)
+                                                          ? ((v >> 18) & 0x7FFu) : 0));
+                                if (x - va < 64 * 4)
+                                    fprintf(stderr, "  [PBX] %08X: %08X%s%c", va, v, hdr ? "  <hdr>" : "", 10);
+                                va += 4;
+                            }
+                        }
+                    }
+                    if (told <= 2 && getenv("RECOMP_PB_DUMP_SKIP")) {
+                        /* The words from where the run began, as the walker read
+                         * them: headers with their method and count. */
+                        const uint32_t *w = (const uint32_t *)((uintptr_t)(XBOX_CONTIG_BASE | s_run_pos)
+                                                               + g_memory_offset);
+                        uint32_t k, next = 0;
+                        for (k = 0; k < 256; k++) {
+                            uint32_t v = w[k];
+                            int hdr = (k == next);
+                            if (hdr)
+                                next = k + 1 + (((v & 0xE0030003u) == 0 || (v & 0xE0030003u) == 0x40000000u)
+                                                ? ((v >> 18) & 0x7FFu) : 0);
+                            fprintf(stderr, "  [PBD] %08X: %08X%s%c", (XBOX_CONTIG_BASE | s_run_pos) + k * 4, v,
+                                    hdr ? "  <hdr>" : "", 10);
+                        }
+                    }
+                }
+                s_run_pos = stalled ? (at & 0x0FFFFFFFu) : p;
+                if (!stalled && (at & 0x0FFFFFFFu) != p) {
+                    /* Skipped to PUT: whatever subroutine the walk was in is
+                     * over. Left set, every later CALL was refused as nested. */
+                    extern void nv2a_pb_leave_subroutine(void);
+                    nv2a_pb_leave_subroutine();
+                }
+            }
+            /* Level with PUT -- idle, or stopped at a software method that was
+             * the last thing before it -- there is nothing more to read, so
+             * nothing is held back for the prefetch model. Only after a run
+             * was not enough: a run that ended stalled at PUT left the
+             * executor idle there with releases pending, and the title waited
+             * on one of them for ever (31 frames into Battle's match type). */
+            if (s_run_pos == p)
+                xbox_Nv2aReleasePump(1);
+            if (*get != (s_run_pos ? s_run_pos : *put))
+                *get = s_run_pos ? s_run_pos : *put;
+            s_get_written = *get & 0x0FFFFFFFu;
+
+            {
+                static int on_submit = -1;
+                if (on_submit < 0)
+                    on_submit = getenv("RECOMP_FENCE_ON_SUBMIT") != NULL;
+                fence_mirrors_tick(on_submit);
+                /* Only once the executor has been stopped at a software method
+                 * for 100 ms -- the hang the follow exists for (a Direct3D
+                 * handler waiting on a reference no release the executor sees
+                 * will complete); an ordinary stall lasts milliseconds. Running
+                 * all the time it completed fences ahead of the commands: 12 of
+                 * 14 overruns in a long fight came after it, and with it off
+                 * none did, skips fell from about 240 to 60, and the fight ran
+                 * its ten minutes. At every stall it still left 5. */
+                int stuck = 0;
+                if (s_waiting && s_freq.QuadPart) {
+                    LARGE_INTEGER t1;
+                    LONGLONG waited;
+                    QueryPerformanceCounter(&t1);
+                    waited = t1.QuadPart - s_stall_t0.QuadPart;
+                    /* Stopped 20 ms: nothing more will be read until the
+                     * method is handled, and the handler may be waiting on a
+                     * release the prefetch model is holding back -- a start-up
+                     * hung that way in the intro movie. Let them go. */
+                    if (waited * 50 > s_freq.QuadPart)
+                        xbox_Nv2aReleasePump(1);
+                    stuck = waited * 10 > s_freq.QuadPart;
+                }
+                /* Or when level with PUT and idle: everything before PUT has
+                 * been read, nothing is left to prefetch, and a start-up hung
+                 * there at fence 0x7 with 0xD issued (the case of 0040) until
+                 * this was allowed again. */
+                if (!s_waiting && s_run_pos == p)
+                    stuck = 1;
+                if (s_semaphore_seen && !on_submit && s_run_pos && stuck)
+                    {
+                        /* In the main stream's terms: inside a subroutine (a
+                         * precompiled push buffer, which can sit above the ring)
+                         * its own address made every ring position look passed. */
+                        extern int nv2a_pb_in_subroutine(uint32_t *ret);
+                        uint32_t ret, at = XBOX_CONTIG_BASE | s_run_pos;
+                        if (nv2a_pb_in_subroutine(&ret))
+                            at = ret;
+                        fence_follow_executor(at, XBOX_CONTIG_BASE | p, 1);
+                    }
+                if (s_semaphore_seen && !on_submit && !s_waiting && s_run_pos == p) {
+                    /* The push buffer's size is [device+0x44]; 512 KB here. */
+                    uint32_t size = 0x80000u;
+                    if (fence_readable(g_fence_mirrors[0].device_ptr_va, 4)) {
+                        uint32_t d = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[0].device_ptr_va
+                                                            + g_memory_offset);
+                        if (fence_readable(d + 0x44, 4))
+                            size = *(volatile uint32_t *)((uintptr_t)(d + 0x44) + g_memory_offset);
+                    }
+                    fence_catch_up(XBOX_CONTIG_BASE | p, size ? size : 0x80000u);
+                }
+                /* RECOMP_FENCE_TRACE: every two seconds, the executor's last
+                 * release against the fence memory and D3D's latest
+                 * reference. A gap that only grows is fences never run. */
+                {
+                    static int trace = -1;
+                    static DWORD last;
+                    DWORD now = GetTickCount();
+                    if (trace < 0)
+                        trace = getenv("RECOMP_FENCE_TRACE") != NULL;
+                    if (trace && now - last >= 2000 && g_fence_mirror_count) {
+                        uint32_t latest = 0;
+                        volatile uint32_t *f = fence_location(0, &latest);
+                        last = now;
+                        fprintf(stderr, "  [FENCE] released 0x%X (%u releases) fence 0x%X"
+                                        " latest 0x%X | run 0x%08X PUT 0x%08X%s | %u stalls,"
+                                        " %.0f ms stopped, %u passes in 2 s\n",
+                                s_last_release, s_releases, f ? *f : 0u, latest,
+                                s_run_pos, p, s_waiting ? " waiting" : "",
+                                s_stalls, s_stall_ms, s_passes);
+                        s_stalls = 0; s_stall_ms = 0; s_passes = 0;
+                    }
+                }
+            }
+        }
         dsp_ack_tick();
         poke_tick();
         counter_mirrors_tick();
@@ -952,39 +1638,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
-                     *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
-                            static unsigned wraps;
-                            if (wraps++ < 8)
-                                fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
-                        }
-                    }
+                    /* From where the last run stopped to PUT, following
+                     * jumps: a push buffer that wraps puts PUT behind it. */
+                    /* (The executor runs above, from s_run_pos.) */
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
@@ -1003,13 +1659,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan_report();
                     }
                 }
-                /* Consumed, now that it has actually been executed. */
-                {
-                    volatile uint32_t *get =
-                        (volatile uint32_t *)((char *)regs
-                                              + NV2A_USER_DMA_GET);
-                    *get = put;
-                }
+                /* GET is advanced by the resumable walker above, including stalls. */
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
@@ -1032,7 +1682,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         }
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
-            uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
+            uint32_t start = xbox_Nv2aRegRead(0xFD600800u);   /* may be trapped */
             if (start != last_start) {
                 last_start = start;
                 fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
@@ -1048,14 +1698,69 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
 
+        /* AC'97 bus-master reset bits.
+         *
+         * Each DMA channel's control register has RR, "reset registers", at bit
+         * 1. Software sets it to reset the channel and hardware clears it when
+         * the reset finishes. Against plain memory it stays set, and a title
+         * that waits for it never stops waiting.
+         *
+         * Def Jam: Fight for NY does exactly that inside DirectSound. At guest
+         * 0x00267B5A it writes CR = 2, reads the same byte back at 0x00267B6A,
+         * masks bit 1, and then spins on a two-instruction loop that reloads
+         * nothing:
+         *
+         *     test cl, cl
+         *     jne  $-2
+         *
+         * so the value it is waiting on can only have changed before the loop
+         * was entered. The title reaches its loading screen, draws it, and
+         * stops there with one thread pinned in that loop making no kernel
+         * calls at all -- which is why it reads as idle rather than as a hang.
+         *
+         * Clearing the bit here rather than emulating the controller matches
+         * what NV2A_ACK above already does for the GPU's handshakes, and is the
+         * same shape of answer: nothing here is going to report a reset that
+         * did not happen, so "already finished" is the truthful reply.
+         *
+         * MEASURED: this does NOT release that particular spin, and cannot.
+         * The title reads the byte into cl six instructions after writing it
+         * and then loops on the register, so by the time this thread runs, ten
+         * milliseconds later, the value it is testing was latched long ago and
+         * no store to memory can reach it. Releasing that loop needs the bit to
+         * read back clear at the instant of the read, which means trapping the
+         * AC'97 page and masking RR on the write rather than acking it after
+         * the fact. Kept because it is correct for any handshake whose loop
+         * re-reads, which is the usual shape, and because leaving the bit set
+         * is wrong regardless.
+         *
+         * Only bit 1 is touched. Bit 0 is RPBM, run/pause bus master, which is
+         * real state the title owns. AC'97 sits at +0x400000 in this aperture,
+         * well outside the 512 KB the APU trap covers, so this is unaffected by
+         * whether that trap is armed.
+         */
+        if (g_mcpx_regs) {
+            static const uint32_t AC97_CR[] = {
+                0x40010Bu, 0x40011Bu, 0x40012Bu, 0x40013Bu,
+                0x40014Bu, 0x40015Bu, 0x40016Bu, 0x40017Bu,
+                0x40210Bu,
+            };
+            for (size_t i = 0; i < sizeof(AC97_CR) / sizeof(AC97_CR[0]); i++) {
+                volatile uint8_t *cr =
+                    (volatile uint8_t *)((char *)g_mcpx_regs + AC97_CR[i]);
+                if (*cr & 0x02u)
+                    *cr = (uint8_t)(*cr & ~0x02u);
+            }
+        }
+
         /* Advance KeTickCount. It was written once at init and left frozen,
          * which silently breaks every timeout that polls it: Halo's DHCP setup
          * waits on a tick deadline that never arrives and spins forever bringing
          * up XNet. A live clock is also just the truth -- KeTickCount ticks on
-         * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
+         * hardware whether or not anyone is asleep. Milliseconds since the
+         * guest's boot, not the host's (kernel_hal.c). */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+                               + g_memory_offset) = (uint32_t)xbox_GuestUptimeMs();
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
@@ -2413,25 +3118,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * stays plain memory, which is what the codec-ready bit needs.
                  *
                  * Enabled by the same variable, because neither half is any
-                 * use without the other. */
-                /* Registers and the VP only (0x00000-0x2FFFF). The GP and EP
-                 * windows above them (0x30000-0x7FFFF) are the DSPs' own
-                 * X/Y/P memories, which behave as RAM on hardware and which
-                 * the APU model does not implement -- it drops writes there
-                 * and reads back 0. Trapping them bought nothing, and cost a
-                 * fault on any access the MMIO decoder cannot emulate:
-                 * Burnout 3's DirectSound bulk-copies DSP memory with
-                 * rep movsd, which the lifter lowers to a host memcpy, and
-                 * that faulted at 0xFE830B78 with no way to resume. Plain
-                 * memory keeps what the title writes. */
-                enum { APU_TRAP_BYTES = 0x00030000 };
+                 * use without the other.
+                 *
+                 * All of it, the GP and EP DSPs' memories and control words
+                 * (0x30000 up) included, though the emulated APU ignores them
+                 * and a read there returns zero. Backed as plain memory for a
+                 * while, they read back what DirectSound had written, and the
+                 * movie player waited for ever on a DSP that never answered
+                 * (4 start-ups in ~20). The copy that made that tempting -- a
+                 * host memcpy out of the GP memory, which the MMIO decoder
+                 * cannot follow -- is now a word loop in the lifter. */
+                enum { APU_TRAP_BYTES = 0x00080000 };
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
-                                    " (GP/EP DSP memory left as RAM)\n",
+                                    " (including GP/EP DSP memory)\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
@@ -3056,6 +3760,7 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Without RECOMP_HEAP_RECLAIM never freed: contiguous blocks are framebuffers
  * and pushbuffers, which a title allocates once. */
+#define XBOX_CONTIG_RESERVED 0x1000u
 /* Starts one page in. Physical page 0 is never handed out by the real
  * kernel, and the XDK's USB stack relies on that: XPP carves its host
  * controller structures from a private 0xFE0-byte arena ending at
@@ -3218,6 +3923,22 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+/* Bytes the general heap has handed out and not had back.
+ *
+ * MmQueryStatistics needs "how much of the console's 64 MB is in use", and a
+ * title sizes its own heap from the answer. Live blocks, not the bump pointer:
+ * a freed block is free memory on the console too. */
+uint32_t xbox_HeapLiveBytes(void)
+{
+    uint64_t live = 0;
+    AcquireSRWLockShared(&g_heap_lock);
+    for (int i = 0; i < g_heap_block_count; i++)
+        if (!g_heap_blocks[i].free)
+            live += g_heap_blocks[i].size;
+    ReleaseSRWLockShared(&g_heap_lock);
+    return live > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)live;
 }
 
 
