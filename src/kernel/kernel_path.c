@@ -43,6 +43,23 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* Partition 1 is the hard disk, and a title's own saved data lives on it
+     * under TDATA -- the same place T: points at, and somewhere that has to be
+     * writable. Routing it with the rest of partition 1 sent it to the game
+     * directory, which is the disc: read-only, and carrying only the empty
+     * TDATA\<titleid> stub every disc ships. Def Jam: Fight for NY opens
+     * TDATA\45410049\$u\contentmeta.xbx there, gets
+     * STATUS_OBJECT_PATH_NOT_FOUND, and could not have created it either.
+     *
+     * UDATA is where saved games live, so it is writable storage too: the
+     * same place U: points at. It used to stay with the game directory, which
+     * is the user's dump -- harmless while titles only read TitleMeta.xbx and
+     * TitleImage.xbx there, and the first save a title made would have been
+     * written into the dump. The dashboard copies a title's UDATA files from
+     * the disc to the disk on first run; xbox_PathInit does the same. */
+    { "\\Device\\Harddisk0\\Partition1\\TDATA\\", 1, "\\TitleData", "/TitleData" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA\\", 1, "\\UserData",  "/UserData"  },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA",     1, "\\UserData",  "/UserData"  },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -321,6 +338,38 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
         }
+        /* The dashboard's first-run copy: the disc's UDATA\<title id>\* to
+         * the save area's UserData, without replacing anything already there.
+         * Two levels is all a disc carries (the title's directory and its
+         * TitleMeta.xbx / TitleImage.xbx). */
+        {
+            WCHAR pat[MAX_PATH], sub[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+            WIN32_FIND_DATAW t, f;
+            HANDLE ht, hf;
+            swprintf_s(pat, MAX_PATH, L"%s\\UDATA\\*", s_game_dir);
+            ht = FindFirstFileW(pat, &t);
+            if (ht != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(t.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || t.cFileName[0] == L'.')
+                        continue;
+                    swprintf_s(dir, MAX_PATH, L"%s\\UserData\\%s", s_save_dir, t.cFileName);
+                    SHCreateDirectoryExW(NULL, dir, NULL);
+                    swprintf_s(sub, MAX_PATH, L"%s\\UDATA\\%s\\*", s_game_dir, t.cFileName);
+                    hf = FindFirstFileW(sub, &f);
+                    if (hf == INVALID_HANDLE_VALUE)
+                        continue;
+                    do {
+                        if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                            continue;
+                        swprintf_s(src, MAX_PATH, L"%s\\UDATA\\%s\\%s", s_game_dir, t.cFileName, f.cFileName);
+                        swprintf_s(dst, MAX_PATH, L"%s\\%s", dir, f.cFileName);
+                        CopyFileW(src, dst, TRUE);      /* never over a file already there */
+                    } while (FindNextFileW(hf, &f));
+                    FindClose(hf);
+                } while (FindNextFileW(ht, &t));
+                FindClose(ht);
+            }
+        }
         swprintf_s(image, MAX_PATH, L"%s\\%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
         xbox_write_partition_table(image);
         /* The other partition devices, sized to the same geometry the table
@@ -378,6 +427,166 @@ static void xbox_remember_host_path(const wchar_t *p)
 
 
 
+/* A clock for unattended runs that starts at a point in the title rather than
+ * at process start. The title reaches its title screen anywhere from 100 to
+ * 190 s into a run, depending on how start-up goes, so a button script in
+ * absolute seconds lands on different screens each time. Anchored to the Nth
+ * open of a file -- Def Jam loads screens\feflow.xml once at boot and again
+ * as the title screen comes up, so "feflow.xml#2" -- the same script reaches
+ * the same screens.
+ *
+ *     RECOMP_SCRIPT_ANCHOR=feflow.xml#2
+ */
+static ULONGLONG s_anchor_ft;             /* FILETIME the anchor was reached */
+static int s_anchor_state = -1;           /* -1 unread, 0 none, 1 waiting, 2 reached */
+static char s_anchor_sub[128];
+static int s_anchor_want = 1, s_anchor_seen;
+
+static void anchor_init(void)
+{
+    const char *s = getenv("RECOMP_SCRIPT_ANCHOR");
+    const char *hash;
+    size_t i, n;
+
+    s_anchor_state = 0;
+    if (!s || !*s)
+        return;
+    hash = strchr(s, '#');
+    n = hash ? (size_t)(hash - s) : strlen(s);
+    if (n >= sizeof(s_anchor_sub))
+        n = sizeof(s_anchor_sub) - 1;
+    for (i = 0; i < n; i++)
+        s_anchor_sub[i] = (char)tolower((unsigned char)s[i]);
+    s_anchor_sub[n] = 0;
+    if (hash && atoi(hash + 1) > 0)
+        s_anchor_want = atoi(hash + 1);
+    s_anchor_state = 1;
+}
+
+/* More anchors, for a script that crosses several screens whose timing varies:
+ * xbox_FileOpenSeconds("main.mus#1") is the seconds since the first open of a
+ * path containing "main.mus", negative before it. A spec is watched from its
+ * first query, so ask before the file can open (the pad and the translator do,
+ * from start-up). */
+/* A screen-by-screen chain uses one per screen, the captures more. */
+#define OPEN_WATCH_MAX 32
+static struct { char sub[64]; int want, seen; volatile ULONGLONG ft; } s_open_watch[OPEN_WATCH_MAX];
+static volatile LONG s_open_watches;
+static CRITICAL_SECTION s_open_watch_lock;
+static INIT_ONCE s_open_watch_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK open_watch_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&s_open_watch_lock);
+    return TRUE;
+}
+
+static ULONGLONG now_ft(void)
+{
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    return ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+}
+
+double xbox_FileOpenSeconds(const char *spec)
+{
+    char sub[64];
+    const char *hash = strchr(spec, '#');
+    size_t i, n = hash ? (size_t)(hash - spec) : strlen(spec);
+    int want = (hash && atoi(hash + 1) > 0) ? atoi(hash + 1) : 1;
+    LONG k, count;
+    ULONGLONG ft = 0;
+
+    if (n >= sizeof sub)
+        n = sizeof sub - 1;
+    for (i = 0; i < n; i++)
+        sub[i] = (char)tolower((unsigned char)spec[i]);
+    sub[n] = 0;
+    InitOnceExecuteOnce(&s_open_watch_once, open_watch_init, NULL, NULL);
+    EnterCriticalSection(&s_open_watch_lock);
+    count = s_open_watches;
+    for (k = 0; k < count; k++)
+        if (s_open_watch[k].want == want && !strcmp(s_open_watch[k].sub, sub))
+            break;
+    if (k == count && count < OPEN_WATCH_MAX) {
+        memcpy(s_open_watch[k].sub, sub, n + 1);
+        s_open_watch[k].want = want;
+        s_open_watches = count + 1;
+    } else if (k == count) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "  [SCRIPT] more than %d anchors: \"%s\" is never reached\n",
+                    OPEN_WATCH_MAX, sub);
+    }
+    if (k < OPEN_WATCH_MAX)
+        ft = s_open_watch[k].ft;
+    LeaveCriticalSection(&s_open_watch_lock);
+    return ft ? (double)(now_ft() - ft) / 1e7 : -1.0;
+}
+
+static void anchor_note_open(const char *xbox_path)
+{
+    char low[512];
+    size_t i;
+    LONG k;
+
+    for (i = 0; xbox_path[i] && i < sizeof(low) - 1; i++)
+        low[i] = (char)tolower((unsigned char)xbox_path[i]);
+    low[i] = 0;
+    if (s_open_watches) {
+        EnterCriticalSection(&s_open_watch_lock);
+        for (k = 0; k < s_open_watches; k++) {
+            if (s_open_watch[k].ft || !strstr(low, s_open_watch[k].sub)
+                    || ++s_open_watch[k].seen < s_open_watch[k].want)
+                continue;
+            s_open_watch[k].ft = now_ft();
+            fprintf(stderr, "  [SCRIPT] anchor \"%s\" #%d reached\n",
+                    s_open_watch[k].sub, s_open_watch[k].want);
+        }
+        LeaveCriticalSection(&s_open_watch_lock);
+    }
+    if (s_anchor_state < 0)
+        anchor_init();
+    if (s_anchor_state != 1)
+        return;
+    if (!strstr(low, s_anchor_sub) || ++s_anchor_seen < s_anchor_want)
+        return;
+    s_anchor_ft = now_ft();
+    s_anchor_state = 2;
+    fprintf(stderr, "  [SCRIPT] anchor \"%s\" #%d reached: script time starts now\n",
+            s_anchor_sub, s_anchor_want);
+}
+
+/* Anything else worth anchoring a script to -- a title's own events, such as
+ * the screen its front end asks for -- is offered here, and matches the same
+ * specs as a file path does. */
+void xbox_NoteAnchorEvent(const char *text)
+{
+    if (text)
+        anchor_note_open(text);
+}
+
+double xbox_ScriptSeconds(void)
+{
+    FILETIME c, e, k, u, now;
+    ULONGLONG from, to;
+
+    if (s_anchor_state < 0)
+        anchor_init();
+    if (s_anchor_state == 1)
+        return -1.0;
+    GetSystemTimeAsFileTime(&now);
+    to = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    if (s_anchor_state == 2) {
+        from = s_anchor_ft;
+    } else {
+        if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+            return 0.0;
+        from = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+    }
+    return (double)(to - from) / 1e7;
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char*  remainder = NULL;
@@ -419,6 +628,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 
 translate:
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    anchor_note_open(xbox_path);
+    xbox_KernelTrail(8);
     fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];

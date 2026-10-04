@@ -10,3 +10,5 @@ target_include_directories(kernel_irql_abi_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_irql_abi_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME kernel_irql_abi_test COMMAND kernel_irql_abi_test)
+# Synthetic low RAM only; no GPU register aperture is mapped.
+set_tests_properties(kernel_irql_abi_test PROPERTIES ENVIRONMENT "RECOMP_GPU_PREEMPT=0")

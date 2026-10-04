@@ -7,3 +7,5 @@ target_include_directories(kernel_object_paths_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_object_paths_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME kernel_object_paths_test COMMAND kernel_object_paths_test)
+# Synthetic low RAM only; no GPU register aperture is mapped.
+set_tests_properties(kernel_object_paths_test PROPERTIES ENVIRONMENT "RECOMP_GPU_PREEMPT=0")

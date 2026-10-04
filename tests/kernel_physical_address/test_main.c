@@ -35,6 +35,20 @@ int main(void) {
                     cases[i][0],cases[i][1],g_eax,g_esp); failed=1;
         }
     }
+    /* Recording more than the old 512-entry limit must retain every answer. */
+    uint32_t before = xbox_PhysMapGeneration();
+    for (unsigned i=0; i<1025; ++i)
+        xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)(0x81000000u+i*4096u));
+    for (unsigned i=0; i<1025; ++i) {
+        uint32_t pa=0x01000000u+i*4096u;
+        if (xbox_PhysicalToVirtual(pa+0xABCu)!=0x80000000u+pa+0xABCu) failed=1;
+    }
+    uint32_t added = xbox_PhysMapGeneration();
+    xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)0x81000000u);
+    if (added==before || xbox_PhysMapGeneration()!=added) failed=1;
+    xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)0x01000000u);
+    if (xbox_PhysicalToVirtual(0x01000ABCu)!=0x01000ABCu ||
+        xbox_PhysMapGeneration()==added) failed=1;
     VirtualFree(memory,0,MEM_RELEASE);
     if(!failed) puts("PASS nine physical-address cases and stdcall stack cleanup");
     return failed;

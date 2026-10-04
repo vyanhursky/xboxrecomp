@@ -614,7 +614,29 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     return NULL;
 }
 
-NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+/* A closed directory handle takes its enumeration with it. Host handle values
+ * are reused, and a search abandoned part-way (a title that stops at the first
+ * match) otherwise carried on under the next directory opened at the same
+ * value: its first answer was the old search's next entry. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == FileHandle) {
+            if (s_dir_contexts[i].find_handle &&
+                s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done = FALSE;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
+static NTSTATUS query_directory(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
     XBOX_FILE_INFORMATION_CLASS FileInformationClass,
@@ -718,6 +740,41 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         IoStatusBlock->Information = header_size + name_len;
     }
     return STATUS_SUCCESS;
+}
+
+/* Every answer a directory enumeration gets, budgeted. A title that lists its
+ * saves decides what to show from these alone, and a status it did not expect
+ * is a stall with nothing else in the log to say so. */
+NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
+    PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
+{
+    static volatile LONG s_logged;
+    NTSTATUS st = query_directory(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                  FileInformation, Length, FileInformationClass,
+                                  FileName, RestartScan);
+    if (InterlockedIncrement(&s_logged) <= 400) {
+        char pat[64] = "*";
+        const char *got = "";
+        char name[64] = "";
+        if (FileName && FileName->Buffer && FileName->Length) {
+            int n = FileName->Length < 63 ? FileName->Length : 63;
+            memcpy(pat, FileName->Buffer, (size_t)n);
+            pat[n] = 0;
+        }
+        if (st == STATUS_SUCCESS && FileInformation) {
+            PXBOX_FILE_DIRECTORY_INFORMATION e = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
+            ULONG n = e->FileNameLength < 63 ? e->FileNameLength : 63;
+            memcpy(name, e->FileName, n);
+            name[n] = 0;
+            got = (e->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? " dir" : " file";
+        }
+        fprintf(stderr, "  [DIR] handle %p event %p apc %p pattern \"%s\"%s -> 0x%08lX%s %s\n",
+                (void *)FileHandle, (void *)Event, (void *)ApcRoutine, pat, RestartScan ? " restart" : "", (unsigned long)st, got, name);
+    }
+    return st;
 }
 
 /* ======================================================================== */
