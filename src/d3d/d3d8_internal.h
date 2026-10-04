@@ -35,6 +35,9 @@ ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
+UINT                 d3d8_GetRenderScale(void);
+void                 d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h);
+void                 d3d8_SetBlendColor(DWORD argb);
 
 /* Presentation-only gamma. End restores the saved backbuffer even if Present fails. */
 void d3d8_gamma_set(const D3DGAMMARAMP *ramp);
@@ -255,6 +258,7 @@ ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
 
 /* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);
+UINT      d3d8_texel_swizzle(IDirect3DBaseTexture8 *texture);
 void      d3d8_base_set_palette(IDirect3DBaseTexture8 *texture, UINT palette);
 
 /* Re-upload every level of a P8 (palettized) texture through its

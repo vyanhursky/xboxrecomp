@@ -46,6 +46,10 @@ static D3D11_BLEND d3d8_to_d3d11_blend(DWORD d3d8blend)
     case D3DBLEND_DESTCOLOR:    return D3D11_BLEND_DEST_COLOR;
     case D3DBLEND_INVDESTCOLOR: return D3D11_BLEND_INV_DEST_COLOR;
     case D3DBLEND_SRCALPHASAT:  return D3D11_BLEND_SRC_ALPHA_SAT;
+    case D3DBLEND_CONSTANTCOLOR:
+    case D3DBLEND_CONSTANTALPHA:    return D3D11_BLEND_BLEND_FACTOR;
+    case D3DBLEND_INVCONSTANTCOLOR:
+    case D3DBLEND_INVCONSTANTALPHA: return D3D11_BLEND_INV_BLEND_FACTOR;
     default:                    return D3D11_BLEND_ONE;
     }
 }
@@ -90,6 +94,14 @@ static D3D11_STENCIL_OP d3d8_to_d3d11_stencilop(DWORD op)
     case 8: return D3D11_STENCIL_OP_DECR;
     default: return D3D11_STENCIL_OP_KEEP;
     }
+}
+
+/* ARGB; see D3DBLEND_CONSTANTCOLOR. */
+static DWORD g_blend_color = 0;
+
+void d3d8_SetBlendColor(DWORD argb)
+{
+    g_blend_color = argb;
 }
 
 static D3D11_BLEND_OP d3d8_to_d3d11_blendop(DWORD op)
@@ -219,7 +231,7 @@ static void update_rasterizer_state(const DWORD *rs)
 
     rd.FrontCounterClockwise = FALSE;
     rd.DepthClipEnable = TRUE;
-    rd.ScissorEnable = FALSE;
+    rd.ScissorEnable = TRUE;               /* d3d8_SetScissorRect() */
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
 
@@ -334,6 +346,23 @@ void d3d8_states_apply(void)
     float blend_factor[4] = { 1, 1, 1, 1 };
 
     if (!rs || !ctx) return;
+
+    /* The blend colour, for the constant factors. D3D11 has one factor and
+     * applies its alpha to the alpha channel only, so a constant-ALPHA
+     * factor on colour is done by putting the alpha in all four. */
+    {
+        DWORD c = g_blend_color, sb = rs[D3DRS_SRCBLEND], db = rs[D3DRS_DESTBLEND];
+        float a = ((c >> 24) & 0xFF) / 255.0f;
+        if (sb == D3DBLEND_CONSTANTALPHA || sb == D3DBLEND_INVCONSTANTALPHA
+                || db == D3DBLEND_CONSTANTALPHA || db == D3DBLEND_INVCONSTANTALPHA) {
+            blend_factor[0] = blend_factor[1] = blend_factor[2] = blend_factor[3] = a;
+        } else {
+            blend_factor[0] = ((c >> 16) & 0xFF) / 255.0f;
+            blend_factor[1] = ((c >> 8) & 0xFF) / 255.0f;
+            blend_factor[2] = (c & 0xFF) / 255.0f;
+            blend_factor[3] = a;
+        }
+    }
 
     update_blend_state(rs);
     update_depth_stencil_state(rs);
