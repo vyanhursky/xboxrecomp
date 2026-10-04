@@ -400,6 +400,10 @@ static void emit_mapped_input(char *buf, int bufsize, int *off,
             snprintf(swizzle, sizeof(swizzle), ".a");
         else
             snprintf(swizzle, sizeof(swizzle), ".aaa");
+    } else if (strcmp(suffix, ".a") == 0) {
+        /* The alpha portion without the alpha bit reads the blue channel
+         * (NV_register_combiners; xemu's psh.c does the same). */
+        snprintf(swizzle, sizeof(swizzle), ".b");
     } else {
         snprintf(swizzle, sizeof(swizzle), "%s", suffix);
     }
@@ -561,8 +565,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                  i, i, i, i);
         }
         /* Preserve disabled stages and sampled alpha. */
-        if (state->tex_mode[i] != NV2A_TEXMODE_NONE)
-            EMIT("    if (alpha_only[%d]) r_t%d.rgb = 1.0;\n", i, i);
+        if (state->tex_mode[i] != NV2A_TEXMODE_NONE) {
+            /* d3d8_texel_swizzle(): alpha-only, luminance, luminance-alpha. */
+            EMIT("    if (alpha_only[%d] == 1) r_t%d.rgb = 1.0;\n", i, i);
+            EMIT("    else if (alpha_only[%d] == 2) r_t%d = float4(r_t%d.rrr, 1.0);\n", i, i, i);
+            EMIT("    else if (alpha_only[%d] == 3) r_t%d = r_t%d.rrrg;\n", i, i, i);
+        }
     }
 
     /* Temporary registers: R0 initialized to T0 (NV2A convention),
@@ -812,6 +820,19 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
         fprintf(stderr, "NV2A combiners: HLSL generation failed (buffer overflow)\n");
         return NULL;
     }
+    {
+        /* RECOMP_COMBINER_DUMP=<n>: the first n generated shaders, whole. */
+        static int left = -1;
+        if (left < 0) {
+            const char *e = getenv("RECOMP_COMBINER_DUMP");
+            left = e ? atoi(e) : 0;
+        }
+        if (left > 0) {
+            left--;
+            fprintf(stderr, "[COMBINER] new shader (%d stages):%c%s%c[COMBINER] end%c",
+                    state->num_stages, 10, hlsl, 10, 10);
+        }
+    }
 
     hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
                     NULL, NULL, "main", "ps_5_0",
@@ -975,6 +996,110 @@ void d3d8_combiners_set_pixel_shader(DWORD token)
     }
 }
 
+/* ---- Register values as the NV2A holds them (push-buffer titles) ------
+ *
+ * A title that drives PGRAPH through a push buffer sets the combiners with
+ * NV097 methods, and those words are packed the hardware's way -- the way
+ * xemu's pgraph reads them and the way a Def Jam fight frame's values only
+ * make sense: an input word holds A in its top byte and D in its bottom one
+ * (a plain "texture times diffuse" is 0xC4C80000), an output word holds the
+ * CD destination in bits 3:0 and the AB destination in 7:4, the final
+ * combiner's words hold A..D and E,F,G the same way round with its flags in
+ * the bottom byte of the second, and the texture-shader word holds five bits
+ * per stage. The render-state path above reads them the other way round. */
+static BOOL g_nv2a_mode;
+
+static void hw_input(DWORD b, NV2ACombinerInput *in)
+{
+    in->reg       = (NV2ACombinerRegister)(b & 0xF);
+    in->alpha_rep = (b >> 4) & 1;
+    in->mapping   = (NV2AInputMapping)((b >> 5) & 7);
+}
+
+static void hw_four(DWORD w, NV2ACombinerInput in[4])
+{
+    hw_input((w >> 24) & 0xFF, &in[0]);
+    hw_input((w >> 16) & 0xFF, &in[1]);
+    hw_input((w >>  8) & 0xFF, &in[2]);
+    hw_input( w        & 0xFF, &in[3]);
+}
+
+static void hw_output(DWORD w, NV2ACombinerOutput *o)
+{
+    DWORD map = (w >> 15) & 7;
+    o->cd_dst   = (NV2ACombinerRegister)( w       & 0xF);
+    o->ab_dst   = (NV2ACombinerRegister)((w >> 4) & 0xF);
+    o->sum_dst  = (NV2ACombinerRegister)((w >> 8) & 0xF);
+    o->cd_dot   = (w >> 12) & 1;
+    o->ab_dot   = (w >> 13) & 1;
+    o->mux_sum  = (w >> 14) & 1;
+    /* NV2A: 0 none, 1 bias, 2 x2, 3 bias x2, 4 x4, 6 /2 (5 unused). */
+    o->output_map = map == 6 ? NV2A_OUT_SHIFTRIGHT_1
+                  : map <= 4 ? (NV2AOutputMapping)map : NV2A_OUT_IDENTITY;
+}
+
+void d3d8_combiners_set_nv2a(const DWORD color_icw[8], const DWORD alpha_icw[8],
+                             const DWORD color_ocw[8], const DWORD alpha_ocw[8],
+                             const DWORD factor0[8], const DWORD factor1[8],
+                             DWORD control, DWORD final_cw0, DWORD final_cw1,
+                             DWORD final_c0, DWORD final_c1, DWORD shader_stages)
+{
+    NV2ACombinerState *s = &g_combiner_state;
+    int i;
+
+    memset(s, 0, sizeof(*s));
+    s->num_stages = (int)(control & 0xFF);
+    if (s->num_stages < 1) s->num_stages = 1;
+    if (s->num_stages > NV2A_MAX_COMBINER_STAGES) s->num_stages = NV2A_MAX_COMBINER_STAGES;
+    for (i = 0; i < NV2A_MAX_COMBINER_STAGES; i++) {
+        hw_four(color_icw[i], s->stages[i].rgb_input);
+        hw_four(alpha_icw[i], s->stages[i].alpha_input);
+        hw_output(color_ocw[i], &s->stages[i].rgb_output);
+        hw_output(alpha_ocw[i], &s->stages[i].alpha_output);
+        /* One factor for every stage unless the control word says each
+         * stage has its own (bits 12 and 16). */
+        s->c0[i] = (control & (1u << 12)) ? factor0[i] : factor0[0];
+        s->c1[i] = (control & (1u << 16)) ? factor1[i] : factor1[0];
+    }
+    hw_input((final_cw0 >> 24) & 0xFF, &s->final_input[0]);
+    hw_input((final_cw0 >> 16) & 0xFF, &s->final_input[1]);
+    hw_input((final_cw0 >>  8) & 0xFF, &s->final_input[2]);
+    hw_input( final_cw0        & 0xFF, &s->final_input[3]);
+    hw_input((final_cw1 >> 24) & 0xFF, &s->final_input[4]);
+    hw_input((final_cw1 >> 16) & 0xFF, &s->final_input[5]);
+    hw_input((final_cw1 >>  8) & 0xFF, &s->final_input[6]);
+    /* In the final combiner NV2A's register 0xE is spare0 + secondary colour
+     * and 0xF is E*F; this file's enum has them the other way round. A Def
+     * Jam fighter's colour is D = 0xE, and read as E*F (0) it drew black. */
+    for (i = 0; i < 7; i++) {
+        if (s->final_input[i].reg == (NV2ACombinerRegister)0xE)
+            s->final_input[i].reg = NV2A_REG_V1R0_SUM;
+        else if (s->final_input[i].reg == (NV2ACombinerRegister)0xF)
+            s->final_input[i].reg = NV2A_REG_EF_PROD;
+    }
+    s->flags = final_cw1 & 0xFF;
+    s->final_c0 = final_c0;
+    s->final_c1 = final_c1;
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        DWORD m = (shader_stages >> (i * 5)) & 0x1F;
+        s->tex_mode[i] = m == 0 ? NV2A_TEXMODE_NONE
+                       : m == 2 ? NV2A_TEXMODE_3D
+                       : m == 3 ? NV2A_TEXMODE_CUBEMAP
+                       : NV2A_TEXMODE_2D;
+    }
+    g_nv2a_mode = TRUE;
+    g_ps_token = 0xFFFFFFFFu;               /* active; never parsed as a token */
+    g_dirty = FALSE;
+}
+
+void d3d8_combiners_clear_nv2a(void)
+{
+    if (g_nv2a_mode) {
+        g_nv2a_mode = FALSE;
+        g_ps_token = 0;
+    }
+}
+
 BOOL d3d8_combiners_active(void)
 {
     return g_ps_token != 0;
@@ -1050,8 +1175,7 @@ BOOL d3d8_combiners_prepare_draw(void)
         cb->alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
         cb->fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
         for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
-            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(i));
-            cb->alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+            cb->alpha_only[i] = d3d8_texel_swizzle(d3d8_GetStageTexture(i));
         }
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);

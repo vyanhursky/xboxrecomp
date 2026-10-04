@@ -1655,6 +1655,30 @@ D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture)
     return *(D3DFORMAT *)((BYTE *)texture + offsetof(D3D8Texture, d3d8_format));
 }
 
+/* How a sampled texel must be rearranged to read as the Xbox format does.
+ * D3D11 has no per-view channel swizzle, so the one- and two-channel formats
+ * arrive as (R,0,0,1) or (R,G,0,1) and the pixel shaders put them right:
+ *   1  A8          rgb = 1         (DXGI A8 gives zero)
+ *   2  L8, L16     (L, L, L, 1)
+ *   3  A8L8, AL8   (L, L, L, A)    (uploaded as R = L, G = A) */
+UINT d3d8_texel_swizzle(IDirect3DBaseTexture8 *texture)
+{
+    if (!texture)
+        return 0;                          /* L8 is format 0, and so is "none" */
+    switch (d3d8_base_format(texture)) {
+    case D3DFMT_A8:   case D3DFMT_LIN_A8:
+        return 1;
+    case D3DFMT_L8:   case D3DFMT_LIN_L8:
+    case D3DFMT_L16:  case D3DFMT_LIN_L16:
+        return 2;
+    case D3DFMT_A8L8: case D3DFMT_LIN_A8L8:
+    case D3DFMT_AL8:  case D3DFMT_LIN_AL8:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
 /* Set the palette index baked into a base texture. */
 void d3d8_base_set_palette(IDirect3DBaseTexture8 *texture, UINT palette)
 {

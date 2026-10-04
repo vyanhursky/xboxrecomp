@@ -493,6 +493,12 @@ typedef enum D3DBLEND {
     D3DBLEND_DESTCOLOR       = 9,
     D3DBLEND_INVDESTCOLOR    = 10,
     D3DBLEND_SRCALPHASAT     = 11,
+    /* The blend colour (d3d8_SetBlendColor) as a factor: the NV2A's
+     * CONSTANT_COLOR / CONSTANT_ALPHA and their complements. */
+    D3DBLEND_CONSTANTCOLOR    = 12,
+    D3DBLEND_INVCONSTANTCOLOR = 13,
+    D3DBLEND_CONSTANTALPHA    = 14,
+    D3DBLEND_INVCONSTANTALPHA = 15,
 } D3DBLEND;
 
 typedef enum D3DCMPFUNC {

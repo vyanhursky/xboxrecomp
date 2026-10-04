@@ -248,7 +248,7 @@ typedef struct NV2APSConstants {
     UINT  alpha_func;                       /* D3DCMPFUNC enum value */
     UINT  alpha_test_enable;                /* 0 or 1 */
     UINT  fog_enable;                       /* 0 or 1 */
-    UINT  alpha_only[NV2A_MAX_TEXTURES];     /* A8 sampling uses white RGB */
+    UINT  alpha_only[NV2A_MAX_TEXTURES];     /* d3d8_texel_swizzle(): 1 A8, 2 L, 3 LA */
 } NV2APSConstants;
 
 /* ================================================================
@@ -351,6 +351,18 @@ void d3d8_combiners_set_pixel_shader(DWORD token);
  * Get whether a combiner pixel shader is currently active.
  */
 BOOL d3d8_combiners_active(void);
+
+/**
+ * Set the combiners from NV097 register values as a push buffer carries them
+ * (hardware packing; see d3d8_combiners.c), and make them active for the
+ * following draws. d3d8_combiners_clear_nv2a() returns to fixed function.
+ */
+void d3d8_combiners_set_nv2a(const DWORD color_icw[8], const DWORD alpha_icw[8],
+                             const DWORD color_ocw[8], const DWORD alpha_ocw[8],
+                             const DWORD factor0[8], const DWORD factor1[8],
+                             DWORD control, DWORD final_cw0, DWORD final_cw1,
+                             DWORD final_c0, DWORD final_c1, DWORD shader_stages);
+void d3d8_combiners_clear_nv2a(void);
 
 #ifdef __cplusplus
 }

@@ -458,9 +458,13 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
         off += snprintf(buf + off, bufsize - off,
                         "    texels[%d] = tex%d.Sample(samp%d, input.tex%d.%s);\n",
                         i, i, i, i, dim ? "xyz" : "xy");
-        /* Xbox A8 samples white RGB; DXGI A8 supplies zero RGB. */
+        /* d3d8_texel_swizzle(): Xbox A8 samples white RGB where DXGI A8
+         * supplies zero; luminance formats replicate their one channel. */
         off += snprintf(buf + off, bufsize - off,
-                        "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
+                        "    if (AlphaOnly[%d] == 1) texels[%d].rgb = 1.0;\n"
+                        "    else if (AlphaOnly[%d] == 2) texels[%d] = float4(texels[%d].rrr, 1.0);\n"
+                        "    else if (AlphaOnly[%d] == 3) texels[%d] = texels[%d].rrrg;\n",
+                        i, i, i, i, i, i, i, i);
     }
     off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
 }
@@ -1165,9 +1169,8 @@ void d3d8_shaders_prepare_draw(DWORD handle)
 
         /* Per-stage texture state */
         for (stage = 0; stage < 4; stage++) {
-            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(stage));
             const DWORD *tss = d3d8_GetTSS(stage);
-            pc->alpha_only[stage] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+            pc->alpha_only[stage] = d3d8_texel_swizzle(d3d8_GetStageTexture(stage));
             if (!tss) {
                 pc->stage_color[stage][0] = D3DTOP_DISABLE;
                 continue;
