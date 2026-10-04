@@ -188,10 +188,21 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+/* Bytes the general heap has handed out and not had back (live blocks). */
+uint32_t xbox_HeapLiveBytes(void);
+
+/* An NV2A register page whose owner (a title's trap) models it. Register it
+ * before protecting the page; runtime code then reaches its registers through
+ * xbox_Nv2aRegRead/Write, and the ack loop leaves it alone. */
+void     xbox_Nv2aSetPageHooks(uint32_t page_va, uint32_t (*rd)(uint32_t va),
+                               void (*wr)(uint32_t va, uint32_t value));
+uint32_t xbox_Nv2aRegRead(uint32_t va);
+void     xbox_Nv2aRegWrite(uint32_t va, uint32_t value);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
-
+/* The executor ran a semaphore release: complete the fence with its value. */
+void xbox_Nv2aSemaphoreRelease(uint32_t value);
 void xbox_MemoryLayoutShutdown(void);
 
 /**
