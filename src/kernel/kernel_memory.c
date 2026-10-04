@@ -10,6 +10,8 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
+#include <stdio.h>
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -138,12 +140,48 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
-    ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
-    MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
-    if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
-        MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
+    /* The console's 64 MB, less what is actually in use.
+     *
+     * This used to report the host's free memory, which is always more than
+     * 64 MB, and so fell back to a flat half: 32 MB. Titles size their own
+     * heaps from this. Def Jam: Fight for NY takes AvailablePages minus a fixed
+     * 14 MB reserve as its main arena, so it got 18 MB. That is roughly half
+     * what a console gives it, and the front end ran the arena dry: the
+     * allocation for the loader movie's 587 KB decompressed archive came back
+     * NULL, the title decompressed it onto address 0, and the movie never
+     * advanced a frame.
+     *
+     * In use: a kernel footprint (ponytail: a fixed 2 MB, roughly a retail
+     * kernel and its pools), the title's image (SizeOfImage from its own XBE
+     * header, read once while it is still intact), and what the runtime's two
+     * allocators have handed out. The runtime's main-thread stack reservation is
+     * its own artefact and is not counted. */
+    {
+        enum { PAGE = 4096, TOTAL = 64 * 1024 * 1024, KERNEL = 2 * 1024 * 1024 };
+        static uint32_t image_size;
+        static int logged;
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        uint64_t used;
+
+        if (!image_size) {
+            uint32_t base = *(const uint32_t *)(mem + 0x10000u + 0x104u);
+            if (base == 0x10000u)
+                image_size = *(const uint32_t *)(mem + 0x10000u + 0x10Cu);
+        }
+        used = (uint64_t)KERNEL + image_size
+             + xbox_HeapLiveBytes() + xbox_ContiguousAllocatedBytes();
+        MemoryStatistics->TotalPhysicalPages = TOTAL / PAGE;               /* 16384 */
+        MemoryStatistics->AvailablePages =
+            used >= TOTAL ? 0 : (ULONG)((TOTAL - used) / PAGE);
+        if (logged++ < 4)
+            fprintf(stderr, "  [MM] MmQueryStatistics: %lu of %lu pages available "
+                            "(image %u KB, heap %u KB, contiguous %u KB)\n",
+                    (unsigned long)MemoryStatistics->AvailablePages,
+                    (unsigned long)MemoryStatistics->TotalPhysicalPages,
+                    image_size / 1024, xbox_HeapLiveBytes() / 1024,
+                    xbox_ContiguousAllocatedBytes() / 1024);
+    }
+    (void)ms;
 
     return STATUS_SUCCESS;
 }
@@ -163,6 +201,107 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
 }
 
+/* Physical-to-virtual, remembered from the translations we handed out.
+ *
+ * A hardware model is given physical addresses and has to write guest memory,
+ * so it needs to go back the other way, and it cannot do that by arithmetic.
+ * MmGetPhysicalAddress below subtracts the contiguous base inside that window
+ * and is the identity outside it, which makes a physical address ambiguous:
+ * 0x3CC934 is both the physical form of the contiguous address 0x803CC934 and
+ * the identity form of the ordinary address 0x3CC934. Guessing costs real
+ * time -- the OHCI model guessed "contiguous", the title's USB driver had
+ * passed the address of an ordinary static buffer, and so every device
+ * descriptor was written 0x80000000 bytes away from the driver that was
+ * waiting to read it. Enumeration failed with every byte moved and every
+ * condition code correct.
+ *
+ * There is no ambiguity in what we actually handed out, though. Any physical
+ * address a model sees came from this call, so recording each translation as
+ * it is made gives an exact inverse. Whole pages, because a driver translates
+ * a buffer once and then puts buffer+offset in its descriptors.
+ */
+typedef struct { uint32_t pa_page, va_page; } PhysicalMapping;
+static PhysicalMapping *g_phys_map;
+static LONG g_phys_map_capacity;
+static LONG g_phys_map_count;
+/* Bumped whenever an answer changes, so a model that caches translations (the
+ * APU looks one up for every sample it reads) knows when to drop them. */
+static volatile LONG g_phys_map_gen;
+static CRITICAL_SECTION g_phys_map_lock;
+static INIT_ONCE g_phys_map_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK phys_map_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_phys_map_lock);
+    return TRUE;
+}
+static void phys_map_lock(void)
+{
+    InitOnceExecuteOnce(&g_phys_map_once, phys_map_init, NULL, NULL);
+    EnterCriticalSection(&g_phys_map_lock);
+}
+
+uint32_t xbox_PhysMapGeneration(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&g_phys_map_gen, 0, 0);
+}
+
+static void phys_map_record(uint32_t va, uint32_t pa)
+{
+    uint32_t va_page = va & ~0xFFFu;
+    uint32_t pa_page = pa & ~0xFFFu;
+    LONG n, i;
+    phys_map_lock();
+    n = g_phys_map_count;
+
+    for (i = 0; i < n; i++)
+        if (g_phys_map[i].pa_page == pa_page) {
+            if (g_phys_map[i].va_page != va_page) {
+                g_phys_map[i].va_page = va_page;
+                InterlockedIncrement(&g_phys_map_gen);
+            }
+            LeaveCriticalSection(&g_phys_map_lock);
+            return;
+        }
+    if (n == g_phys_map_capacity) {
+        LONG capacity = g_phys_map_capacity ? g_phys_map_capacity * 2 : 512;
+        PhysicalMapping *grown = (PhysicalMapping *)realloc(g_phys_map,
+                                                (size_t)capacity * sizeof *grown);
+        if (!grown) {
+            fprintf(stderr, "[MM] physical mapping allocation failed (%ld entries)\n", capacity);
+            LeaveCriticalSection(&g_phys_map_lock);
+            return;
+        }
+        g_phys_map = grown;
+        g_phys_map_capacity = capacity;
+    }
+    g_phys_map[n].pa_page = pa_page;
+    g_phys_map[n].va_page = va_page;
+    g_phys_map_count = n + 1;
+    InterlockedIncrement(&g_phys_map_gen);
+    LeaveCriticalSection(&g_phys_map_lock);
+}
+
+/* The guest address for a physical one, or 0 when we never handed it out.
+ * Callers fall back to their own rule in that case rather than being handed
+ * a guess from here. */
+uint32_t xbox_PhysicalToVirtual(uint32_t pa)
+{
+    uint32_t pa_page = pa & ~0xFFFu;
+    LONG n, i;
+    phys_map_lock();
+    n = g_phys_map_count;
+
+    for (i = 0; i < n; i++)
+        if (g_phys_map[i].pa_page == pa_page) {
+            uint32_t va = g_phys_map[i].va_page | (pa & 0xFFFu);
+            LeaveCriticalSection(&g_phys_map_lock);
+            return va;
+        }
+    LeaveCriticalSection(&g_phys_map_lock);
+    return 0;
+}
+
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
     /*
@@ -179,9 +318,11 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    uint32_t pa = (va >= XBOX_CONTIG_BASE &&
+                   (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+                ? va - XBOX_CONTIG_BASE : va;
+    phys_map_record(va, pa);
+    return (ULONG_PTR)pa;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

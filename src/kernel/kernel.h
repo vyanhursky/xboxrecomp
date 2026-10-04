@@ -702,6 +702,20 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan);
 
+/* Log the next `calls` kernel calls this thread makes, past the start-up
+ * trace budget. The path layer arms it on every open. */
+void xbox_KernelTrail(int calls);
+
+/* Seconds on the clock RECOMP_PAD_SCRIPT and RECOMP_TRANS_SHOT_SECS use: since
+ * process start, or, with RECOMP_SCRIPT_ANCHOR=<path substring>[#N], since the
+ * Nth open of a matching file (negative until then). kernel_path.c. */
+double xbox_ScriptSeconds(void);
+/* Seconds since the Nth open of a path containing SUB, spec "SUB#N" (N
+ * defaults to 1); negative until then, and watched from the first query. */
+double xbox_FileOpenSeconds(const char *spec);
+/* Offers TEXT to the anchors as if it were a path being opened. */
+void xbox_NoteAnchorEvent(const char *text);
+
 NTSTATUS __stdcall xbox_NtFsControlFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, ULONG FsControlCode,
@@ -761,6 +775,17 @@ NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+
+/* The push-buffer executor reached a PGRAPH software method (a NOP with a
+ * parameter); the kernel raises the notify interrupt for it (kernel_bridge.c). */
+void kernel_nv2a_software_method(uint32_t subch, uint32_t method, uint32_t data);
+/* Milliseconds since the guest console's power-on, which is shortly before the
+ * process started -- not the host's uptime (kernel_hal.c). */
+ULONGLONG xbox_GuestUptimeMs(void);
+/* Pin the calling thread to the one host CPU every guest thread shares, as
+ * the console's titles all share its one CPU (kernel_bridge.c). Call it at
+ * the start of every thread that runs guest code. */
+void xbox_PinToGuestCore(void);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
 BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
@@ -796,6 +821,13 @@ int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);
+int     xbox_DispatchLockEnter(void);
+void    xbox_DispatchLockLeave(void);
+void    xbox_IrqlInterruptThread(void);
+int     xbox_IrqlPreemptible(void);
+KIRQL   __stdcall xbox_KeRaiseIrqlToSynchLevel(void);
+uint32_t xbox_PhysicalToVirtual(uint32_t pa);
+uint32_t xbox_PhysMapGeneration(void);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
@@ -820,6 +852,17 @@ BOOLEAN __stdcall xbox_KeConnectInterrupt(PXBOX_KINTERRUPT Interrupt);
 
 /* KeTickCount - exported as a data pointer, not a function */
 extern volatile ULONG xbox_KeTickCount;
+
+/* Legacy I/O ports (`in`/`out`). The recompiler emits calls to these for a
+ * title that reaches the southbridge through I/O space rather than through the
+ * 0xFD000000 aperture. See kernel_hal.c for what they model. */
+uint8_t  xbox_IoRead8 (uint16_t port);
+uint16_t xbox_IoRead16(uint16_t port);
+uint32_t xbox_IoRead32(uint16_t port);
+void     xbox_IoWrite8 (uint16_t port, uint8_t  value);
+void     xbox_IoWrite16(uint16_t port, uint16_t value);
+void     xbox_IoWrite32(uint16_t port, uint32_t value);
+void     xbox_IoPortReport(void);
 
 /* ============================================================================
  * Xbox Identity & Stubs (kernel_xbox.c)

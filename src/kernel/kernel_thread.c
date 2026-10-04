@@ -34,6 +34,7 @@ static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
     /* Free the start info before calling the routine - the routine may
      * never return (calling PsTerminateSystemThread instead) */
     HeapFree(GetProcessHeap(), 0, lpParameter);
+    xbox_PinToGuestCore();   /* one CPU, as on the console (kernel_bridge.c) */
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u starting at %p",
         GetCurrentThreadId(), info.StartRoutine);
