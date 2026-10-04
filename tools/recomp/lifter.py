@@ -2773,7 +2773,7 @@ class Lifter:
         """
         if (op.type != "mem" or op.mem_size != 4 or op.mem_scale != 4
                 or not op.mem_index or op.mem_base or not op.mem_disp
-                or not 2 <= len(targets) <= 64):
+                or op.mem_seg or not 2 <= len(targets) <= 64):
             return []
         base = op.mem_disp
         possibilities = [
@@ -2787,6 +2787,32 @@ class Lifter:
                 if actual != targets:
                     return []
                 return [(first + i * step, target) for i, target in enumerate(actual)]
+        return []
+
+    def _foreign_switch_index_pairs(self, op):
+        """Keep proven slot recovery when CFG ownership splits every arm.
+
+        Only accept an exact bounded XBE table whose complete target set names
+        known foreign function entries. An authoritative rejected census, mixed
+        local/foreign targets, unknown entries and ambiguous operands stay raw.
+        """
+        if (op.type != "mem" or op.mem_size != 4 or op.mem_scale != 4
+                or not op.mem_index or op.mem_base or not op.mem_disp
+                or op.mem_seg or op.mem_disp in self.jump_table_targets):
+            return []
+        base = op.mem_disp
+        for read, address, first, step in (
+                (self._read_jump_table, base, 0, 1),
+                (self._read_jump_table, base + 4, 1, 1),
+                (self._read_jump_table_backward, base - 4, -1, -1)):
+            targets = read(address)
+            if len(targets) < 2:
+                continue
+            if (len(targets) <= 64 and all(
+                    target in self.func_db and self._is_external_target(target)
+                    for target in targets)):
+                return [(first + i * step, target) for i, target in enumerate(targets)]
+            return []  # Never reinterpret a rejected census by dropping its first slot.
         return []
 
     def _lift_jmp(self, insn, ops):
@@ -2830,6 +2856,20 @@ class Lifter:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 for index, target in self._switch_index_pairs(ops[0], switch_targets):
                     lines.append(f"if ((int32_t){ops[0].mem_index} == {index}) goto loc_{target:08X}; /* proven switch slot */")
+                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL_AT(_jt, 0x{insn.address:08X}u); return; }}")
+                return lines
+            foreign_pairs = self._foreign_switch_index_pairs(ops[0])
+            if foreign_pairs:
+                targets = sorted({target for _, target in foreign_pairs})
+                target_expr = _fmt_operand_read(ops[0])
+                lines = [f"{{ uint32_t _jt = {target_expr}; /* foreign switch: {len(foreign_pairs)} proven slots */"]
+                known = " && ".join(f"_jt != 0x{target:08X}u" for target in targets)
+                lines.append(f"if ({known}) {{")
+                for index, target in foreign_pairs:
+                    lines.append(f"if ((int32_t){ops[0].mem_index} == {index}) _jt = 0x{target:08X}u; /* proven switch slot */")
+                lines.append("}")
+                # Dispatch preserves manual replacements and entry hooks, and
+                # reuses the current guest return address across foreign arms.
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL_AT(_jt, 0x{insn.address:08X}u); return; }}")
                 return lines
             # `jmp <reg>` where the register was loaded with an address
