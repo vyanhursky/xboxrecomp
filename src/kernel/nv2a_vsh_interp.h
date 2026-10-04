@@ -44,6 +44,13 @@ void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
 void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
 void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
 
+/* Read-only upload view and revisions shared with the HLSL adapter. */
+typedef uint32_t Nv2aVshInstruction[4];
+const Nv2aVshInstruction *nv2a_vsh_program_data(uint32_t *revision, uint32_t *start);
+const float *nv2a_vsh_constants(uint32_t *version);
+int nv2a_vsh_program_loaded(void);
+void nv2a_vsh_trace(int runs);
+
 /* Run the program from the start slot on one vertex. Inputs are the ten
  * attribute values as floats. Returns 0 if there is no program to run (no
  * FINAL flag within program memory), which the caller treats as "cannot
