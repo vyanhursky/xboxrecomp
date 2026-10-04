@@ -18,6 +18,7 @@
 
 #include <string.h>
 #include <ctype.h>
+#include "../input/xinput_xbox.h"
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -28,7 +29,7 @@ static const uint8_t s_device_desc[18] = {
     0x00,           /* bDeviceClass: per interface                */
     0x00,           /* bDeviceSubClass                            */
     0x00,           /* bDeviceProtocol                            */
-    0x08,           /* bMaxPacketSize0: 8                         */
+    0x20,           /* bMaxPacketSize0: 8                         */
     0x5E, 0x04,     /* idVendor  0x045E Microsoft                 */
     0x89, 0x02,     /* idProduct 0x0289 Controller S              */
     0x21, 0x01,     /* bcdDevice                                  */
@@ -53,6 +54,8 @@ static const uint8_t s_config_desc[32] = {
 
 static uint8_t s_address[USB_GAMEPAD_MAX];
 static uint8_t s_configuration[USB_GAMEPAD_MAX];
+static uint32_t s_reset_generation[USB_GAMEPAD_MAX];
+uint32_t usb_gamepad_reset_generation(int pad) { return s_reset_generation[pad & 3]; }
 
 uint8_t usb_gamepad_address(int pad) { return s_address[pad & 3]; }
 int usb_gamepad_configured(int pad) { return s_configuration[pad & 3] != 0; }
@@ -84,6 +87,7 @@ static int copy_out(uint8_t *out, int max, const uint8_t *src, int len,
 
 int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 {
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX) return -1;
     int is_in = (setup->bmRequestType & 0x80) != 0;
     int type  = (setup->bmRequestType >> 5) & 3;   /* 0 standard, 1 class */
 
@@ -211,6 +215,7 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
         return -1;
     }
 
+    if (setup->bmRequestType == 0x21) return 0; /* class OUT: rumble/idle */
     /* Class requests: not ours to guess at. */
     return -1;
 }
@@ -556,62 +561,182 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+static void apply_script(int pad, uint8_t *out);   /* below */
+
+/* Quick presses could be lost: START and A needed two presses (Vlad, with a
+ * real pad). Two exposures, two guards below.
+ *
+ * 1. The pad was only sampled when the controller model asked it for a
+ *    report, and those polls come in bursts: 66 a second on average, but with
+ *    gaps -- 80 ms script spans were first sampled 50-80 ms in, and in one run
+ *    a 250 ms right and nine 250 ms downs produced no report at all. A tap
+ *    inside a gap never existed as far as the title was concerned. So a thread
+ *    samples the host pad and the script every 4 ms and latches every press
+ *    it sees until the next report carries it.
+ *
+ * 2. The pad reports only when its state changes, so a tap is two reports,
+ *    press and release, and the driver takes the second as soon as it re-arms
+ *    the endpoint. The title reads XInputGetState once a frame, every 30-50 ms
+ *    at the frame rates this port runs at, so a press has to stay down across
+ *    at least one of those reads. A button pressed is reported pressed for at
+ *    least RECOMP_PAD_MIN_HOLD_MS (120 by default), however quickly it is let
+ *    go; 0 turns this off. */
+static void sample_now(int pad, uint8_t *out);       /* below */
+
+static CRITICAL_SECTION s_latch_cs;
+static uint8_t s_latch[USB_GAMEPAD_MAX][20];                 /* presses seen since the last report */
+static INIT_ONCE s_sampler_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION s_sample_cs;
+
+static DWORD WINAPI sampler_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        int pad, i;
+        for (pad = 0; pad < USB_GAMEPAD_MAX; pad++) {
+            uint8_t cur[20];
+            EnterCriticalSection(&s_sample_cs);
+            sample_now(pad, cur);
+            LeaveCriticalSection(&s_sample_cs);
+            EnterCriticalSection(&s_latch_cs);
+            s_latch[pad][2] |= cur[2];
+            for (i = 4; i < 12; i++)
+                if (cur[i] > s_latch[pad][i]) s_latch[pad][i] = cur[i];
+            LeaveCriticalSection(&s_latch_cs);
+        }
+        Sleep(4);
+    }
+    return 0;
+}
+
+static BOOL CALLBACK start_sampler(PINIT_ONCE once, PVOID arg, PVOID *ctx)
+{
+    HANDLE th;
+    (void)once; (void)arg; (void)ctx;
+    InitializeCriticalSection(&s_latch_cs);
+    InitializeCriticalSection(&s_sample_cs);
+    th = CreateThread(NULL, 0, sampler_thread, NULL, 0, NULL);
+    if (th) {
+        SetThreadPriority(th, THREAD_PRIORITY_ABOVE_NORMAL);
+        CloseHandle(th);
+    }
+    return TRUE;
+}
+
+static void merge_latch(int pad, uint8_t *out)
+{
+    int i;
+    EnterCriticalSection(&s_latch_cs);
+    out[2] |= s_latch[pad][2];
+    for (i = 4; i < 12; i++)
+        if (s_latch[pad][i] > out[i]) out[i] = s_latch[pad][i];
+    memset(s_latch[pad], 0, sizeof s_latch[pad]);
+    LeaveCriticalSection(&s_latch_cs);
+}
+
+static void min_hold(int pad, uint8_t *out)
+{
+    static int hold_ms = -1;
+    static ULONGLONG until[USB_GAMEPAD_MAX][20][8];
+    ULONGLONG now = GetTickCount64();
+    int i, b;
+
+    if (hold_ms < 0) {
+        const char *s = getenv("RECOMP_PAD_MIN_HOLD_MS");
+        hold_ms = s ? atoi(s) : 120;
+    }
+    if (!hold_ms)
+        return;
+    /* Byte 2 is eight digital buttons; 4..11 are analog buttons, one per byte. */
+    for (b = 0; b < 8; b++) {
+        if (out[2] & (1u << b)) {
+            if (!until[pad][2][b])
+                until[pad][2][b] = now + (ULONGLONG)hold_ms;
+        } else if (until[pad][2][b]) {
+            if (now < until[pad][2][b])
+                out[2] |= (uint8_t)(1u << b);
+            else
+                until[pad][2][b] = 0;
+        }
+    }
+    for (i = 4; i < 12; i++) {
+        static uint8_t last[USB_GAMEPAD_MAX][20];               /* the value to hold, for triggers */
+        if (out[i]) {
+            last[pad][i] = out[i];
+            if (!until[pad][i][0])
+                until[pad][i][0] = now + (ULONGLONG)hold_ms;
+        } else if (until[pad][i][0]) {
+            if (now < until[pad][i][0])
+                out[i] = last[pad][i];
+            else
+                until[pad][i][0] = 0;
+        }
+    }
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
+{
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX || max < 20) return 0;
+    InitOnceExecuteOnce(&s_sampler_once, start_sampler, NULL, NULL);
+    EnterCriticalSection(&s_sample_cs);
+    sample_now(pad, out);
+    merge_latch(pad, out);
+    min_hold(pad, out);
+    LeaveCriticalSection(&s_sample_cs);
+    return 20;
+}
+
+/* The pad as it is this instant: the host's pad, plus the pad script. */
+static void sample_now(int pad, uint8_t *out)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
-    uint8_t synth = synthetic_buttons();
+    uint8_t synth = pad == 0 ? synthetic_buttons() : 0;
     int i;
 
-    if (max < 20)
-        return 0;
     memset(out, 0, 20);
     out[0] = 0;
     out[1] = 20;
+    out[2] = synth;
 
     /* A disconnected host pad is not an error here: the device is present on
-     * the bus either way, it just reports nothing pressed. */
-    /* RECOMP_INPUT_DIAG: the whole chain on one line, once a second.
+     * the bus either way, it just reports nothing pressed.
      *
-     * "Nothing happens when I press a key" has several candidate causes and
-     * guessing between them costs a rebuild each: the variable not read,
-     * XInput claiming a pad so the keyboard fallback never runs, the window
-     * not receiving the key, or the report going out without it. Printing
-     * all four together answers it in one run.
-     *
-     * It samples the held state, so pair it with the window's own
-     * RECOMP_KEY_TRACE: that answers "did the key arrive", this answers
-     * "is the chain wired". */
+     * A scripted run does not read the host's pad at all: one left plugged in
+     * with a drifting stick walked the menu cursor away under the script.
+     * RECOMP_PAD_HOST=1 brings it back alongside a script. */
     {
-        static int diag = -1;
-        if (diag < 0)
-            diag = getenv("RECOMP_INPUT_DIAG") != NULL;
-        if (diag) {
-            extern int xbox_FramebufferKeyDown(int vk);
-            static unsigned long last;
-            unsigned long now = (unsigned long)GetTickCount();
-            if (now - last > 1000) {
-                XBOX_INPUT_STATE probe;
-                DWORD rc = xbox_InputGetState(0, &probe);
-                last = now;
-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
-                        "InputGetState=%lu buttons=0x%04X\n",
-                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
-                        xbox_FramebufferKeyDown(0x0D),
-                        (unsigned long)rc,
-                        rc == 0 ? probe.Gamepad.wButtons : 0);
-                fflush(stderr);
-            }
+        static int host = -1;
+        if (host < 0) {
+            const char *h = getenv("RECOMP_PAD_HOST");
+            host = h ? (*h != '0') : (getenv("RECOMP_PAD_SCRIPT") == NULL);
+        }
+        if (!host) {
+            apply_script(pad, out);
+            return;
         }
     }
-
-    /* The synthetic press and the host pad drive pad n from host pad n. */
-    if (pad != 0)
-        synth = 0;
+    /* Keep upstream's keyboard/window/input-chain diagnostic. Host suppression
+     * above also suppresses this probe during deterministic scripted runs. */
+    if (pad == 0 && getenv("RECOMP_INPUT_DIAG")) {
+        extern int xbox_FramebufferKeyDown(int vk);
+        static DWORD last;
+        DWORD now = GetTickCount();
+        if (now - last > 1000) {
+            XBOX_INPUT_STATE probe;
+            DWORD rc = xbox_InputGetState(0, &probe);
+            last = now;
+            fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+                            "InputGetState=%lu buttons=0x%04X\n",
+                    getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                    xbox_FramebufferKeyDown(0x0D), (unsigned long)rc,
+                    rc == 0 ? probe.Gamepad.wButtons : 0);
+            fflush(stderr);
+        }
+    }
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
-        out[2] = synth;
-        pad_script_apply(pad, out);
-        return 20;
+        apply_script(pad, out);
+        return;
     }
 
     g = &state.Gamepad;
@@ -627,6 +752,135 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    apply_script(pad, out);
+}
+
+/* Seconds since this process started. */
+extern double xbox_ScriptSeconds(void);   /* kernel_path.c */
+extern double xbox_FileOpenSeconds(const char *spec);
+
+/* RECOMP_PAD_SCRIPT: buttons held over given spans of seconds since start, so
+ * an unattended run can press START at the title screen. "Since start" is
+ * xbox_ScriptSeconds(): process start, or RECOMP_SCRIPT_ANCHOR's file open.
+ *
+ *     RECOMP_PAD_SCRIPT=start:150:151,a:160:160.5
+ *
+ * Names: up down left right start back ls rs (digital, byte 2) and a b x y
+ * black white lt rt (analog, full press). Added to the host pad's state.
+ *
+ * "@file#N" switches the entries after it to seconds since that file's Nth
+ * open (xbox_FileOpenSeconds), for screens that arrive after a variable wait,
+ * and ends the entries before it once that open happens -- so a run of
+ * presses can say "A until the main menu is up":
+ *
+ *     RECOMP_PAD_SCRIPT=start:14:14.3,a:20:20.3,a:24:24.3,@main.mus#1,right:3:3.3 */
+static void apply_script(int pad, uint8_t *out)
+{
+    static const struct { const char *name; int byte; uint8_t bit; } names[] = {
+        { "up", 2, 0x01 }, { "down", 2, 0x02 }, { "left", 2, 0x04 }, { "right", 2, 0x08 },
+        { "start", 2, 0x10 }, { "back", 2, 0x20 }, { "ls", 2, 0x40 }, { "rs", 2, 0x80 },
+        { "a", 4, 0 }, { "b", 5, 0 }, { "x", 6, 0 }, { "y", 7, 0 },
+        { "black", 8, 0 }, { "white", 9, 0 }, { "lt", 10, 0 }, { "rt", 11, 0 },
+    };
+    const char *s = getenv("RECOMP_PAD_SCRIPT");
+    double t;
+    /* Screen-anchored chains run long; one cut short can leave an anchor such
+     * as "@contr" that matches something at boot and ends everything before
+     * it. Too long for the buffer is refused outright instead. */
+    char buf[4096];
+    char *tok, *ctx = NULL;
+    char *toks[256];
+    unsigned char closed[256];
+    int ntok = 0, k, later = 0;
+    /* Which entries have reached the title, so a run's log says when each
+     * scripted press was actually sampled -- the only way to tell a press the
+     * title ignored from one it never saw. */
+    static unsigned char logged[USB_GAMEPAD_MAX][256];
+    unsigned idx = 0;
+
+    static int seconds = -1;
+    if (seconds < 0) {
+        const char *format = getenv("RECOMP_PAD_SCRIPT_FORMAT");
+        seconds = format && strcmp(format, "seconds") == 0;
+    }
+    if (!seconds) {
+        pad_script_apply(pad, out);
+        return;
+    }
+    /* Live commands keep their independent millisecond queue. */
+    if (s_script_len < 0) s_script_len = 0;
     pad_script_apply(pad, out);
-    return 20;
+    if (!s || !*s) return;
+    t = xbox_ScriptSeconds();
+    if (strlen(s) >= sizeof buf) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "  [PAD] script: %u characters, over %u -- ignored\n",
+                    (unsigned)strlen(s), (unsigned)sizeof buf - 1);
+        return;
+    }
+    strcpy(buf, s);
+    for (tok = strtok_s(buf, ",", &ctx); tok && ntok < 256; tok = strtok_s(NULL, ",", &ctx))
+        toks[ntok++] = tok;
+    /* An entry is over once any anchor after it has been reached. */
+    for (k = ntok - 1; k >= 0; k--) {
+        if (toks[k][0] == '@')
+            later |= xbox_FileOpenSeconds(toks[k] + 1) >= 0.0;
+        closed[k] = (unsigned char)later;
+    }
+    for (k = 0; k < ntok; k++, idx++) {
+        char name[16];
+        double from, to, period = 0.0, hold = 0.0;
+        int fields;
+        size_t i;
+        tok = toks[k];
+        if (tok[0] == '@') {
+            t = xbox_FileOpenSeconds(tok + 1);
+            continue;
+        }
+        {
+            int target = 0;
+            if ((tok[0] == 'p' || tok[0] == 'P') && tok[1] >= '1' && tok[1] <= '4' && tok[2] == '-') {
+                target = tok[1] - '1'; tok += 3;
+            }
+            if (target != pad) continue;
+        }
+        /* name:from:to, or name:from:to:period:hold -- pressed for hold
+         * seconds every period seconds across the span, so a fight's worth of
+         * presses fits in one entry. */
+        if (closed[k] || t < 0.0)
+            continue;
+        fields = sscanf(tok, "%15[^:]:%lf:%lf:%lf:%lf", name, &from, &to, &period, &hold);
+        if (fields != 3 && fields != 5)
+            continue;
+        if (t < from || t > to)
+            continue;
+        if (fields == 5 && period > 0.0) {
+            double phase = t - from;
+            phase -= period * (double)(long long)(phase / period);
+            if (phase > hold)
+                continue;
+        }
+        if (idx < sizeof logged[pad] && !logged[pad][idx]) {
+            logged[pad][idx] = 1;
+            fprintf(stderr, "  [PAD] script: %s sampled at %.2f s (span %.2f..%.2f)\n",
+                    name, t, from, to);
+        }
+        for (i = 0; i < sizeof names / sizeof names[0]; i++) {
+            if (strcmp(names[i].name, name))
+                continue;
+            if (names[i].bit)
+                out[names[i].byte] |= names[i].bit;
+            else
+                out[names[i].byte] = 0xFF;
+        }
+    }
+}
+
+/* Reset just the device that was reset by its parent port. */
+void usb_gamepad_reset(int pad)
+{
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX) return;
+    s_address[pad] = s_configuration[pad] = 0;
+    ++s_reset_generation[pad];
 }
