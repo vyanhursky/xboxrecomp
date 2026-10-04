@@ -45,4 +45,8 @@ int usb_gamepad_configured(int pad);
  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
 #define USB_GAMEPAD_MAX 4
 
+/* Its port was reset (by the hub it sits behind): back to address 0. */
+void usb_gamepad_reset(int pad);
+uint32_t usb_gamepad_reset_generation(int pad);
+
 #endif /* XBOX_USB_GAMEPAD_H */
