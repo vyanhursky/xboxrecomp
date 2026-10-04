@@ -34,6 +34,9 @@ static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
+/* Submissions refused because the queue was full, and submissions that
+ * found it empty (the device had run dry: a gap in what is heard). */
+int                            g_xa2_dropped, g_xa2_starved;
 
 int xa2_init(void)
 {
@@ -138,7 +141,12 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    if (state.BuffersQueued == 0 && g_xa2_frames_written > 0)
+        g_xa2_starved++;
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
+        g_xa2_dropped++;
+        return 0;
+    }
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;

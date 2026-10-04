@@ -94,6 +94,45 @@ static int mcpx_apu_mixdown_all(void)
     return on;
 }
 
+/* Explicit six-speaker downmix retains centre/LFE/rear balance and headroom.
+ * Other titles keep the upstream all-bin default or legacy two-bin override. */
+static int mcpx_apu_mixdown_six(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_MIXDOWN");
+        on = e && !strcmp(e, "six");
+    }
+    return on;
+}
+
+/* Where DirectSound's doorbell is, read from the hardware state rather than
+ * observed.
+ *
+ * GPSADDR is not the scratch memory itself but the physical address of its
+ * scatter-gather table: 8-byte entries, each a physical page (xemu's
+ * dsp_scratch_rw reads it the same way). DirectSound keeps its command block
+ * in the GP's scratch memory and the command word is at offset 0x810 of the
+ * first page. Measured on Def Jam: Fight for NY under two different heap
+ * layouts (0x819E8810, then 0x831F8810, each SGE[0] + 0x810), and consistent
+ * with the Wreckless address in the note above. The comparison that note made
+ * was against GPSADDR's own value, which is the table, not the pages.
+ *
+ * Returns a guest VA in the contiguous window, or 0 until the title has
+ * programmed GPSADDR. */
+static uint32_t dsp_doorbell_from_sge(MCPXAPUState *d)
+{
+    uint32_t table = d->regs[NV_PAPU_GPSADDR] & 0x3FFFFFFFu;
+    uint32_t page0;
+
+    if (!table || table >= 0x04000000u)
+        return 0;
+    page0 = *(const uint32_t *)(d->ram_ptr + 0x80000000u + table) & 0x3FFFFFFFu;
+    if (!page0 || page0 >= 0x04000000u)
+        return 0;
+    return 0x80000000u + page0 + 0x810u;
+}
+
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
@@ -102,6 +141,27 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         dsp_ack_init();
     if (!d->ram_ptr)
         return;
+    if (s_dsp_ack_count == 0) {
+        /* No explicit address: follow the title's own scratch mapping. It can
+         * move whenever the title re-programs GPSADDR, so it is read per frame. */
+        uint32_t bell = dsp_doorbell_from_sge(d);
+        static uint32_t shown_bell;
+        if (bell) {
+            uint32_t *slot = (uint32_t *)(d->ram_ptr + bell);
+            if (bell != shown_bell) {
+                shown_bell = bell;
+                fprintf(stderr, "[APU] DSP doorbell derived from GPSADDR: 0x%08X\n", bell);
+            }
+            if (*slot) {
+                static int shown;
+                if (shown++ < 3)
+                    fprintf(stderr, "[APU] DSP doorbell 0x%08X: command 0x%08X"
+                                    " acknowledged\n", bell, *slot);
+                *slot = 0;
+            }
+        }
+        return;
+    }
     for (i = 0; i < s_dsp_ack_count; i++) {
         uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
         if (*slot) {
@@ -187,7 +247,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * counts. This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
+            if (mcpx_apu_mixdown_six()) {
+                float c = 0.7071f * mixbins[2][i] + 0.5f * mixbins[3][i];
+                left = 0.7f * (mixbins[0][i] + c + 0.7071f * mixbins[4][i]);
+                right = 0.7f * (mixbins[1][i] + c + 0.7071f * mixbins[5][i]);
+            } else if (mcpx_apu_mixdown_all()) {
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {

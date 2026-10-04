@@ -46,6 +46,8 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+unsigned g_apu_notifies;   /* read by the status line in apu_core.c */
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
@@ -56,6 +58,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
     stb_phys(address_space_memory, notify_offset - 1, 1);
+    g_apu_notifies++;
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -185,6 +188,18 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
     unsigned int selected_handle, list;
+
+    /* Whether the title starts voices at all: the first question when a
+     * title waits on its audio, and not otherwise visible. */
+    {
+        static unsigned on, off;
+        if (method == NV1BA0_PIO_VOICE_ON && (on++ < 6 || on % 1000 == 0))
+            fprintf(stderr, "[APU] voice on 0x%X (#%u)\n",
+                    argument & NV1BA0_PIO_VOICE_ON_HANDLE, on);
+        if (method == NV1BA0_PIO_VOICE_OFF && (off++ < 6 || off % 1000 == 0))
+            fprintf(stderr, "[APU] voice off 0x%X (#%u)\n",
+                    argument & NV1BA0_PIO_VOICE_OFF_HANDLE, off);
+    }
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
@@ -946,26 +961,122 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
 
+/* Resampling, linear interpolation, per voice.
+ *
+ * The pitch says how fast a voice steps through its source: rate is output
+ * samples per source sample (xemu hands it to libsamplerate as src_ratio), so
+ * a 22.05 kHz voice has rate 2.18 and a 48 kHz one 1.0. This used to ignore it
+ * and play every voice at 48 kHz: music and speech came out too fast and too
+ * high, and a looping stream buffer drained faster than the title refilled it,
+ * so playback lapped the writer and replayed stale data -- noise (patch 0068).
+ *
+ * Source samples are fetched in small chunks with voice_get_samples, which is
+ * what advances the voice's CBO, so the play position the title reads back runs
+ * at most one chunk ahead of what has been heard. The state is dropped when the
+ * voice is new or when its CBO is not where the last fetch left it (a title
+ * that seeks, or a voice restarted on the same handle). */
+#define VRS_CHUNK 64
+typedef struct {
+    float buf[VRS_CHUNK + 2][2];   /* source samples; [pos] and [pos + 1] are interpolated */
+    int n, pos;                     /* valid samples, current index */
+    double frac;                    /* position between [pos] and [pos + 1] */
+    uint32_t cbo_after;             /* CBO the last fetch left behind */
+    int primed;
+} VoiceResampler;
+static VoiceResampler s_vrs[MCPX_HW_MAX_VOICES];
+
+/* Top the buffer up; returns 0 when the voice has nothing more to give. */
+static int vrs_fill(MCPXAPUState *d, uint16_t v, VoiceResampler *r)
+{
+    int keep = r->n - r->pos, got, skip = 0;
+    if (keep > 0 && r->pos > 0)
+        memmove(r->buf, r->buf + r->pos, (size_t)keep * sizeof r->buf[0]);
+    if (keep < 0) {
+        skip = -keep;               /* stepped past the end: drop that many new ones */
+        keep = 0;
+    }
+    r->n = keep;
+    r->pos = 0;
+    if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+        return 0;
+    while (r->n < VRS_CHUNK) {
+        got = voice_get_samples(d, v, &r->buf[r->n], VRS_CHUNK - r->n);
+        if (got <= 0)
+            break;
+        r->n += got;
+        if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+            break;
+    }
+    r->cbo_after = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO);
+    r->pos = skip < r->n ? skip : r->n;
+    return r->n > keep;
+}
+
+struct apu_route { double energy; float gain; uint8_t bin; };
+struct apu_route g_apu_route[MCPX_HW_MAX_VOICES][8];
+int g_apu_route_on;
+
+/* Print and clear the routing table: every voice slot that carried sound. */
+void mcpx_apu_vp_dump_routing(void)
+{
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        for (int b = 0; b < 8; b++)
+            if (g_apu_route[v][b].energy > 0.0) {
+                fprintf(stderr, "[APU]   route voice 0x%02X slot %d -> bin %d gain %.3f energy %.1f%c",
+                        v, b, g_apu_route[v][b].bin, g_apu_route[v][b].gain,
+                        g_apu_route[v][b].energy, 10);
+                g_apu_route[v][b].energy = 0.0;
+            }
+}
+
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    VoiceResampler *r = &s_vrs[v];
+    double step;
+    int out = 0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    if (!(rate > 0.0f))
+        rate = 1.0f;
+    step = 1.0 / rate;
+    if (step > 16.0)
+        step = 16.0;
+
+    if (!r->primed
+            || voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_NEW_VOICE)
+            || voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO)
+               != r->cbo_after) {
+        r->n = r->pos = 0;
+        r->frac = 0.0;
+        r->primed = 1;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+
+    while (out < requested_num) {
+        float *s0, *s1;
+        if (r->pos + 1 >= r->n) {
+            if (!vrs_fill(d, v, r) || r->pos + 1 >= r->n) {
+                /* Out of source: play the last sample out once, then stop. */
+                if (r->pos < r->n) {
+                    samples[out][0] = r->buf[r->pos][0];
+                    samples[out][1] = r->buf[r->pos][1];
+                    out++;
+                    r->pos = r->n;
+                }
+                break;
+            }
+        }
+        s0 = r->buf[r->pos];
+        s1 = r->buf[r->pos + 1];
+        samples[out][0] = s0[0] + (float)((s1[0] - s0[0]) * r->frac);
+        samples[out][1] = s0[1] + (float)((s1[1] - s0[1]) * r->frac);
+        out++;
+        r->frac += step;
+        while (r->frac >= 1.0) {
+            r->frac -= 1.0;
+            r->pos++;
+        }
+    }
+    return out > 0 ? out : -1;
 }
 
 /* ============================================================
@@ -1052,6 +1163,30 @@ static void voice_process(MCPXAPUState *d,
              * sat here indefinitely while the title waited in voice_lock. */
             if (count == 0 && ++empty > 4) break;
             sample_count += count;
+        }
+        {
+            /* RECOMP_APU_VOICE_PCM=<prefix>: what voices 0xF8-0xFA (the
+             * title's six-channel stream) produced each frame, before volume,
+             * as raw 48 kHz stereo 16-bit in <prefix>F8.pcm etc. Local only. */
+            static const char *prefix = (const char *)1;
+            static FILE *f[3];
+            if (prefix == (const char *)1)
+                prefix = getenv("RECOMP_APU_VOICE_PCM");
+            if (prefix && v >= 0xF8 && v <= 0xFA) {
+                int k = v - 0xF8, i;
+                int16_t out[NUM_SAMPLES_PER_FRAME][2];
+                if (!f[k]) {
+                    char path[512];
+                    snprintf(path, sizeof path, "%s%02X.pcm", prefix, v);
+                    f[k] = fopen(path, "wb");
+                }
+                for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    out[i][0] = (int16_t)(clampf(samples[i][0], -1.0f, 1.0f) * 32767.0f);
+                    out[i][1] = (int16_t)(clampf(samples[i][1], -1.0f, 1.0f) * 32767.0f);
+                }
+                if (f[k])
+                    fwrite(out, sizeof out, 1, f[k]);
+            }
         }
     }
 
@@ -1149,6 +1284,18 @@ static void voice_process(MCPXAPUState *d,
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
+        {
+            /* RECOMP_APU_LEVEL: what each voice sends where (routing report). */
+            extern int g_apu_route_on;
+            if (g_apu_route_on) {
+                double e = 0.0;
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    e += (double)samples[i][b % channels] * samples[i][b % channels];
+                g_apu_route[v][b].energy += e * g * g;
+                g_apu_route[v][b].bin = (uint8_t)bin[b];
+                g_apu_route[v][b].gain = g;
+            }
+        }
     }
 
     /* VP monitor mix */
@@ -1221,6 +1368,54 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
         memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
         memset(mixbins, 0, sizeof(float) * NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
+    }
+}
+
+/* Every voice on the three lists, one line each: whether it plays, whether it
+ * is a stream and where its segment lists stand. For the status line. */
+int mcpx_apu_vp_count_voices(MCPXAPUState *d)
+{
+    int n = 0;
+    for (int list = 0; list < 3; list++) {
+        uint32_t v = d->regs[voice_list_regs[list].top];
+        for (int i = 0; v != 0xFFFF && i < 256; i++, n++)
+            v = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+    }
+    return n;
+}
+
+void mcpx_apu_vp_dump_voices(MCPXAPUState *d)
+{
+    for (int list = 0; list < 3; list++) {
+        uint32_t v = d->regs[voice_list_regs[list].top];
+        for (int i = 0; v != 0xFFFF && i < 16; i++) {
+            uint16_t h = (uint16_t)v;
+            fprintf(stderr, "[APU]   list %d voice 0x%02X pitch=%d ba=%X lbo=%X"
+                    " state=%08X fmt=%08X"
+                    " cbo=%X ebo=%X ssl idx %d seg %d count %u/%u base %u/%u\n",
+                    list, h,
+                    (int)(int16_t)voice_get_mask(d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                                 NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CUR_PSL_START,
+                                   NV_PAVS_VOICE_CUR_PSL_START_BA),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
+                                   NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFF),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_OFFSET,
+                                   NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_NEXT,
+                                   NV_PAVS_VOICE_PAR_NEXT_EBO),
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].ssl_index : -1,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].ssl_seg : -1,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].count[0] : 0,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].count[1] : 0,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].base[0] : 0,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].base[1] : 0);
+            v = voice_get_mask(d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
     }
 }
 
