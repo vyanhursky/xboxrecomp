@@ -2,7 +2,8 @@
 from .test_switch_table_offset_index import _image, _translate, BASE, TABLE, ARMS
 from .test_lifter_result_clobber import _build_and_run
 from .lifter import Lifter
-from .disasm import Operand
+from .disasm import Operand, Instruction
+from . import config
 from .test_icall_guarded_runtime import _macro, HARNESS
 
 
@@ -53,10 +54,65 @@ def test_ambiguous_shapes_and_changed_census_refuse_index_rescue():
     lifter=Lifter()
     for op in (Operand(type='mem',mem_index='eax',mem_scale=2,mem_disp=TABLE,mem_size=4),
                Operand(type='mem',mem_base='eax',mem_disp=TABLE,mem_size=4),
+               Operand(type='mem',mem_index='eax',mem_scale=4,mem_disp=TABLE,mem_size=4,mem_seg='fs'),
                Operand(type='mem',mem_index='eax',mem_scale=4,mem_disp=TABLE,mem_size=2)):
         assert lifter._switch_index_pairs(op,ARMS)==[]
     op=Operand(type='mem',mem_index='eax',mem_scale=4,mem_disp=TABLE,mem_size=4)
     assert lifter._switch_index_pairs(op,ARMS*22)==[]
+
+
+def test_compiled_foreign_arms_keep_value_first_and_guest_tail_frame():
+    image = _image(bytes.fromhex('83e003'), TABLE)
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin='foreign-slot-test')
+    lifter = Lifter(func_db={a: {'name': f'sub_{a:08X}'} for a in ARMS}, xbe_data=image,
+                    manual_functions={ARMS[1]})
+    lifter.func_start, lifter.func_end = BASE, BASE + 10
+    bodies, checks = [], []
+    for tag, disp, first, step in (('normal', TABLE, 0, 1), ('positive', TABLE-4, 1, 1),
+                                   ('negative', TABLE+12, -1, -1)):
+        op = Operand(type='mem', mem_index='ecx', mem_scale=4, mem_disp=disp, mem_size=4)
+        insn = Instruction(BASE+3, 7, 'jmp', '', '', operands=[op])
+        body = '\n'.join(lifter._lift_jmp(insn, [op]))
+        assert 'foreign switch: 3 proven slots' in body
+        bodies.append(f'void jump_{tag}(void){{{body}}}')
+        ordered = ARMS if step == 1 else list(reversed(ARMS))
+        for i, arm in enumerate(ordered):
+            index = first + i * step
+            for runtime, want in ((0xdeadbeef, arm), (ARMS[1], ARMS[1])):
+                checks.append(f'ecx=(uint32_t){index};MEM32(0x{disp+index*4:X})=0x{runtime:X};'
+                              f'esp=0x1000;ebp=0x1234;jump_{tag}();'
+                              f'if(target!=0x{want:X}||site!=0x{BASE+3:X}||esp!=0x1004||g_seh_ebp!=0x1234)return 1;')
+        # A live target outside the proven ordinal set retains generic dispatch.
+        outside = 3 if tag == 'normal' else 0
+        checks.append(f'ecx=(uint32_t){outside};MEM32(0x{disp+outside*4:X})=0xdeadbeef;'
+                      f'esp=0x1000;jump_{tag}();if(target!=0xdeadbeef||esp!=0x1004)return 2;')
+    prelude = r'''
+#include <stdint.h>
+uint32_t ecx,esp,ebp,g_seh_ebp,target,site;
+uint8_t image[512];
+#define MEM32(a) (*(uint32_t*)(image+(uint32_t)(a)-0x10000u))
+#define RECOMP_ITAIL_AT(a,s) do{target=(a);site=(s);esp+=4;}while(0)
+'''
+    ran = _build_and_run(prelude+'\n'.join(bodies)+'int main(void){'+''.join(checks)+'return 0;}')
+    assert ran.returncode == 0, ran.stdout+ran.stderr
+
+
+def test_foreign_table_requires_full_bounded_known_census():
+    op = Operand(type='mem', mem_index='eax', mem_scale=4, mem_disp=TABLE, mem_size=4)
+    lifter = Lifter(func_db={a: {} for a in ARMS})
+    lifter.func_start, lifter.func_end = BASE, BASE + 10
+    # Rejected first census must not be trimmed into an apparently valid table.
+    lifter._read_jump_table = lambda va: [0x10001, *ARMS] if va == TABLE else ARMS
+    assert lifter._foreign_switch_index_pairs(op) == []
+    lifter._read_jump_table = lambda va: ARMS * 22 if va == TABLE else ARMS
+    assert lifter._foreign_switch_index_pairs(op) == []
+    lifter._read_jump_table = lambda va: ARMS
+    lifter.jump_table_targets = {TABLE: []}
+    assert lifter._foreign_switch_index_pairs(op) == []
+    lifter.jump_table_targets = {}
+    op.mem_seg = 'fs'
+    assert lifter._foreign_switch_index_pairs(op) == []
 
 
 def test_tail_site_shared_across_translation_units_and_cleared_after_dispatch():
