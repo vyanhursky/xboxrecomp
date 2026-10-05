@@ -46,6 +46,16 @@ HRESULT d3d8_gamma_begin(ID3D11RenderTargetView *target);
 void d3d8_gamma_end(ID3D11RenderTargetView *target);
 void d3d8_gamma_shutdown(void);
 
+/* Scaled presentation (d3d8_present.c): the title's target is a texture and
+ * each present draws it into a swap chain that follows the window. */
+BOOL d3d8_present_scaling(void);
+UINT d3d8_present_render_scale(void);     /* 0 = no host override */
+int  d3d8_present_vsync(void);            /* -1 = no host choice */
+HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);
+ID3D11Texture2D *d3d8_present_game_texture(void);
+HRESULT d3d8_present_blit(void);
+void d3d8_present_shutdown(void);
+
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);
 const DWORD         *d3d8_GetTSS(DWORD stage);

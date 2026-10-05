@@ -1,0 +1,79 @@
+/*
+ * Scaled presentation: the title renders into a target of its own size and
+ * that picture is drawn into a window of any size.
+ *
+ * Without this the swap chain is the title's size times the render scale and
+ * DXGI stretches it over whatever the window happens to be, so a resized or
+ * full-screen window distorts the picture. With it the swap chain follows the
+ * window, the title's target stays what it was, and each present draws one
+ * into the other: filling the window, or at a fixed aspect ratio with black
+ * bars.
+ *
+ * Opt-in. A host that does not call d3d8_present_enable_scaling gets the
+ * swap chain and the behaviour it always had.
+ *
+ * Plain C types only, so the fitting arithmetic can be tested without a
+ * Direct3D device.
+ */
+
+#ifndef D3D8_PRESENT_H
+#define D3D8_PRESENT_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct D3D8PresentRect {
+    unsigned x, y, width, height;
+} D3D8PresentRect;
+
+/* Where a picture of aspect num:den goes in a dst_w x dst_h window: centred
+ * and as large as fits when `keep` is set, the whole window otherwise. A
+ * degenerate ratio or window yields the whole window. */
+static inline D3D8PresentRect d3d8_present_fit(unsigned num, unsigned den,
+                                               unsigned dst_w, unsigned dst_h, int keep)
+{
+    D3D8PresentRect r;
+    r.x = 0; r.y = 0; r.width = dst_w; r.height = dst_h;
+    if (!keep || !num || !den || !dst_w || !dst_h)
+        return r;
+    if ((unsigned long long)dst_w * den > (unsigned long long)dst_h * num) {
+        /* Window wider than the picture: bars left and right. */
+        r.width = (unsigned)(((unsigned long long)dst_h * num + den / 2) / den);
+        if (r.width > dst_w) r.width = dst_w;
+        if (!r.width) r.width = 1;
+        r.x = (dst_w - r.width) / 2;
+    } else {
+        /* Window taller: bars above and below. */
+        r.height = (unsigned)(((unsigned long long)dst_w * den + num / 2) / num);
+        if (r.height > dst_h) r.height = dst_h;
+        if (!r.height) r.height = 1;
+        r.y = (dst_h - r.height) / 2;
+    }
+    return r;
+}
+
+/* Call before the device is created. */
+void d3d8_present_enable_scaling(int enable);
+
+/* The render scale to create the device with (1-4). 0 leaves the choice to
+ * RECOMP_RENDER_SCALE and its default. Call before the device is created. */
+void d3d8_present_set_render_scale(unsigned scale);
+
+/* The following take effect at the next present, from any thread. */
+
+/* keep = 1: show the picture at num:den with bars. keep = 0: fill the window. */
+void d3d8_present_set_aspect(int keep, unsigned num, unsigned den);
+
+/* 1 waits for the display's vertical blank, 0 does not, -1 leaves the choice
+ * to RECOMP_PRESENT_VSYNC. */
+void d3d8_present_set_vsync(int vsync);
+
+/* 1 = smooth (bilinear), 0 = sharp (nearest). */
+void d3d8_present_set_linear_filter(int linear);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* D3D8_PRESENT_H */
