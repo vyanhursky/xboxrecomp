@@ -139,7 +139,7 @@ static HRESULT d3d8_present(void)
          * movie once stalled without it (2 start-ups of 4, before the guest
          * clocks moved to QPC); 6 of 6 reach the title now. */
         static int env_vsync = -1;
-        int vsync = d3d8_present_vsync();   /* the host's choice, if it made one */
+        int vsync = d3d8_present_sync_interval();   /* the host's choice, if it made one */
         if (env_vsync < 0) {
             const char *e = getenv("RECOMP_PRESENT_VSYNC");
             env_vsync = (e && *e == '1') ? 1 : 0;
@@ -153,6 +153,7 @@ static HRESULT d3d8_present(void)
         if (FAILED(hr))
             fprintf(stderr, "D3D8: Scaled presentation failed: 0x%08lX\n", hr);
         hr = IDXGISwapChain_Present(g_device_state.swap_chain, (UINT)vsync, 0);
+        d3d8_present_trace_pacing();
     }
     d3d8_gamma_end(g_device_state.default_rtv);
     return hr;
@@ -307,19 +308,36 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.Windowed = pp->Windowed;
     scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    hr = D3D11CreateDeviceAndSwapChain(
-        NULL,
-        D3D_DRIVER_TYPE_HARDWARE,
-        NULL,
-        create_flags,
-        NULL, 0,
-        D3D11_SDK_VERSION,
-        &scd,
-        &state->swap_chain,
-        &state->d3d11_device,
-        &feature_level,
-        &state->d3d11_context
-    );
+    hr = E_FAIL;
+    if (d3d8_present_scaling()) {
+        /* Flip model: a borderless window is presented without a copy through
+         * the desktop compositor, which is what exclusive full screen used to
+         * be needed for, and a sync interval waits for the display properly.
+         * Windows 10 and later; older systems fall through to the blit model. */
+        DXGI_SWAP_CHAIN_DESC flip = scd;
+        flip.BufferCount = 2;
+        flip.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
+                                           NULL, 0, D3D11_SDK_VERSION, &flip, &state->swap_chain,
+                                           &state->d3d11_device, &feature_level,
+                                           &state->d3d11_context);
+        if (FAILED(hr))
+            fprintf(stderr, "D3D8: Flip-model swap chain unavailable (0x%08lX); using the blit model\n", hr);
+    }
+    if (FAILED(hr))
+        hr = D3D11CreateDeviceAndSwapChain(
+            NULL,
+            D3D_DRIVER_TYPE_HARDWARE,
+            NULL,
+            create_flags,
+            NULL, 0,
+            D3D11_SDK_VERSION,
+            &scd,
+            &state->swap_chain,
+            &state->d3d11_device,
+            &feature_level,
+            &state->d3d11_context
+        );
 
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);

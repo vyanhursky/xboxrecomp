@@ -65,9 +65,29 @@ void d3d8_present_set_render_scale(unsigned scale);
 /* keep = 1: show the picture at num:den with bars. keep = 0: fill the window. */
 void d3d8_present_set_aspect(int keep, unsigned num, unsigned den);
 
-/* 1 waits for the display's vertical blank, 0 does not, -1 leaves the choice
- * to RECOMP_PRESENT_VSYNC. */
+/* 1 paces presentation on the display when it can show 60 frames a second
+ * evenly -- a refresh rate that is a multiple of 60, presenting every 1 to 4
+ * refreshes -- and does not wait otherwise (90, 144, 165 Hz: a title frame
+ * would land on an uneven number of refreshes). 0 never waits. -1 leaves the
+ * choice to RECOMP_PRESENT_VSYNC, which waits one refresh. */
 void d3d8_present_set_vsync(int vsync);
+
+/* 1 while presents are being paced on the display, which makes the display
+ * the title's frame clock. A host whose title is otherwise paced by a timer
+ * should relax that timer while this holds (xbox_Nv2aSetFlipHz), or the two
+ * clocks drift against each other and frames are repeated or dropped. */
+int d3d8_present_display_paced(void);
+
+/* The sync interval for a display refreshing at `hz` (as Windows reports it,
+ * so 59 for 59.94): hz / 60 when that is 1 to 4 and hz is within 1 of a
+ * multiple of 60, else 0. */
+static inline unsigned d3d8_present_interval_for(unsigned hz)
+{
+    unsigned k = (hz + 30) / 60;
+    unsigned nearest = k * 60;
+    unsigned off = hz > nearest ? hz - nearest : nearest - hz;
+    return (k >= 1 && k <= 4 && off <= 1) ? k : 0;
+}
 
 /* 1 = smooth (bilinear), 0 = sharp (nearest). */
 void d3d8_present_set_linear_filter(int linear);

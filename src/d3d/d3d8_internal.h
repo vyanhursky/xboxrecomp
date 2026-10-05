@@ -50,7 +50,8 @@ void d3d8_gamma_shutdown(void);
  * each present draws it into a swap chain that follows the window. */
 BOOL d3d8_present_scaling(void);
 UINT d3d8_present_render_scale(void);     /* 0 = no host override */
-int  d3d8_present_vsync(void);            /* -1 = no host choice */
+int  d3d8_present_sync_interval(void);    /* -1 = no host choice; else Present's interval */
+void d3d8_present_trace_pacing(void);     /* RECOMP_PRESENT_PACING=1 */
 HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);
 ID3D11Texture2D *d3d8_present_game_texture(void);
 HRESULT d3d8_present_blit(void);
