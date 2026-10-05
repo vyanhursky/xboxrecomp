@@ -138,11 +138,20 @@ static HRESULT d3d8_present(void)
          * presented 13-15 frames a second; without the wait, 20-23. The intro
          * movie once stalled without it (2 start-ups of 4, before the guest
          * clocks moved to QPC); 6 of 6 reach the title now. */
-        static int vsync = -1;
-        if (vsync < 0) {
+        static int env_vsync = -1;
+        int vsync = d3d8_present_vsync();   /* the host's choice, if it made one */
+        if (env_vsync < 0) {
             const char *e = getenv("RECOMP_PRESENT_VSYNC");
-            vsync = (e && *e == '1') ? 1 : 0;
+            env_vsync = (e && *e == '1') ? 1 : 0;
         }
+        if (vsync < 0)
+            vsync = env_vsync;
+        /* With scaled presentation the title's target is not the swap chain's
+         * buffer: draw it into the window first (after the gamma pass, so the
+         * window shows the ramped picture). */
+        hr = d3d8_present_blit();
+        if (FAILED(hr))
+            fprintf(stderr, "D3D8: Scaled presentation failed: 0x%08lX\n", hr);
         hr = IDXGISwapChain_Present(g_device_state.swap_chain, (UINT)vsync, 0);
     }
     d3d8_gamma_end(g_device_state.default_rtv);
@@ -272,6 +281,8 @@ static HRESULT d3d11_create_device_and_swap_chain(
     {
         const char *e = getenv("RECOMP_RENDER_SCALE");
         int n = e && *e ? atoi(e) : 2;
+        if (d3d8_present_render_scale())
+            n = (int)d3d8_present_render_scale();
         state->render_scale = (UINT)(n < 1 ? 1 : n > 4 ? 4 : n);
     }
     state->logical_width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
@@ -280,6 +291,12 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
     scd.BufferDesc.Width = state->logical_width * state->render_scale;
     scd.BufferDesc.Height = state->logical_height * state->render_scale;
+    if (d3d8_present_scaling()) {
+        /* The swap chain follows the window (0 = its client area); the title
+         * renders into a target of its own, created with the render targets. */
+        scd.BufferDesc.Width = 0;
+        scd.BufferDesc.Height = 0;
+    }
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
@@ -316,8 +333,8 @@ static HRESULT d3d11_create_device_and_swap_chain(
 #endif
 
     state->hwnd = pp->hDeviceWindow;
-    state->width = scd.BufferDesc.Width;
-    state->height = scd.BufferDesc.Height;
+    state->width = state->logical_width * state->render_scale;
+    state->height = state->logical_height * state->render_scale;
 
     return S_OK;
 }
@@ -328,17 +345,25 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
     D3D11_TEXTURE2D_DESC depth_desc;
     HRESULT hr;
 
-    /* Create render target view from swap chain back buffer */
-    hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
-                                   &IID_ID3D11Texture2D,
-                                   (void **)&back_buffer);
-    if (FAILED(hr)) return hr;
+    if (d3d8_present_scaling()) {
+        /* The default target is a texture of the title's size; each present
+         * draws it into the swap chain's buffer (d3d8_present.c). */
+        hr = d3d8_present_create_game_target(state->width, state->height,
+                                             &state->default_rtv);
+        if (FAILED(hr)) return hr;
+    } else {
+        /* Create render target view from swap chain back buffer */
+        hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
+                                       &IID_ID3D11Texture2D,
+                                       (void **)&back_buffer);
+        if (FAILED(hr)) return hr;
 
-    hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
-                                              (ID3D11Resource *)back_buffer,
-                                              NULL, &state->default_rtv);
-    ID3D11Texture2D_Release(back_buffer);
-    if (FAILED(hr)) return hr;
+        hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
+                                                  (ID3D11Resource *)back_buffer,
+                                                  NULL, &state->default_rtv);
+        ID3D11Texture2D_Release(back_buffer);
+        if (FAILED(hr)) return hr;
+    }
 
     /* Create depth stencil */
     memset(&depth_desc, 0, sizeof(depth_desc));
@@ -441,6 +466,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         /* Cleanup subsystems first */
         up_ring_shutdown();
         d3d8_gamma_shutdown();
+        d3d8_present_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
@@ -550,9 +576,16 @@ static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuff
 
     if (!ppSurface) return E_INVALIDARG;
 
-    hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
-                                   &IID_ID3D11Texture2D,
-                                   (void **)&back_buffer);
+    if (d3d8_present_scaling() && d3d8_present_game_texture()) {
+        /* What the title drew, whatever the window's size. */
+        back_buffer = d3d8_present_game_texture();
+        ID3D11Texture2D_AddRef(back_buffer);
+        hr = S_OK;
+    } else {
+        hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
+                                       &IID_ID3D11Texture2D,
+                                       (void **)&back_buffer);
+    }
     if (FAILED(hr)) return hr;
 
     *ppSurface = d3d8_surface_create(back_buffer, 0, 0,
