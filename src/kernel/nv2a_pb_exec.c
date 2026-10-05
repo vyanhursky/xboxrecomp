@@ -544,18 +544,29 @@ static uint32_t s_cmb_fc[2];
 /* getenv is slow in the debug CRT -- it locks and copies -- and this was
  * asked on every method and every draw: the largest single cost of the GPU
  * executor in a fight (58 of 34 samples on its thread, some twice). */
+/* A host whose presents are paced by the display (vsync) makes the display
+ * the frame clock: this timer then only has to stop the title running away
+ * when the display is not pacing (a minimised or covered window presents at
+ * once). 0 returns to RECOMP_FLIP_HZ. */
+static volatile LONG s_flip_hz_override;
+void xbox_Nv2aSetFlipHz(int hz) { InterlockedExchange(&s_flip_hz_override, hz > 0 ? hz : 0); }
+
 static void flip_pace(void)
 {
-    static int hz = -1;
+    static int env_hz = -1;
+    int hz;
     static LARGE_INTEGER freq, next;
     LARGE_INTEGER now;
     LONGLONG period;
 
-    if (hz < 0) {
+    if (env_hz < 0) {
         const char *e = getenv("RECOMP_FLIP_HZ");
-        hz = e && *e ? atoi(e) : 60;
+        env_hz = e && *e ? atoi(e) : 60;
         QueryPerformanceFrequency(&freq);
     }
+    hz = env_hz;
+    if (hz > 0 && s_flip_hz_override)
+        hz = (int)s_flip_hz_override;
     if (hz <= 0)
         return;
     period = freq.QuadPart / hz;

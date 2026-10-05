@@ -37,6 +37,21 @@ int main(void)
     expect("sliver", d3d8_present_fit(4, 3, 1000, 1, 1), 499, 0, 1, 1);
     expect("column", d3d8_present_fit(4, 3, 1, 1000, 1), 0, 499, 1, 1);
 
+    /* Which displays can show 60 frames a second evenly. */
+    {
+        static const unsigned cases[][2] = {
+            { 60, 1 }, { 59, 1 }, { 61, 1 }, { 120, 2 }, { 119, 2 }, { 180, 3 }, { 240, 4 }, { 239, 4 },
+            { 90, 0 }, { 144, 0 }, { 165, 0 }, { 75, 0 }, { 50, 0 }, { 30, 0 }, { 300, 0 }, { 360, 0 }, { 0, 0 },
+        };
+        unsigned i;
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+            if (d3d8_present_interval_for(cases[i][0]) != cases[i][1]) {
+                printf("FAIL interval for %u Hz: got %u, want %u\n", cases[i][0],
+                       d3d8_present_interval_for(cases[i][0]), cases[i][1]);
+                g_failed++;
+            }
+    }
+
     if (g_failed) { printf("%d case(s) failed\n", g_failed); return 1; }
     printf("d3d8_present_fit: all cases passed\n");
     return 0;

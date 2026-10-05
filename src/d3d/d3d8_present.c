@@ -4,6 +4,7 @@
 #include "d3d8_present.h"
 #include <d3dcompiler.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static BOOL g_scaling;
@@ -48,7 +49,80 @@ void d3d8_present_set_linear_filter(int linear)
 
 BOOL d3d8_present_scaling(void) { return g_scaling; }
 UINT d3d8_present_render_scale(void) { return g_scale_override; }
-int d3d8_present_vsync(void) { return (int)g_vsync; }
+
+/* The display the window is on, re-read about once a second: the window can
+ * be dragged to another monitor and the mode can change. */
+static unsigned present_refresh_hz(void)
+{
+    static unsigned hz, countdown;
+    IDXGIOutput *output = NULL;
+    if (countdown) { countdown--; return hz; }
+    countdown = 60;
+    if (SUCCEEDED(IDXGISwapChain_GetContainingOutput(d3d8_GetSwapChain(), &output)) && output) {
+        DXGI_OUTPUT_DESC desc;
+        DEVMODEW mode;
+        memset(&mode, 0, sizeof(mode));
+        mode.dmSize = sizeof(mode);
+        if (SUCCEEDED(IDXGIOutput_GetDesc(output, &desc)) &&
+            EnumDisplaySettingsW(desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode))
+            hz = mode.dmDisplayFrequency;
+        IDXGIOutput_Release(output);
+    }
+    return hz;
+}
+
+int d3d8_present_sync_interval(void)
+{
+    LONG vsync = g_vsync;
+    if (vsync <= 0) return (int)vsync;
+    return (int)d3d8_present_interval_for(present_refresh_hz());
+}
+
+int d3d8_present_display_paced(void)
+{
+    return g_scaling && g_window_rtv && d3d8_present_sync_interval() > 0;
+}
+
+/* RECOMP_PRESENT_PACING=1: every two seconds, how evenly frames reached the
+ * display -- the count, the shortest, mean and longest interval, and how many
+ * were more than half as long again as the median. */
+void d3d8_present_trace_pacing(void)
+{
+    static int on = -1;
+    static LARGE_INTEGER freq, last, window_start;
+    static double ms[512], sorted[512];
+    static unsigned n;
+    LARGE_INTEGER now;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PRESENT_PACING");
+        on = e && *e == '1';
+        QueryPerformanceFrequency(&freq);
+    }
+    if (!on) return;
+    QueryPerformanceCounter(&now);
+    if (last.QuadPart && n < 512)
+        ms[n++] = (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    last = now;
+    if (!window_start.QuadPart) window_start = now;
+    if (now.QuadPart - window_start.QuadPart >= 2 * freq.QuadPart && n) {
+        double lo = ms[0], hi = ms[0], sum = 0, median;
+        unsigned i, j, late = 0;
+        for (i = 0; i < n; i++) {
+            if (ms[i] < lo) lo = ms[i];
+            if (ms[i] > hi) hi = ms[i];
+            sum += ms[i];
+            for (j = i; j > 0 && sorted[j - 1] > ms[i]; j--) sorted[j] = sorted[j - 1];
+            sorted[j] = ms[i];
+        }
+        median = sorted[n / 2];
+        for (i = 0; i < n; i++) if (ms[i] > median * 1.5) late++;
+        fprintf(stderr, "[PACING] %u presents, interval %.2f / %.2f / %.2f ms (min/mean/max), "
+                        "median %.2f, %u late, sync interval %d\n",
+                n, lo, sum / n, hi, median, late, d3d8_present_sync_interval());
+        n = 0;
+        window_start = now;
+    }
+}
 ID3D11Texture2D *d3d8_present_game_texture(void) { return g_game_texture; }
 
 void d3d8_present_shutdown(void)
