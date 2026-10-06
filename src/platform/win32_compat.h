@@ -44,6 +44,8 @@ extern "C" {
 #define THREAD_PRIORITY_ABOVE_NORMAL  1
 #define THREAD_PRIORITY_HIGHEST       2
 #define THREAD_PRIORITY_TIME_CRITICAL 15
+#define THREAD_PRIORITY_ERROR_RETURN  0x7FFFFFFF
+#define STILL_ACTIVE 259u
 
 #define DUPLICATE_CLOSE_SOURCE   0x00000001u
 #define DUPLICATE_SAME_ACCESS    0x00000002u
@@ -92,6 +94,16 @@ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+static inline LONGLONG InterlockedAdd64(volatile LONGLONG *Addend, LONGLONG Value)
+{ return __atomic_add_fetch(Addend, Value, __ATOMIC_SEQ_CST); }
+#define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#if defined(__x86_64__) || defined(__i386__)
+#define YieldProcessor() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define YieldProcessor() __asm__ volatile("yield")
+#else
+#define YieldProcessor() ((void)0)
+#endif
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -455,6 +467,7 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_EXECUTE_HANDLER       1
 #define EXCEPTION_CONTINUE_EXECUTION  (-1)
 #define EXCEPTION_ACCESS_VIOLATION       0xC0000005u
+#define EXCEPTION_SINGLE_STEP            0x80000004u
 #define EXCEPTION_STACK_OVERFLOW         0xC00000FDu
 #define EXCEPTION_ILLEGAL_INSTRUCTION    0xC000001Du
 #define EXCEPTION_INT_DIVIDE_BY_ZERO     0xC0000094u

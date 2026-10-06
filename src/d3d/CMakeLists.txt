@@ -5,6 +5,7 @@
 if(WIN32)
     add_library(xbox_d3d8 STATIC
         d3d8_device.c
+        d3d8_formats.c
         d3d8_gamma.c
         d3d8_present.c
         d3d8_resources.c
@@ -22,6 +23,8 @@ if(WIN32)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
+        d3d8_formats.c
+        d3d8_nv2a_pending.c
     )
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)

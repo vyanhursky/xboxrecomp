@@ -25,6 +25,12 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* sched_setaffinity, CPU_SET */
+#endif
+#include <sched.h>
+#endif
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
@@ -493,6 +499,7 @@ void guest_cpu_part(void);
  * low numbers are the performance cores. RECOMP_GUEST_CORES=all turns it off. */
 void xbox_PinToGuestCore(void)
 {
+#if defined(_WIN32)
     static DWORD_PTR mask;
     static volatile LONG init;
 
@@ -513,6 +520,46 @@ void xbox_PinToGuestCore(void)
         YieldProcessor();
     if (mask)
         SetThreadAffinityMask(GetCurrentThread(), mask);
+#elif defined(__linux__)
+    /* The same rule through the scheduler: every guest thread on one CPU the
+     * process is allowed to use, CPU 2 when it is one of them. */
+    static volatile LONG init;
+    static int cpu = -1;
+    cpu_set_t set;
+
+    if (InterlockedCompareExchange(&init, 1, 0) == 0) {
+        const char *s = getenv("RECOMP_GUEST_CORES");
+        if (!(s && !strcmp(s, "all")) && sched_getaffinity(0, sizeof set, &set) == 0) {
+            int i;
+            if (CPU_ISSET(2, &set))
+                cpu = 2;
+            else
+                for (i = 0; i < CPU_SETSIZE && cpu < 0; i++)
+                    if (CPU_ISSET(i, &set))
+                        cpu = i;
+            if (cpu >= 0)
+                fprintf(stderr, "  [KERNEL] guest threads share host CPU %d"
+                                " (RECOMP_GUEST_CORES=all to spread them)\n", cpu);
+        }
+        InterlockedExchange(&init, 2);
+    }
+    while (init != 2)
+        YieldProcessor();
+    if (cpu >= 0) {
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        sched_setaffinity(0, sizeof set, &set);
+    }
+#else
+    /* Darwin on Apple Silicon has no thread affinity. Guest threads run on
+     * any core here until the one-guest-CPU rule has a mechanism that does
+     * not need one; a title that relies on a single core can race. */
+    static volatile LONG said;
+
+    if (InterlockedCompareExchange(&said, 1, 0) == 0)
+        fprintf(stderr, "  [KERNEL] this host cannot pin threads: guest threads"
+                        " are NOT held to one CPU\n");
+#endif
 }
 
 static DWORD WINAPI bridge_thread_main(LPVOID param)
@@ -3305,12 +3352,16 @@ static void bridge_RtlNtStatusToDosError(void)
     static rtl_status_fn host_map;
     static int looked;
 
+#if defined(_WIN32)
     if (!looked) {
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         if (ntdll)
             host_map = (rtl_status_fn)(void *)GetProcAddress(ntdll, "RtlNtStatusToDosError");
         looked = 1;
     }
+#else
+    (void)looked;
+#endif
     if (host_map) {
         g_eax = host_map((LONG)status);
         return;

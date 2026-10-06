@@ -310,7 +310,6 @@ typedef struct w32_object {
 /* pseudo handles for "current thread"/"current process" */
 #define PSEUDO_CURRENT_PROCESS ((HANDLE)(LONG_PTR)-1)
 #define PSEUDO_CURRENT_THREAD  ((HANDLE)(LONG_PTR)-2)
-#define STILL_ACTIVE 259u
 
 static __thread w32_object *t_self_obj = NULL;
 static __thread DWORD       t_tid      = 0;

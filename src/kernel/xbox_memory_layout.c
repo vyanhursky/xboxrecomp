@@ -425,6 +425,7 @@ static void ac97_clear_reset_bits(void)
     }
 }
 
+#if defined(_WIN32)
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -462,12 +463,14 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif
 
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
 static void ac97_arm_write_trap(void)
 {
+#if defined(_WIN32)
     DWORD old;
 
     if (!g_mcpx_memory || g_ac97_page)
@@ -491,6 +494,13 @@ static void ac97_arm_write_trap(void)
     fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+#else
+    /* The trap steps the faulting write with the CPU's trace flag, which has
+     * no signal-context equivalent on every host. Not armed here yet. */
+    (void)g_ac97_veh; (void)s_ac97_stepping; (void)ac97_clear_reset_bits;
+    fprintf(stderr, "  AC97: the bus-master write trap is not available on this"
+                    " host; a channel reset will spin\n");
+#endif
 }
 
 /*
@@ -2091,6 +2101,7 @@ static void watch_report(void)
     fflush(stderr);
 }
 
+#if defined(_WIN32)
 static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -2122,6 +2133,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif
 
 /* The target, which may be reached through pointers that do not exist yet.
  *
@@ -2217,7 +2229,12 @@ static int watch_arm(uint32_t va)
     /* The page holding the guest dword, in host terms. */
     g_watch_page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset
                                          + g_watch_va)) & ~(uintptr_t)4095);
+#if defined(_WIN32)
     g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
+#else
+    /* Stepping the trapped write needs the trace flag; see the AC97 trap. */
+    (void)s_watch_stepping; (void)watch_report;
+#endif
     if (!g_watch_veh
             || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
         if (g_watch_veh) {

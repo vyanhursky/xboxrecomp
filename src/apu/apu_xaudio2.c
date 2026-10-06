@@ -171,6 +171,7 @@ int xa2_get_buffer_size(void)
 
 #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
 
+int  g_xa2_dropped, g_xa2_starved;
 int  xa2_init(void)                                   { return 0; }
 void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
