@@ -16,6 +16,7 @@
 #define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
+#include "mmio_trap.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -1070,6 +1071,13 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
+
 #if defined(__APPLE__)
 /* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
  * for VirtualAlloc: MAP_FIXED silently unmaps whatever already occupies the
@@ -1188,7 +1196,21 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
 {
+    uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
+
     if (oldProtect) *oldProtect = PAGE_READWRITE;
+    /* The console's devices are laid out in 4 KB pages and the callers close
+     * them one at a time. Where the host page is larger, mprotect would close
+     * the neighbours as well, so such a range goes to the trap layer, which
+     * keeps the neighbours working as memory. */
+    if (((uintptr_t)address | (uintptr_t)size) & (page - 1)) {
+        if (newProtect == PAGE_NOACCESS)
+            return mmio_trap_close(address, size) == 0;
+        if (mmio_trap_remove(address) == 0)
+            return TRUE;
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;   /* a finer protection than the host has */
+    }
     return mprotect(address, size, prot_from_page(newProtect)) == 0;
 }
 

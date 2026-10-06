@@ -858,6 +858,16 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    /* A partition device opened as a directory wants the volume, not the
+     * image's bytes: use the directory that holds the image, as on Windows. */
+    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+        struct stat st;
+        char *slash;
+        if (stat(host_path, &st) == 0 && S_ISREG(st.st_mode)
+                && (slash = strrchr(host_path, '/')) != NULL && slash != host_path)
+            *slash = 0;
+    }
+
     int fd;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
@@ -870,6 +880,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (fd < 0) {
         int e = errno;
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        fprintf(stderr, "  [FILE] %s -> not opened (%s: %s)\n",
+                xbox_path, host_path, strerror(e));
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;

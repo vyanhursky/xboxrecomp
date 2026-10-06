@@ -165,37 +165,21 @@ static uint64_t mem_get(const uint8_t *p, int size)
     return v;
 }
 
-/* The device whose range holds [va, va + size), if any. Two devices can sit
- * in one host page, so this is not necessarily the trap whose span faulted. */
-static mmio_trap *device_at(uintptr_t va, int size)
-{
-    int i, n = g_trap_count;
+/* Where one element of an access goes. */
+typedef struct {
+    void              *dev;      /* callbacks, with off ... */
+    mmio_trap_read_fn  rd;
+    mmio_trap_write_fn wr;
+    uint32_t           off;
+    uint8_t           *mem;      /* ... or plain memory, when rd is NULL */
+} target;
 
-    for (i = 0; i < n; i++) {
-        mmio_trap *d = &g_traps[i];
-        if (d->len && va >= d->addr && va + (uintptr_t)size <= d->addr + d->len)
-            return d;
-    }
-    return NULL;
-}
-
-/* One element of the access at host address va, against a device if it is
- * inside one and against the open view of t's span if it is only nearby. */
-static int element(mmio_trap *t, ucontext_t *uc, const mmio_a64_access *a,
-                   uintptr_t va, int reg)
+static void element(ucontext_t *uc, const mmio_a64_access *a, const target *t, int reg)
 {
-    mmio_trap *d = device_at(va, a->size);
     uint64_t v;
 
-    if (!d) {
-        if (!t->open || va < t->span
-                || va + (uintptr_t)a->size > t->span + t->span_len)
-            return 0;
-        g_neighbours++;
-    }
     if (a->is_load) {
-        v = d ? d->rd(d->dev, (uint32_t)(va - d->addr), a->size)
-              : mem_get(t->open + (va - t->span), a->size);
+        v = t->rd ? t->rd(t->dev, t->off, a->size) : mem_get(t->mem, a->size);
         if (a->size < 8)
             v &= (1ULL << (a->size * 8)) - 1;
         if (a->sign_extend) {
@@ -208,53 +192,154 @@ static int element(mmio_trap *t, ucontext_t *uc, const mmio_a64_access *a,
         v = reg_get(uc, reg);
         if (a->size < 8)
             v &= (1ULL << (a->size * 8)) - 1;
-        if (d)
-            d->wr(d->dev, (uint32_t)(va - d->addr), v, a->size);
+        if (t->rd)
+            t->wr(t->dev, t->off, v, a->size);
         else
-            memcpy(t->open + (va - t->span), &v, (size_t)a->size);
+            memcpy(t->mem, &v, (size_t)a->size);
     }
+}
+
+static void finish(ucontext_t *uc, const mmio_a64_access *a)
+{
+    if (a->writeback) {
+        if (a->rn == 31) UC_SP(uc) += (uint64_t)a->wb_delta;
+        else             reg_set(uc, a->rn, reg_get(uc, a->rn) + (uint64_t)a->wb_delta);
+    }
+    UC_PC(uc) += 4;
+}
+
+static int decode_at_pc(ucontext_t *uc, mmio_a64_access *a, uint32_t *insn)
+{
+    memcpy(insn, (const void *)(uintptr_t)UC_PC(uc), 4);
+    return mmio_a64_decode(*insn, a);
+}
+
+/* The address a pair starts at. The fault address may be its second element,
+ * so this comes from the base register. */
+static uintptr_t pair_base(ucontext_t *uc, const mmio_a64_access *a, uint32_t insn)
+{
+    uint64_t base = (a->rn == 31) ? (uint64_t)UC_SP(uc) : reg_get(uc, a->rn);
+    int64_t off = sext((insn >> 15) & 0x7F, 7) * a->size;
+
+    if (((insn >> 23) & 3) == 1)
+        off = 0;                           /* post-index reads at the base */
+    return (uintptr_t)(base + (uint64_t)off);
+}
+
+int mmio_trap_emulate(void *uctx, uint32_t off, void *dev,
+                      mmio_trap_read_fn rd, mmio_trap_write_fn wr)
+{
+    ucontext_t *uc = uctx;
+    mmio_a64_access a;
+    uint32_t insn;
+    target t = { dev, rd, wr, off, NULL };
+
+    if (!rd || !wr || !decode_at_pc(uc, &a, &insn))
+        return 0;
+    element(uc, &a, &t, a.rt);
+    if (a.rt2 >= 0) {
+        t.off += (uint32_t)a.size;
+        element(uc, &a, &t, a.rt2);
+    }
+    finish(uc, &a);
     return 1;
 }
 
-static int service(mmio_trap *t, ucontext_t *uc, uintptr_t fault)
+/* The trap whose device range holds [va, va + size). Two devices can sit in
+ * one host page, so this is not necessarily the one whose span faulted. */
+static mmio_trap *device_at(uintptr_t va, int size)
+{
+    int i, n = g_trap_count;
+
+    for (i = 0; i < n; i++) {
+        mmio_trap *d = &g_traps[i];
+        if (d->len && va >= d->addr && va + (uintptr_t)size <= d->addr + d->len)
+            return d;
+    }
+    return NULL;
+}
+
+static mmio_trap *span_at(uintptr_t va)
+{
+    int i, n = g_trap_count;
+
+    for (i = 0; i < n; i++) {
+        mmio_trap *t = &g_traps[i];
+        if (t->len && va >= t->span && va < t->span + t->span_len)
+            return t;
+    }
+    return NULL;
+}
+
+/* Resolve one element at va: a device with callbacks, or memory next to one.
+ * 0 if it is neither, or a device this file has no callbacks for. */
+static int resolve(uintptr_t va, int size, int devices, target *out)
+{
+    mmio_trap *d = device_at(va, size), *t;
+
+    memset(out, 0, sizeof *out);
+    if (d) {
+        if (!devices || !d->rd)
+            return 0;
+        out->dev = d->dev; out->rd = d->rd; out->wr = d->wr;
+        out->off = (uint32_t)(va - d->addr);
+        return 1;
+    }
+    t = span_at(va);
+    if (!t || !t->open || va + (uintptr_t)size > t->span + t->span_len)
+        return 0;
+    out->mem = t->open + (va - t->span);
+    return 1;
+}
+
+/* Service the access at fault from the table: devices too when asked, else
+ * only memory that shares a host page with one. */
+static int service(ucontext_t *uc, uintptr_t fault, int devices)
 {
     mmio_a64_access a;
     uint32_t insn;
     uintptr_t va = fault;
+    target t0, t1;
 
-    memcpy(&insn, (const void *)(uintptr_t)UC_PC(uc), 4);
-    if (!mmio_a64_decode(insn, &a))
+    if (!decode_at_pc(uc, &a, &insn))
         return 0;
-    /* For a pair the fault address may be its second element, so the address
-     * comes from the base register instead. */
+    if (a.rt2 >= 0)
+        va = pair_base(uc, &a, insn);
+    if (!resolve(va, a.size, devices, &t0))
+        return 0;
+    if (a.rt2 >= 0 && !resolve(va + (uintptr_t)a.size, a.size, devices, &t1))
+        return 0;
+    element(uc, &a, &t0, a.rt);
+    g_neighbours += !t0.rd;
     if (a.rt2 >= 0) {
-        uint64_t base = (a.rn == 31) ? (uint64_t)UC_SP(uc) : reg_get(uc, a.rn);
-        int64_t off = sext((insn >> 15) & 0x7F, 7) * a.size;
-        if (((insn >> 23) & 3) == 1)
-            off = 0;                       /* post-index reads at the base */
-        va = (uintptr_t)(base + (uint64_t)off);
+        element(uc, &a, &t1, a.rt2);
+        g_neighbours += !t1.rd;
     }
-    if (!element(t, uc, &a, va, a.rt))
-        return 0;
-    if (a.rt2 >= 0 && !element(t, uc, &a, va + (uintptr_t)a.size, a.rt2))
-        return 0;
-    if (a.writeback) {
-        if (a.rn == 31) UC_SP(uc) += (uint64_t)a.wb_delta;
-        else            reg_set(uc, a.rn, reg_get(uc, a.rn) + (uint64_t)a.wb_delta);
-    }
-    UC_PC(uc) += 4;
+    finish(uc, &a);
     return 1;
 }
+
+uintptr_t mmio_trap_pc(void *uctx) { return (uintptr_t)UC_PC((ucontext_t *)uctx); }
 
 #else  /* !__aarch64__ */
 
 /* x86-64 hosts use mmio_decode.h's decoder once its context is not Win32's;
- * until then a fault here is not serviced and falls through to the previous
- * handler, which reports it. */
-static int service(mmio_trap *t, ucontext_t *uc, uintptr_t fault)
-{ (void)t; (void)uc; (void)fault; return 0; }
+ * until then a fault here is not serviced and the caller reports it. */
+static int service(ucontext_t *uc, uintptr_t fault, int devices)
+{ (void)uc; (void)fault; (void)devices; return 0; }
+
+int mmio_trap_emulate(void *uctx, uint32_t off, void *dev,
+                      mmio_trap_read_fn rd, mmio_trap_write_fn wr)
+{ (void)uctx; (void)off; (void)dev; (void)rd; (void)wr; return 0; }
+
+uintptr_t mmio_trap_pc(void *uctx) { (void)uctx; return 0; }
 
 #endif
+
+int mmio_trap_neighbour(void *uctx, uintptr_t fault)
+{
+    return service((ucontext_t *)uctx, fault, 0);
+}
 
 /* ── Signal plumbing ───────────────────────────────────────────────────── */
 
@@ -272,20 +357,10 @@ static void chain(const struct sigaction *prev, int sig, siginfo_t *si, void *ct
 
 static void on_fault(int sig, siginfo_t *si, void *ctx)
 {
-    uintptr_t fault = (uintptr_t)si->si_addr;
-    int saved = errno, i, n = g_trap_count;
+    int saved = errno;
 
-    for (i = 0; i < n; i++) {
-        mmio_trap *t = &g_traps[i];
-        if (t->len && fault >= t->span && fault < t->span + t->span_len) {
-            if (service(t, (ucontext_t *)ctx, fault)) {
-                errno = saved;
-                return;
-            }
-            break;
-        }
-    }
-    chain(sig == SIGBUS ? &g_prev_bus : &g_prev_segv, sig, si, ctx);
+    if (!service((ucontext_t *)ctx, (uintptr_t)si->si_addr, 1))
+        chain(sig == SIGBUS ? &g_prev_bus : &g_prev_segv, sig, si, ctx);
     errno = saved;
 }
 
@@ -330,21 +405,18 @@ static uint8_t *open_view(uintptr_t span, uintptr_t span_len)
 #endif
 }
 
-int mmio_trap_add(void *addr, size_t len, void *dev,
-                  mmio_trap_read_fn rd, mmio_trap_write_fn wr)
+static int add(void *addr, size_t len, void *dev,
+               mmio_trap_read_fn rd, mmio_trap_write_fn wr)
 {
     uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
     uintptr_t a = (uintptr_t)addr;
     mmio_trap *t;
     int n = g_trap_count;
 
-    if (!rd || !wr || !len || (a | len) % DEVICE_PAGE || n >= MMIO_TRAP_MAX) {
+    if (!len || (a | len) % DEVICE_PAGE || n >= MMIO_TRAP_MAX) {
         errno = EINVAL;
         return -1;
     }
-    if (install())
-        return -1;
-
     t = &g_traps[n];
     t->addr = a;
     t->len  = len;
@@ -368,6 +440,36 @@ int mmio_trap_add(void *addr, size_t len, void *dev,
         return -1;
     }
     return 0;
+}
+
+int mmio_trap_add(void *addr, size_t len, void *dev,
+                  mmio_trap_read_fn rd, mmio_trap_write_fn wr)
+{
+    if (!rd || !wr) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (install())
+        return -1;
+    return add(addr, len, dev, rd, wr);
+}
+
+void *mmio_trap_view(void *addr)
+{
+    uintptr_t va = (uintptr_t)addr;
+    int i, n = g_trap_count;
+
+    for (i = 0; i < n; i++) {
+        mmio_trap *t = &g_traps[i];
+        if (t->len && t->open && va >= t->span && va < t->span + t->span_len)
+            return t->open + (va - t->span);
+    }
+    return addr;
+}
+
+int mmio_trap_close(void *addr, size_t len)
+{
+    return add(addr, len, NULL, NULL, NULL);
 }
 
 int mmio_trap_remove(void *addr)

@@ -56,3 +56,13 @@ void d3d8_combiners_set_nv2a(const DWORD color_icw[8], const DWORD alpha_icw[8],
 }
 
 void d3d8_combiners_clear_nv2a(void) { pending("d3d8_combiners_clear_nv2a"); }
+
+/* Presentation settings and the gamma ramp: accepted and not applied, because
+ * there is no presenter here to apply them to yet. */
+void d3d8_present_enable_scaling(int enable)            { (void)enable; }
+void d3d8_present_set_render_scale(unsigned scale)      { (void)scale; }
+void d3d8_present_set_aspect(int keep, unsigned num, unsigned den)
+{ (void)keep; (void)num; (void)den; }
+void d3d8_present_set_vsync(int vsync)                  { (void)vsync; }
+void d3d8_present_set_linear_filter(int linear)         { (void)linear; }
+void d3d8_gamma_set(const void *ramp)                   { (void)ramp; }

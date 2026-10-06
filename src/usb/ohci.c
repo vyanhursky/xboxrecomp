@@ -1541,7 +1541,6 @@ void xbox_OhciInit(void)
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
      * the title's VEH routes the faults back to xbox_OhciHandleMmio.
@@ -1570,7 +1569,6 @@ void xbox_OhciInit(void)
             }
         }
     }
-#endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
                     "%d ports each, one device on HC0 root port %u\n",
@@ -1605,7 +1603,6 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
 
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
-#if defined(_WIN32)
     OhciController *hc = hc_for(xbox_va);
     int ok;
 
@@ -1615,11 +1612,15 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
      * time with a value that is not a descriptor. Naming the instruction
      * that does it is the only way to tell a driver quirk from a defect in
      * how this runtime answers it. */
+#if defined(_WIN32)
     s_last_write_rip = (uint64_t)((PCONTEXT)ctx)->Rip;
-    ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
+#else
+    s_last_write_rip = (uint64_t)mmio_trap_pc(ctx);
+#endif
+    ok = mmio_emulate(ctx, xbox_va - hc->base, hc,
                       ohci_read, ohci_write);
     if (!ok && hc->decode_fail++ < 20) {
-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
+        const uint8_t *ip = (const uint8_t *)(uintptr_t)s_last_write_rip;
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
                         "%02X %02X %02X %02X %02X %02X\n",
                 hc->index, xbox_va - hc->base,
@@ -1627,10 +1628,6 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
         fflush(stderr);
     }
     return ok;
-#else
-    (void)ctx; (void)xbox_va;
-    return 0;
-#endif
 }
 
 void xbox_OhciReport(void)

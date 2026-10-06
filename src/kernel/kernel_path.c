@@ -443,165 +443,6 @@ static void xbox_remember_host_path(const wchar_t *p)
 
 
 
-/* A clock for unattended runs that starts at a point in the title rather than
- * at process start. The title reaches its title screen anywhere from 100 to
- * 190 s into a run, depending on how start-up goes, so a button script in
- * absolute seconds lands on different screens each time. Anchored to the Nth
- * open of a file -- Def Jam loads screens\feflow.xml once at boot and again
- * as the title screen comes up, so "feflow.xml#2" -- the same script reaches
- * the same screens.
- *
- *     RECOMP_SCRIPT_ANCHOR=feflow.xml#2
- */
-static ULONGLONG s_anchor_ft;             /* FILETIME the anchor was reached */
-static int s_anchor_state = -1;           /* -1 unread, 0 none, 1 waiting, 2 reached */
-static char s_anchor_sub[128];
-static int s_anchor_want = 1, s_anchor_seen;
-
-static void anchor_init(void)
-{
-    const char *s = getenv("RECOMP_SCRIPT_ANCHOR");
-    const char *hash;
-    size_t i, n;
-
-    s_anchor_state = 0;
-    if (!s || !*s)
-        return;
-    hash = strchr(s, '#');
-    n = hash ? (size_t)(hash - s) : strlen(s);
-    if (n >= sizeof(s_anchor_sub))
-        n = sizeof(s_anchor_sub) - 1;
-    for (i = 0; i < n; i++)
-        s_anchor_sub[i] = (char)tolower((unsigned char)s[i]);
-    s_anchor_sub[n] = 0;
-    if (hash && atoi(hash + 1) > 0)
-        s_anchor_want = atoi(hash + 1);
-    s_anchor_state = 1;
-}
-
-/* More anchors, for a script that crosses several screens whose timing varies:
- * xbox_FileOpenSeconds("main.mus#1") is the seconds since the first open of a
- * path containing "main.mus", negative before it. A spec is watched from its
- * first query, so ask before the file can open (the pad and the translator do,
- * from start-up). */
-/* A screen-by-screen chain uses one per screen, the captures more. */
-#define OPEN_WATCH_MAX 32
-static struct { char sub[64]; int want, seen; volatile ULONGLONG ft; } s_open_watch[OPEN_WATCH_MAX];
-static volatile LONG s_open_watches;
-static CRITICAL_SECTION s_open_watch_lock;
-static INIT_ONCE s_open_watch_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK open_watch_init(PINIT_ONCE o, PVOID p, PVOID *c)
-{
-    (void)o; (void)p; (void)c;
-    InitializeCriticalSection(&s_open_watch_lock);
-    return TRUE;
-}
-
-static ULONGLONG now_ft(void)
-{
-    FILETIME now;
-    GetSystemTimeAsFileTime(&now);
-    return ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
-}
-
-double xbox_FileOpenSeconds(const char *spec)
-{
-    char sub[64];
-    const char *hash = strchr(spec, '#');
-    size_t i, n = hash ? (size_t)(hash - spec) : strlen(spec);
-    int want = (hash && atoi(hash + 1) > 0) ? atoi(hash + 1) : 1;
-    LONG k, count;
-    ULONGLONG ft = 0;
-
-    if (n >= sizeof sub)
-        n = sizeof sub - 1;
-    for (i = 0; i < n; i++)
-        sub[i] = (char)tolower((unsigned char)spec[i]);
-    sub[n] = 0;
-    InitOnceExecuteOnce(&s_open_watch_once, open_watch_init, NULL, NULL);
-    EnterCriticalSection(&s_open_watch_lock);
-    count = s_open_watches;
-    for (k = 0; k < count; k++)
-        if (s_open_watch[k].want == want && !strcmp(s_open_watch[k].sub, sub))
-            break;
-    if (k == count && count < OPEN_WATCH_MAX) {
-        memcpy(s_open_watch[k].sub, sub, n + 1);
-        s_open_watch[k].want = want;
-        s_open_watches = count + 1;
-    } else if (k == count) {
-        static int warned;
-        if (!warned++)
-            fprintf(stderr, "  [SCRIPT] more than %d anchors: \"%s\" is never reached\n",
-                    OPEN_WATCH_MAX, sub);
-    }
-    if (k < OPEN_WATCH_MAX)
-        ft = s_open_watch[k].ft;
-    LeaveCriticalSection(&s_open_watch_lock);
-    return ft ? (double)(now_ft() - ft) / 1e7 : -1.0;
-}
-
-static void anchor_note_open(const char *xbox_path)
-{
-    char low[512];
-    size_t i;
-    LONG k;
-
-    for (i = 0; xbox_path[i] && i < sizeof(low) - 1; i++)
-        low[i] = (char)tolower((unsigned char)xbox_path[i]);
-    low[i] = 0;
-    if (s_open_watches) {
-        EnterCriticalSection(&s_open_watch_lock);
-        for (k = 0; k < s_open_watches; k++) {
-            if (s_open_watch[k].ft || !strstr(low, s_open_watch[k].sub)
-                    || ++s_open_watch[k].seen < s_open_watch[k].want)
-                continue;
-            s_open_watch[k].ft = now_ft();
-            fprintf(stderr, "  [SCRIPT] anchor \"%s\" #%d reached\n",
-                    s_open_watch[k].sub, s_open_watch[k].want);
-        }
-        LeaveCriticalSection(&s_open_watch_lock);
-    }
-    if (s_anchor_state < 0)
-        anchor_init();
-    if (s_anchor_state != 1)
-        return;
-    if (!strstr(low, s_anchor_sub) || ++s_anchor_seen < s_anchor_want)
-        return;
-    s_anchor_ft = now_ft();
-    s_anchor_state = 2;
-    fprintf(stderr, "  [SCRIPT] anchor \"%s\" #%d reached: script time starts now\n",
-            s_anchor_sub, s_anchor_want);
-}
-
-/* Anything else worth anchoring a script to -- a title's own events, such as
- * the screen its front end asks for -- is offered here, and matches the same
- * specs as a file path does. */
-void xbox_NoteAnchorEvent(const char *text)
-{
-    if (text)
-        anchor_note_open(text);
-}
-
-double xbox_ScriptSeconds(void)
-{
-    FILETIME c, e, k, u, now;
-    ULONGLONG from, to;
-
-    if (s_anchor_state < 0)
-        anchor_init();
-    if (s_anchor_state == 1)
-        return -1.0;
-    GetSystemTimeAsFileTime(&now);
-    to = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
-    if (s_anchor_state == 2) {
-        from = s_anchor_ft;
-    } else {
-        if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
-            return 0.0;
-        from = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
-    }
-    return (double)(to - from) / 1e7;
-}
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
@@ -646,7 +487,7 @@ translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
-    anchor_note_open(xbox_path);
+    xbox_AnchorNoteOpen(xbox_path);
     xbox_KernelTrail(8);
     fflush(stderr);
     {
@@ -696,6 +537,8 @@ translate:
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -730,6 +573,128 @@ static void mkdir_p(const char* path)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
 }
 
+/* The raw disk and partition devices as image files; see the Windows half
+ * for the table and why a directory cannot answer for them. */
+#define XBOX_PART_TABLE_OFFSET 0x800
+#define XBOX_PART_IN_USE       0x80000000u
+
+static void put_le32(unsigned char *p, uint32_t v)
+{
+    p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
+}
+
+static void posix_disk_images(void)
+{
+    static const struct { const char *name; uint32_t start, size; } parts[] = {
+        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
+        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
+        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
+        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
+        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
+    };
+    static const uint64_t part_sectors[6] = {
+        0, 0x00465400ull, 0x000FA000ull, 0x00177000ull, 0x00177000ull, 0x00177000ull,
+    };
+    unsigned char sector[512];
+    char image[MAX_PATH * 2];
+    int fd;
+
+    memset(sector, 0, sizeof(sector));
+    memcpy(sector, "****PARTINFO****", 16);
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
+        size_t n = strlen(parts[i].name);
+        memset(e, ' ', 16);
+        memcpy(e, parts[i].name, n < 16 ? n : 16);
+        put_le32(e + 16, XBOX_PART_IN_USE);
+        put_le32(e + 20, parts[i].start);
+        put_le32(e + 24, parts[i].size);
+        put_le32(e + 28, 0);
+    }
+    snprintf(image, sizeof(image), "%s/Partition0.img", s_save_dir);
+    fd = open(image, O_WRONLY | O_CREAT, 0644);
+    if (fd >= 0) {
+        if (pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET) < 0)
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "partition table: %s", strerror(errno));
+        close(fd);
+    }
+    /* Extending a file leaves a hole, so these cost nothing until written. */
+    for (int p = 1; p <= 5; p++) {
+        snprintf(image, sizeof(image), "%s/Partition%d.img", s_save_dir, p);
+        fd = open(image, O_WRONLY | O_CREAT, 0644);
+        if (fd < 0)
+            continue;
+        if (ftruncate(fd, (off_t)(part_sectors[p] * 512ull)) != 0)
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "size %s: %s", image, strerror(errno));
+        close(fd);
+    }
+}
+
+/* The dashboard's first-run copy: the disc's UDATA/<title id>/ files to the
+ * save area's UserData, never over a file already there. */
+static void posix_first_run_udata(void)
+{
+    char root[MAX_PATH * 2], src[MAX_PATH * 3], dst[MAX_PATH * 3];
+    DIR *titles, *files;
+    struct dirent *t, *f;
+
+    snprintf(root, sizeof(root), "%s/UDATA", s_game_dir);
+    titles = opendir(root);
+    if (!titles)
+        return;
+    while ((t = readdir(titles)) != NULL) {
+        if (t->d_name[0] == '.')
+            continue;
+        snprintf(src, sizeof(src), "%s/%s", root, t->d_name);
+        files = opendir(src);
+        if (!files)
+            continue;
+        snprintf(dst, sizeof(dst), "%s/UserData/%s", s_save_dir, t->d_name);
+        mkdir_p(dst);
+        while ((f = readdir(files)) != NULL) {
+            struct stat st;
+            char buf[65536];
+            ssize_t n;
+            int in, out;
+
+            snprintf(src, sizeof(src), "%s/%s/%s", root, t->d_name, f->d_name);
+            if (stat(src, &st) != 0 || !S_ISREG(st.st_mode))
+                continue;
+            snprintf(dst, sizeof(dst), "%s/UserData/%s/%s", s_save_dir, t->d_name, f->d_name);
+            out = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0644);
+            if (out < 0)
+                continue;
+            in = open(src, O_RDONLY);
+            while (in >= 0 && (n = read(in, buf, sizeof(buf))) > 0)
+                if (write(out, buf, (size_t)n) != n)
+                    break;
+            if (in >= 0)
+                close(in);
+            close(out);
+        }
+        closedir(files);
+    }
+    closedir(titles);
+}
+
+/* "\Device\Harddisk0\PartitionN" with nothing below it is the device. */
+static BOOL posix_partition_device_path(const char *xbox_path, char *out, DWORD n)
+{
+    int len = match_prefix(xbox_path, "\\Device\\Harddisk0\\Partition");
+    const char *rest;
+
+    if (!len || xbox_path[len] < '0' || xbox_path[len] > '9')
+        return FALSE;
+    rest = xbox_path + len + 1;
+    if (*rest == '\\' || *rest == '/')
+        rest++;
+    if (*rest != '\0')
+        return FALSE;
+    snprintf(out, n, "%s/Partition%c.img", s_save_dir, xbox_path[len]);
+    return TRUE;
+}
+
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     if (game_dir) {
@@ -759,6 +724,22 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
 
+    /* What the Windows half sets up, for the same reasons given there: the
+     * save-side directories, the disc's first-run UDATA copy, and the image
+     * files that stand in for the raw partition devices. */
+    {
+        static const char *const subs[] = { "TitleData", "UserData", "Cache",
+                                            "SystemData" };
+        char path[MAX_PATH * 2];
+        mkdir_p(s_save_dir);
+        for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+            snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[i]);
+            mkdir_p(path);
+        }
+        posix_first_run_udata();
+        posix_disk_images();
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
@@ -783,6 +764,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
 
+    if (posix_partition_device_path(xbox_path, host_path_buf, buf_size)) {
+        fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
+        fflush(stderr);
+        return TRUE;
+    }
+
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
@@ -801,6 +788,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    /* The same line and the same notification as the Windows translator: the
+     * unattended-run tooling reads one and times its input by the other. */
+    fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    xbox_AnchorNoteOpen(xbox_path);
+    fflush(stderr);
     {
         char remainder_posix[MAX_PATH];
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);

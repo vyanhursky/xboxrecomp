@@ -280,4 +280,38 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
+#else /* !_WIN32 */
+
+#include "../platform/mmio_trap.h"
+
+#define APU_MMIO_BASE  0xFE800000u
+
+static uint64_t apu_trap_read(void *dev, uint32_t off, int size)
+{ return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, size); }
+
+static void apu_trap_write(void *dev, uint32_t off, uint64_t val, int size)
+{ mcpx_apu_mmio_write((MCPXAPUState *)dev, off, val, size); }
+
+/* ctx is the signal handler's ucontext. */
+bool apu_hook_handle_mmio(void *ctx, uintptr_t fault_addr,
+                          uint32_t fault_xbox_va, int is_write)
+{
+    uint32_t off = fault_xbox_va - APU_MMIO_BASE;
+    bool ok;
+
+    (void)fault_addr;
+    if (!g_apu_state)
+        return false;
+    ok = mmio_trap_emulate(ctx, off, g_apu_state, apu_trap_read, apu_trap_write) != 0;
+    if (getenv("RECOMP_APU_TRACE")) {
+        static unsigned n;
+        if (n++ < 400)
+            fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
+                    is_write ? "write" : "read ", off,
+                    (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4),
+                    ok ? "" : "  (decode failed)");
+    }
+    return ok;
+}
+
 #endif /* _WIN32 */

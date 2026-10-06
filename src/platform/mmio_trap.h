@@ -30,12 +30,36 @@ typedef void     (*mmio_trap_write_fn)(void *dev, uint32_t off, uint64_t val, in
 /* Trap [addr, addr + len). off in the callbacks is relative to addr. Both
  * must be multiples of 4096; the host pages that contain the range are closed
  * and every other byte in them keeps behaving as memory. Returns 0, or -1
- * with errno set. Installs the signal handlers on first use. */
+ * with errno set. Installs this file's signal handlers on first use. */
 int mmio_trap_add(void *addr, size_t len, void *dev,
                   mmio_trap_read_fn rd, mmio_trap_write_fn wr);
 
-/* Reopen a range added above. */
+/* Reopen a range added or closed here. */
 int mmio_trap_remove(void *addr);
+
+/*
+ * The same pieces for a program that owns the signal handler itself and
+ * routes faults to its device models by address, as the Win32 hosts do with
+ * their vectored handler.
+ *
+ *   mmio_trap_close     close a 4 KB-granular range without callbacks
+ *   mmio_trap_emulate   service the faulting instruction in uctx against one
+ *                       device: the access is at off, and a second element of
+ *                       a pair follows it. 1 if serviced and stepped over.
+ *   mmio_trap_neighbour 1 if fault only shared a host page with a closed
+ *                       range and was completed as memory.
+ *   mmio_trap_pc        the faulting instruction's address, for reports.
+ */
+int       mmio_trap_close(void *addr, size_t len);
+/* Where host code can reach the memory at addr with a bulk copy: the open
+ * view when a closed range shares its host page, addr itself otherwise. A
+ * memcpy through the guest's view would fault in an instruction nothing here
+ * decodes. */
+void     *mmio_trap_view(void *addr);
+int       mmio_trap_emulate(void *uctx, uint32_t off, void *dev,
+                            mmio_trap_read_fn rd, mmio_trap_write_fn wr);
+int       mmio_trap_neighbour(void *uctx, uintptr_t fault);
+uintptr_t mmio_trap_pc(void *uctx);
 
 /* Accesses completed against the open view because they only shared a host
  * page with a device. A cost to watch on 16 KB hosts; always 0 on 4 KB ones. */

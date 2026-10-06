@@ -202,5 +202,20 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
+#else /* !_WIN32 */
+
+/* Off Windows the context is the signal handler's ucontext and the decoding
+ * belongs to the trap layer, which knows the host's instruction set. */
+#include "mmio_trap.h"
+
+typedef mmio_trap_read_fn  mmio_read_fn;
+typedef mmio_trap_write_fn mmio_write_fn;
+
+static inline int mmio_emulate(void *ctx, uint32_t off, void *dev,
+                               mmio_read_fn rd, mmio_write_fn wr)
+{
+    return mmio_trap_emulate(ctx, off, dev, rd, wr);
+}
+
 #endif /* _WIN32 */
 #endif /* MMIO_DECODE_H */

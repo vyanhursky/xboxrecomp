@@ -10,6 +10,7 @@ if(WIN32)
     add_executable(d3d8_smoke
         ${CMAKE_CURRENT_SOURCE_DIR}/test_main.c
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_resources.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_formats.c
     )
     target_include_directories(d3d8_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d
@@ -30,6 +31,7 @@ if(WIN32)
     add_executable(d3d8_a8
         test_a8.c
         ../../src/d3d/d3d8_resources.c
+        ../../src/d3d/d3d8_formats.c
         ../../src/d3d/d3d8_shaders.c
         ../../src/d3d/d3d8_combiners.c
     )
