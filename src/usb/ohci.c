@@ -756,9 +756,21 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * pad unresponsive. */
         moved = len;
         if (endpoint == 0) {
+            /* A class SET_REPORT's data stage is an OUT with bytes in it. The
+             * only such report a pad takes is rumble. */
+            if (dev > 0 && len >= 6 && g_setup_pending && g_setup.bmRequestType == 0x21
+                    && g_setup.bRequest == 0x09) {
+                const uint8_t *p = guest_ptr(cbp, (uint32_t)len);
+                if (p) usb_gamepad_out(dev - 1, p, len);
+            }
             g_setup_pending = 0;
             s_n_out_ep0++;
         } else {
+            /* Rumble on the pad's interrupt OUT endpoint. */
+            if (dev > 0 && len > 0) {
+                const uint8_t *p = guest_ptr(cbp, (uint32_t)len);
+                if (p) usb_gamepad_out(dev - 1, p, len);
+            }
             s_n_out_other++;
         }
     }

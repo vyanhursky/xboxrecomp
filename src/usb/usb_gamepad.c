@@ -220,6 +220,40 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
     return -1;
 }
 
+/* ---- rumble ------------------------------------------------------------ */
+
+void usb_gamepad_out(int pad, const uint8_t *data, int len)
+{
+    static unsigned ignored;
+    XBOX_VIBRATION v;
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX || !data) return;
+    if (len < 6 || data[0] != 0 || data[1] != 6) {
+        if (len > 0 && ignored++ < 4) {
+            fprintf(stderr, "  [USB] pad %d: ignored a %d-byte output report (%02X %02X)\n",
+                    pad + 1, len, data[0], len > 1 ? data[1] : 0);
+            fflush(stderr);
+        }
+        return;
+    }
+    v.wLeftMotorSpeed  = (WORD)(data[2] | (data[3] << 8));
+    v.wRightMotorSpeed = (WORD)(data[4] | (data[5] << 8));
+    {
+        /* RECOMP_RUMBLE_LOG=1 names the first reports the title sends. */
+        static int log_left = -1;
+        static unsigned last[USB_GAMEPAD_MAX];
+        unsigned now_pair = (unsigned)v.wLeftMotorSpeed << 16 | v.wRightMotorSpeed;
+        if (log_left < 0) log_left = getenv("RECOMP_RUMBLE_LOG") ? 60 : 0;
+        if (log_left > 0 && now_pair != last[pad]) {
+            last[pad] = now_pair;
+            log_left--;
+            fprintf(stderr, "  [USB] pad %d rumble: left %u right %u\n", pad + 1,
+                    (unsigned)v.wLeftMotorSpeed, (unsigned)v.wRightMotorSpeed);
+            fflush(stderr);
+        }
+    }
+    xbox_InputSetState((DWORD)pad, &v);
+}
+
 /* ---- the input report -------------------------------------------------- */
 
 /* The host's own pad, through the layer that already maps one to XInput.
