@@ -32,8 +32,12 @@ extern "C" {
 typedef enum RecompSettingType {
     RECOMP_SETTING_BOOL,   /* "true"/"false" (also 1/0, yes/no, on/off) */
     RECOMP_SETTING_INT,    /* clamped to [min, max] */
-    RECOMP_SETTING_ENUM    /* one of choices[]; the value is the index */
+    RECOMP_SETTING_ENUM,   /* one of choices[]; the value is the index */
+    RECOMP_SETTING_STRING  /* free text of at most RECOMP_SETTING_TEXT_MAX-1 characters */
 } RecompSettingType;
+
+/* Room for a string setting's text, terminator included. */
+#define RECOMP_SETTING_TEXT_MAX 96
 
 /* The change takes effect at the next start, not while running. */
 #define RECOMP_SETTING_RESTART  0x1
@@ -54,11 +58,14 @@ typedef struct RecompSetting {
     const char *env;                /* overriding environment variable, or NULL */
     unsigned flags;
     const char *help;               /* one line, written above the key */
+    const char *def_text;           /* RECOMP_SETTING_STRING: the default; NULL is "" */
 
     /* Managed by the library; leave zero in the initialiser. */
     int stored;                     /* default or file value: what gets saved */
     int value;                      /* effective value: stored, or the env override */
     RecompSettingSource source;
+    char stored_text[RECOMP_SETTING_TEXT_MAX];  /* strings: what gets saved */
+    char value_text[RECOMP_SETTING_TEXT_MAX];   /* strings: effective text */
 } RecompSetting;
 
 typedef void (*RecompSettingChanged)(const RecompSetting *setting, void *user);
@@ -87,16 +94,25 @@ RecompSetting *recomp_settings_at(size_t index);
 /* The effective value. Returns `fallback` for an unknown setting. */
 int recomp_settings_get(const char *section, const char *key, int fallback);
 
+/* A string setting's effective text, copied into `buf`. Returns `buf`, or
+ * `fallback` for an unknown setting or one that is not a string. Safe from any
+ * thread. */
+const char *recomp_settings_get_text(const char *section, const char *key,
+                                     char *buf, size_t size, const char *fallback);
+
 /* Set the stored value (clamped, or rejected for an enum index out of range).
  * The effective value follows unless an environment variable overrides it.
  * Calls the change callback when the effective value changed. Returns 1 if the
  * stored value changed, 0 if not, -1 for an unknown setting or a bad value. */
 int recomp_settings_set(const char *section, const char *key, int value);
 
-/* Parse `text` as the setting's type and set it: "true", "3", "4:3". */
+/* Parse `text` as the setting's type and set it: "true", "3", "4:3". A string
+ * setting takes the text as it is (leading and trailing blanks removed) and is
+ * rejected, with -1, if it does not fit. */
 int recomp_settings_set_text(const char *section, const char *key, const char *text);
 
-/* The value as it is written to the file. Returns `buf`. */
+/* The value as it is written to the file. Returns `buf`. A string setting is
+ * formatted from the setting's own stored text; `value` is not used. */
 const char *recomp_settings_format(const RecompSetting *setting, int value,
                                    char *buf, size_t size);
 
