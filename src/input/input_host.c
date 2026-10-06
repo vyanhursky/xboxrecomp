@@ -32,7 +32,9 @@ typedef struct Device {
 #ifdef XBOXRECOMP_HAVE_SDL3
     SDL_Gamepad *gp;
     SDL_JoystickID id;
+    SDL_Joystick *vjoy;             /* the virtual pad's joystick, to set its buttons */
 #endif
+    int is_virtual;
     DWORD xi_index;
 } Device;
 
@@ -50,6 +52,7 @@ static struct Host {
     InputHostConfig cfg;
     int kb_slot, kb_merge, players;
     uint8_t key[INPUT_KEY_COUNT];
+    uint8_t script_held[INPUT_CONTROL_COUNT];
     ULONGLONG wheel_until[2];
     volatile LONG focused;
     Device dev[MAX_DEVICES];
@@ -156,6 +159,57 @@ static void read_sdl(SDL_Gamepad *gp, InputRaw *r)
     r->rx = clamp_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX));
     r->ry = clamp_axis(-1 - SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY));
     raw_directions(r);
+}
+#endif
+
+#ifdef XBOXRECOMP_HAVE_SDL3
+/* ---- virtual pads (tests) ---------------------------------------------------- */
+
+static SDL_JoystickID g_virtual_ids[SLOTS];
+static SDL_Joystick *g_virtual_joys[SLOTS];
+static int g_virtual_count;
+
+static bool SDLCALL virtual_rumble(void *userdata, Uint16 low, Uint16 high)
+{
+    static int logged;
+    if (logged++ < 80)
+        fprintf(stderr, "[INPUT] virtual pad %d rumble: %u %u\n", (int)(intptr_t)userdata + 1,
+                (unsigned)low, (unsigned)high);
+    return true;
+}
+
+static void attach_virtual_pads(int n)
+{
+    int i;
+    for (i = 0; i < n && i < SLOTS; i++) {
+        SDL_VirtualJoystickDesc desc;
+        SDL_INIT_INTERFACE(&desc);
+        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        desc.name = "Virtual test pad";
+        desc.userdata = (void *)(intptr_t)i;
+        desc.Rumble = virtual_rumble;
+        g_virtual_ids[i] = SDL_AttachVirtualJoystick(&desc);
+        g_virtual_joys[i] = g_virtual_ids[i] ? SDL_OpenJoystick(g_virtual_ids[i]) : NULL;
+        if (g_virtual_ids[i]) g_virtual_count++;
+    }
+}
+
+static int is_virtual_id(SDL_JoystickID id)
+{
+    int i;
+    for (i = 0; i < SLOTS; i++)
+        if (g_virtual_ids[i] == id) return 1;
+    return 0;
+}
+
+static SDL_Joystick *virtual_joystick(SDL_JoystickID id)
+{
+    int i;
+    for (i = 0; i < SLOTS; i++)
+        if (g_virtual_ids[i] == id) return g_virtual_joys[i];
+    return NULL;
 }
 #endif
 
@@ -310,6 +364,8 @@ static void poll_once(void)
     EnterCriticalSection(&H.cs);
     cfg = H.cfg;
     memcpy(keys, H.key, sizeof(keys));
+    for (s = 0; s < INPUT_CONTROL_COUNT; s++)
+        if (H.script_held[s] && cfg.keys.count[s]) keys[cfg.keys.key[s][0]] = 1;
     LeaveCriticalSection(&H.cs);
     live = focused || cfg.ignore_focus;
     keys[INPUT_KEY_WHEEL_UP] = now < H.wheel_until[0];
@@ -361,7 +417,8 @@ static void hotplug_once(void)
         SDL_UpdateGamepads();
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
-                open_sdl_gamepad(e.gdevice.which);
+                if (!(H.cfg.no_pads && !is_virtual_id(e.gdevice.which)))
+                    open_sdl_gamepad(e.gdevice.which);
             } else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
                 EnterCriticalSection(&H.cs);
                 for (d = 0; d < MAX_DEVICES; d++)
@@ -373,7 +430,7 @@ static void hotplug_once(void)
         return;
     }
 #endif
-    if (now - xi_scan < 1000) return;
+    if (H.cfg.no_pads || now - xi_scan < 1000) return;
     xi_scan = now;
     for (d = 0; d < XUSER_MAX_COUNT; d++) {
         InputRaw raw;
@@ -407,10 +464,11 @@ static DWORD WINAPI reader_thread(LPVOID unused)
     timeBeginPeriod(1);
 
 #ifdef XBOXRECOMP_HAVE_SDL3
-    if (H.cfg.use_sdl) {
+    if (H.cfg.use_sdl && (!H.cfg.no_pads || H.cfg.virtual_pads)) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
         if (SDL_Init(SDL_INIT_GAMEPAD)) {
             H.sdl = 1;
+            attach_virtual_pads(H.cfg.virtual_pads);
         } else {
             log_line("[INPUT] SDL gamepads unavailable (%s); using XInput\n", SDL_GetError(), 0);
         }
@@ -431,18 +489,22 @@ static DWORD WINAPI reader_thread(LPVOID unused)
         }
         ids = SDL_GetGamepads(&count);
         for (i = 0; ids && i < count && i < MAX_DEVICES; i++) {
-            SDL_Gamepad *gp = SDL_OpenGamepad(ids[i]);
+            SDL_Gamepad *gp;
+            if (H.cfg.no_pads && !is_virtual_id(ids[i])) continue;
+            gp = SDL_OpenGamepad(ids[i]);
             if (!gp) continue;
             d = new_device(1, SDL_GetGamepadName(gp));
             if (d < 0) { SDL_CloseGamepad(gp); continue; }
             H.dev[d].gp = gp;
             H.dev[d].id = ids[i];
+            H.dev[d].is_virtual = is_virtual_id(ids[i]);
+            H.dev[d].vjoy = virtual_joystick(ids[i]);
             H.found++;
         }
         SDL_free(ids);
     }
 #endif
-    if (!H.sdl) {
+    if (!H.sdl && !H.cfg.no_pads) {
         for (i = 0; i < XUSER_MAX_COUNT; i++) {
             InputRaw raw;
             if (read_xinput((DWORD)i, &raw)) {
@@ -482,7 +544,16 @@ static DWORD WINAPI reader_thread(LPVOID unused)
         if (H.dev[d].used) free_device(d);
     LeaveCriticalSection(&H.cs);
 #ifdef XBOXRECOMP_HAVE_SDL3
-    if (H.sdl) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    if (H.sdl) {
+        for (i = 0; i < SLOTS; i++) {
+            if (g_virtual_joys[i]) SDL_CloseJoystick(g_virtual_joys[i]);
+            if (g_virtual_ids[i]) SDL_DetachVirtualJoystick(g_virtual_ids[i]);
+            g_virtual_joys[i] = NULL;
+            g_virtual_ids[i] = 0;
+        }
+        g_virtual_count = 0;
+        SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    }
 #endif
     timeEndPeriod(1);
     return 0;
@@ -503,6 +574,7 @@ int xbox_HostInputStart(const InputHostConfig *cfg)
     memset(H.last, 0, sizeof(H.last));
     memset(H.packet, 0, sizeof(H.packet));
     memset(H.key, 0, sizeof(H.key));
+    memset(H.script_held, 0, sizeof(H.script_held));
     H.wheel_until[0] = H.wheel_until[1] = 0;
     for (i = 0; i < SLOTS; i++) H.slot[i].device = -1;
     H.found = 0;
@@ -544,6 +616,63 @@ void xbox_HostInputConfigure(const InputHostConfig *cfg)
         H.cfg.keyboard = kb;
         H.cfg.players = players;
     }
+    LeaveCriticalSection(&H.cs);
+}
+
+int xbox_HostInputSlotIsVirtual(int slot)
+{
+    int v = 0;
+    if (!H.running || slot < 0 || slot >= SLOTS) return 0;
+    EnterCriticalSection(&H.cs);
+    if (H.slot[slot].device >= 0) v = H.dev[H.slot[slot].device].is_virtual;
+    LeaveCriticalSection(&H.cs);
+    return v;
+}
+
+void xbox_HostInputScriptVirtual(int slot, const uint8_t *held)
+{
+#ifdef XBOXRECOMP_HAVE_SDL3
+    /* Control order: d-pad, start, back, thumbs, A B X Y Black White, triggers,
+     * then the sticks' four directions each. */
+    static const int buttons[16] = {
+        SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+        SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
+        SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_BACK,
+        SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK,
+        SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
+        SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH,
+        SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+        -1, -1 };
+    SDL_Joystick *joy = NULL;
+    int c, v;
+    if (!H.running || slot < 0 || slot >= SLOTS || !held) return;
+    EnterCriticalSection(&H.cs);
+    if (H.slot[slot].device >= 0) joy = H.dev[H.slot[slot].device].vjoy;
+    LeaveCriticalSection(&H.cs);
+    if (!joy) return;
+    for (c = 0; c < 16; c++)
+        if (buttons[c] >= 0) SDL_SetJoystickVirtualButton(joy, buttons[c], held[c] != 0);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, held[INPUT_LEFT_TRIGGER] ? 32767 : 0);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, held[INPUT_RIGHT_TRIGGER] ? 32767 : 0);
+    /* SDL's Y axes point down. */
+    v = (held[INPUT_LSTICK_RIGHT] ? 32767 : 0) - (held[INPUT_LSTICK_LEFT] ? 32767 : 0);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFTX, (Sint16)v);
+    v = (held[INPUT_LSTICK_DOWN] ? 32767 : 0) - (held[INPUT_LSTICK_UP] ? 32767 : 0);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFTY, (Sint16)v);
+    v = (held[INPUT_RSTICK_RIGHT] ? 32767 : 0) - (held[INPUT_RSTICK_LEFT] ? 32767 : 0);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_RIGHTX, (Sint16)v);
+    v = (held[INPUT_RSTICK_DOWN] ? 32767 : 0) - (held[INPUT_RSTICK_UP] ? 32767 : 0);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_RIGHTY, (Sint16)v);
+#else
+    (void)slot; (void)held;
+#endif
+}
+
+void xbox_HostInputScriptControls(const uint8_t *held)
+{
+    if (!H.running || !held) return;
+    EnterCriticalSection(&H.cs);
+    memcpy(H.script_held, held, sizeof(H.script_held));
     LeaveCriticalSection(&H.cs);
 }
 

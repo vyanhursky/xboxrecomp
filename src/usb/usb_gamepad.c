@@ -19,6 +19,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "../input/xinput_xbox.h"
+#include "../input/input_host.h"
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -546,6 +547,41 @@ static void pad_live_poll(unsigned long t)
     fclose(f);
 }
 
+/* RECOMP_PAD_SCRIPT_FORMAT=seconds: the anchored, seconds-based script in
+ * apply_script below. */
+static int script_format_seconds(void)
+{
+    static int seconds = -1;
+    if (seconds < 0) {
+        const char *format = getenv("RECOMP_PAD_SCRIPT_FORMAT");
+        seconds = format && strcmp(format, "seconds") == 0;
+    }
+    return seconds;
+}
+
+/* With the host input layer running, RECOMP_PAD_SCRIPT_KEYS=1 sends the
+ * scripted presses of the pad the keyboard plays as to its keys, and
+ * RECOMP_PAD_SCRIPT_VIRTUAL=1 sends those of a virtual pad (RECOMP_INPUT_VIRTUAL_PADS)
+ * to that pad's buttons, not to the report: 1 keys, 2 virtual pad, 0 neither. */
+static int script_target(int pad)
+{
+    static int keys = -1, virt = -1;
+    if (keys < 0) keys = getenv("RECOMP_PAD_SCRIPT_KEYS") != NULL;
+    if (virt < 0) virt = getenv("RECOMP_PAD_SCRIPT_VIRTUAL") != NULL;
+    if (!xbox_HostInputActive()) return 0;
+    if (keys && pad == xbox_HostInputKeyboardSlot()) return 1;
+    if (virt && xbox_HostInputSlotIsVirtual(pad)) return 2;
+    return 0;
+}
+
+static int script_as_keys(int pad) { return script_target(pad) != 0; }
+
+static void script_hold(int pad, const uint8_t *held)
+{
+    if (script_target(pad) == 2) xbox_HostInputScriptVirtual(pad, held);
+    else xbox_HostInputScriptControls(held);
+}
+
 static void pad_script_apply(int pad, uint8_t *out)
 {
     static unsigned long t0;
@@ -559,6 +595,31 @@ static void pad_script_apply(int pad, uint8_t *out)
         t0 = now;
     t = now - t0;
     pad_live_poll(t);
+    /* The millisecond script's steps for pad 1 press the keyboard player's keys
+     * (the first key bound to each control) instead of setting report bits, so
+     * a scripted run exercises the keyboard path end to end. The seconds script
+     * does the same in apply_script. */
+    if (script_as_keys(pad) && !script_format_seconds()) {
+        uint8_t held[INPUT_CONTROL_COUNT];
+        memset(held, 0, sizeof held);
+        for (i = 0; i < s_script_len; i++) {
+            const PadStep *st = &s_script[i];
+            if (st->pad != pad || t < st->at_ms || t >= st->at_ms + st->hold_ms)
+                continue;
+            for (j = 0; j < 8; j++) {
+                if (st->digital & (1u << j)) held[INPUT_DPAD_UP + j] = 1;
+                if (st->analog & (1u << j)) held[INPUT_A + j] = 1;
+                if (st->stick & (1u << j)) {
+                    /* left: left right up down; right: the same four */
+                    static const uint8_t ctl[8] = {
+                        INPUT_LSTICK_LEFT, INPUT_LSTICK_RIGHT, INPUT_LSTICK_UP, INPUT_LSTICK_DOWN,
+                        INPUT_RSTICK_LEFT, INPUT_RSTICK_RIGHT, INPUT_RSTICK_UP, INPUT_RSTICK_DOWN };
+                    held[ctl[j]] = 1;
+                }
+            }
+        }
+        script_hold(pad, held);
+    }
     if (s_script_len == 0)
         return;
     for (i = 0; i < s_script_len; i++) {
@@ -567,6 +628,15 @@ static void pad_script_apply(int pad, uint8_t *out)
             continue;
         if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
             continue;
+        if (script_as_keys(pad) && !script_format_seconds()) {
+            if (!st->announced) {
+                st->announced = 1;
+                fprintf(stderr, "  PAD: t=%lu ms step %d as keys (digital 0x%02X analog 0x%02X)\n",
+                        t, i, st->digital, st->analog);
+                fflush(stderr);
+            }
+            continue;
+        }
         if (!st->announced) {
             st->announced = 1;
             fprintf(stderr, "  PAD: t=%lu ms step %d (digital 0x%02X analog 0x%02X)\n",
@@ -832,25 +902,28 @@ static void apply_script(int pad, uint8_t *out)
     static unsigned char logged[USB_GAMEPAD_MAX][256];
     unsigned idx = 0;
 
-    static int seconds = -1;
-    if (seconds < 0) {
-        const char *format = getenv("RECOMP_PAD_SCRIPT_FORMAT");
-        seconds = format && strcmp(format, "seconds") == 0;
-    }
-    if (!seconds) {
+    int as_keys = script_as_keys(pad);
+    uint8_t held[INPUT_CONTROL_COUNT];
+
+    if (!script_format_seconds()) {
         pad_script_apply(pad, out);
         return;
     }
+    memset(held, 0, sizeof held);
     /* Live commands keep their independent millisecond queue. */
     if (s_script_len < 0) s_script_len = 0;
     pad_script_apply(pad, out);
-    if (!s || !*s) return;
+    if (!s || !*s) {
+        if (as_keys) script_hold(pad, held);
+        return;
+    }
     t = xbox_ScriptSeconds();
     if (strlen(s) >= sizeof buf) {
         static int warned;
         if (!warned++)
             fprintf(stderr, "  [PAD] script: %u characters, over %u -- ignored\n",
                     (unsigned)strlen(s), (unsigned)sizeof buf - 1);
+        if (as_keys) script_hold(pad, held);
         return;
     }
     strcpy(buf, s);
@@ -903,12 +976,15 @@ static void apply_script(int pad, uint8_t *out)
         for (i = 0; i < sizeof names / sizeof names[0]; i++) {
             if (strcmp(names[i].name, name))
                 continue;
-            if (names[i].bit)
+            if (as_keys)
+                held[i] = 1;                    /* the table is in control order */
+            else if (names[i].bit)
                 out[names[i].byte] |= names[i].bit;
             else
                 out[names[i].byte] = 0xFF;
         }
     }
+    if (as_keys) script_hold(pad, held);
 }
 
 /* Reset just the device that was reset by its parent port. */
