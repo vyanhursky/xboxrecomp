@@ -28,14 +28,27 @@
 
 #include <stdint.h>
 
+/* The decoder below reads and writes the register file through a context with
+ * Win32's field names. On Windows that is the vectored handler's CONTEXT.
+ * Off Windows, the trap layer on an x86-64 host defines MMIO_X64_CONTEXT as a
+ * structure with the same names, filled from the signal's ucontext, and
+ * includes this file for the decoder alone. */
 #if defined(_WIN32)
 #include <windows.h>
+typedef PCONTEXT mmio_ctx_t;
+#define MMIO_HAVE_X64_DECODER 1
+#elif defined(MMIO_X64_CONTEXT)
+typedef MMIO_X64_CONTEXT *mmio_ctx_t;
+#define MMIO_HAVE_X64_DECODER 1
+#endif
+
+#if defined(MMIO_HAVE_X64_DECODER)
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 
-static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
+static inline uint64_t *mmio_ctx_reg(mmio_ctx_t c, int reg)
 {
     switch (reg & 0xF) {
     case 0:  return (uint64_t *)&c->Rax;   case 1:  return (uint64_t *)&c->Rcx;
@@ -68,7 +81,7 @@ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
 /* Flags after a compare-shaped operation, so a poll loop branches correctly.
  * ZF, SF and CF only: those are what jz/jnz, js and jb/jae read, and inventing
  * an overflow flag nothing here sets is worse than leaving it alone. */
-static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
+static inline void mmio_set_flags(mmio_ctx_t ctx, uint64_t result, int size,
                                   int carry)
 {
     ctx->EFlags &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
@@ -83,7 +96,7 @@ static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
 }
 
 /* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
-static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+static inline int mmio_emulate(mmio_ctx_t ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
@@ -202,7 +215,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#else /* !_WIN32 */
+#else /* no x86-64 decoder wanted here */
 
 /* Off Windows the context is the signal handler's ucontext and the decoding
  * belongs to the trap layer, which knows the host's instruction set. */
@@ -217,5 +230,5 @@ static inline int mmio_emulate(void *ctx, uint32_t off, void *dev,
     return mmio_trap_emulate(ctx, off, dev, rd, wr);
 }
 
-#endif /* _WIN32 */
+#endif /* MMIO_HAVE_X64_DECODER */
 #endif /* MMIO_DECODE_H */

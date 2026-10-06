@@ -321,10 +321,88 @@ static int service(ucontext_t *uc, uintptr_t fault, int devices)
 
 uintptr_t mmio_trap_pc(void *uctx) { return (uintptr_t)UC_PC((ucontext_t *)uctx); }
 
-#else  /* !__aarch64__ */
+#elif defined(__x86_64__)
 
-/* x86-64 hosts use mmio_decode.h's decoder once its context is not Win32's;
- * until then a fault here is not serviced and the caller reports it. */
+/* The x86-64 decoder is the one the Win32 hosts use (mmio_decode.h), run on
+ * a copy of the registers under the names it expects. */
+struct x64_context {
+    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t EFlags;
+};
+#define MMIO_X64_CONTEXT struct x64_context
+#define mmio_emulate mmio_x64_emulate
+#include "mmio_decode.h"
+#undef mmio_emulate
+
+#if defined(__APPLE__)
+#define UC_R(uc, name) ((uc)->uc_mcontext->__ss.__##name)
+#define X64_REGS(X) \
+    X(Rax, UC_R(uc, rax)) X(Rcx, UC_R(uc, rcx)) X(Rdx, UC_R(uc, rdx)) X(Rbx, UC_R(uc, rbx)) \
+    X(Rsp, UC_R(uc, rsp)) X(Rbp, UC_R(uc, rbp)) X(Rsi, UC_R(uc, rsi)) X(Rdi, UC_R(uc, rdi)) \
+    X(R8,  UC_R(uc, r8))  X(R9,  UC_R(uc, r9))  X(R10, UC_R(uc, r10)) X(R11, UC_R(uc, r11)) \
+    X(R12, UC_R(uc, r12)) X(R13, UC_R(uc, r13)) X(R14, UC_R(uc, r14)) X(R15, UC_R(uc, r15)) \
+    X(Rip, UC_R(uc, rip))
+#define UC_FLAGS(uc) UC_R(uc, rflags)
+#else
+#define UC_G(uc, name) ((uc)->uc_mcontext.gregs[REG_##name])
+#define X64_REGS(X) \
+    X(Rax, UC_G(uc, RAX)) X(Rcx, UC_G(uc, RCX)) X(Rdx, UC_G(uc, RDX)) X(Rbx, UC_G(uc, RBX)) \
+    X(Rsp, UC_G(uc, RSP)) X(Rbp, UC_G(uc, RBP)) X(Rsi, UC_G(uc, RSI)) X(Rdi, UC_G(uc, RDI)) \
+    X(R8,  UC_G(uc, R8))  X(R9,  UC_G(uc, R9))  X(R10, UC_G(uc, R10)) X(R11, UC_G(uc, R11)) \
+    X(R12, UC_G(uc, R12)) X(R13, UC_G(uc, R13)) X(R14, UC_G(uc, R14)) X(R15, UC_G(uc, R15)) \
+    X(Rip, UC_G(uc, RIP))
+#define UC_FLAGS(uc) UC_G(uc, EFL)
+#endif
+
+int mmio_trap_emulate(void *uctx, uint32_t off, void *dev,
+                      mmio_trap_read_fn rd, mmio_trap_write_fn wr)
+{
+    ucontext_t *uc = uctx;
+    struct x64_context c;
+    int ok;
+
+#define X(field, reg) c.field = (uint64_t)(reg);
+    X64_REGS(X)
+#undef X
+    c.EFlags = (uint32_t)UC_FLAGS(uc);
+    ok = mmio_x64_emulate(&c, off, dev, rd, wr);
+    if (ok) {
+#define X(field, reg) (reg) = c.field;
+        X64_REGS(X)
+#undef X
+        UC_FLAGS(uc) = (UC_FLAGS(uc) & ~0xFFFFFFFFull) | c.EFlags;
+    }
+    return ok;
+}
+
+/* An x86-64 host has the console's page size, so a closed range has no
+ * neighbours and a fault is either on a device with callbacks or not ours. */
+static int service(ucontext_t *uc, uintptr_t fault, int devices)
+{
+    int i, n = g_trap_count;
+
+    for (i = 0; devices && i < n; i++) {
+        mmio_trap *d = &g_traps[i];
+        if (d->len && d->rd && fault >= d->addr && fault < d->addr + d->len)
+            return mmio_trap_emulate(uc, (uint32_t)(fault - d->addr), d->dev, d->rd, d->wr);
+    }
+    return 0;
+}
+
+uintptr_t mmio_trap_pc(void *uctx)
+{
+    ucontext_t *uc = uctx;
+#if defined(__APPLE__)
+    return (uintptr_t)UC_R(uc, rip);
+#else
+    return (uintptr_t)UC_G(uc, RIP);
+#endif
+}
+
+#else  /* neither arm64 nor x86-64 */
+
 static int service(ucontext_t *uc, uintptr_t fault, int devices)
 { (void)uc; (void)fault; (void)devices; return 0; }
 

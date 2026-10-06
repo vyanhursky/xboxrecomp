@@ -2,7 +2,7 @@
  * Trapped device registers on a POSIX host.
  *
  * Two halves. The decoder half runs everywhere: fixed A64 encodings in, the
- * decoded access out. The live half needs an arm64 host: it closes one 4 KB
+ * decoded access out. The live half runs on arm64 and x86-64: it closes one 4 KB
  * "device" page in the middle of ordinary memory and checks that
  *
  *   - loads and stores to it reach the callbacks with the right offset,
@@ -59,7 +59,7 @@ static void test_decoder(void)
     CHECK(!mmio_a64_decode(0x8B020020u, &a));   /* add x0,x1,x2 */
 }
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__x86_64__)
 
 typedef struct {
     uint32_t reg[1024];
@@ -147,6 +147,7 @@ static void test_live(void)
     else
         CHECK(mmio_trap_neighbour_count() == 0);
 
+#if defined(__aarch64__)
     /* Forms a compiler rarely picks for a register access. */
     {
         uint32_t *p = (uint32_t *)(mem + 0x1100), v, lo = 0xAAAA0001u, hi = 0xBBBB0002u;
@@ -161,6 +162,7 @@ static void test_live(void)
         __asm__ volatile("str wzr, [%[q]]" : : [q] "r"(q) : "memory");
         CHECK(a.reg[0x200 / 4] == 0);
     }
+#endif
 
     /* A second device in the same 16 KB host page. */
     CHECK(mmio_trap_add(mem + 0x3000, 0x1000, (void *)&b, dev_read, dev_write) == 0);
@@ -187,7 +189,7 @@ static void test_live(void)
 }
 
 #else
-static void test_live(void) { printf("live: skipped, not an arm64 host\n"); }
+static void test_live(void) { printf("live: skipped on this architecture\n"); }
 #endif
 
 int main(void)
