@@ -68,6 +68,19 @@ Derived algorithms — credited, independently implemented
   label.
 
 
+zlib — SDL3 (optional, fetched at build time)
+----------------------------------------------
+
+  https://github.com/libsdl-org/SDL, release 3.4.18, (c) 1997-2026 Sam
+  Lantinga and the SDL contributors, zlib licence (LICENSES/SDL3-zlib.txt).
+
+  Used for gamepad input only, when the toolkit is configured with
+  XBOXRECOMP_SDL3=ON (src/input/input_host.c). Nothing from SDL is copied into
+  this tree: cmake/xbox_sdl3.cmake downloads the pinned release source,
+  checks its SHA-256 and builds it as a static library, so a binary built
+  with the option carries SDL's code under the zlib licence.
+
+
 Reference material (no code taken)
 -----------------------------------
 
