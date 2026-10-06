@@ -47,6 +47,8 @@ typedef struct InputHostConfig {
     int  use_sdl;               /* prefer SDL pads when the build has them */
     int  rumble_percent;        /* 0 turns rumble off; 100 is as the title asks */
     int  ignore_focus;          /* test only: read devices without the window's focus */
+    int  no_pads;               /* test only: open no physical pad, whatever is plugged in */
+    int  virtual_pads;          /* test only: attach this many SDL virtual gamepads (0-4) */
     InputPadMap   padmap;
     InputBindings keys;
 } InputHostConfig;
@@ -70,6 +72,18 @@ int xbox_HostInputActive(void);
 /* Change the pad map, bindings, rumble strength and focus rule while running.
  * The keyboard's slot and the player count are fixed at start. */
 void xbox_HostInputConfigure(const InputHostConfig *cfg);
+
+/* Test hook: hold the given controls on the keyboard player as if their first
+ * bound key were down (`held` has INPUT_CONTROL_COUNT entries). Lets a scripted
+ * run drive the whole keyboard path -- bindings, resolution, the slot, the USB
+ * report -- with nobody at the keyboard. */
+void xbox_HostInputScriptControls(const uint8_t *held);
+
+/* Test hooks for virtual pads (InputHostConfig.virtual_pads): whether the pad in
+ * `slot` is virtual, and hold the given controls on it (`held` has
+ * INPUT_CONTROL_COUNT entries). Its rumble is logged as "[INPUT] virtual pad". */
+int xbox_HostInputSlotIsVirtual(int slot);
+void xbox_HostInputScriptVirtual(int slot, const uint8_t *held);
 
 /* How many controllers the title should see on its hub: one per pad found, one
  * for a separate keyboard player, and at least `players`. Never below 1, never
