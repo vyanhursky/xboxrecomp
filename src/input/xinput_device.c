@@ -22,6 +22,11 @@
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
 
+/* When the host input layer is running (input_host.c) it answers for every
+ * port: SDL or XInput pads, the keyboard as a player, rumble. The XInput code
+ * below is what answers without it. */
+#include "input_host.h"
+
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
@@ -140,6 +145,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (xbox_HostInputActive())
+        return xbox_HostInputGetState((int)dwPort, pState);
 
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
@@ -216,6 +223,9 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (xbox_HostInputActive())
+        return xbox_HostInputRumble((int)dwPort, pVibration->wLeftMotorSpeed,
+                                    pVibration->wRightMotorSpeed);
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
@@ -225,6 +235,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    if (xbox_HostInputActive())
+        return xbox_HostInputSlotInfo((int)dwPort, NULL, 0) != 0;
     return g_controller_connected[dwPort];
 }
 
