@@ -160,6 +160,69 @@ int main(void)
     recomp_settings_reset();
     CHECK(recomp_settings_count() == 0);
 
+    /* Text settings: default, file round trip, environment precedence, a value
+     * that does not fit, and the change callback. */
+    {
+        static RecompSetting text_table[] = {
+            { "keyboard", "a", RECOMP_SETTING_STRING, 0, 0, 0, NULL, "TEST_KEY_A", 0,
+              "Keys for the A button.", "L, Space" },
+            { "keyboard", "b", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0, NULL, NULL },
+        };
+        char buf[RECOMP_SETTING_TEXT_MAX], toolong[RECOMP_SETTING_TEXT_MAX + 8];
+        set_env("TEST_KEY_A", NULL);
+        recomp_settings_register(text_table, 2);
+        recomp_settings_set_log(logger);
+        CHECK(recomp_settings_load(path) == 0);
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "L, Space"));
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "b", buf, sizeof(buf), "?"), ""));
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "nope", buf, sizeof(buf), "?"), "?"));
+        /* An integer accessor does not apply to text. */
+        CHECK(recomp_settings_set("keyboard", "a", 1) == -1);
+
+        g_changes = 0;
+        recomp_settings_on_change(changed, NULL);
+        CHECK(recomp_settings_set_text("keyboard", "a", "  J , Mouse1 ") == 1);
+        CHECK(g_changes == 1 && !strcmp(g_last_key, "a"));
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "J , Mouse1"));
+        CHECK(recomp_settings_set_text("keyboard", "a", "J , Mouse1") == 0);
+        CHECK(g_changes == 1);
+
+        memset(toolong, 'x', sizeof(toolong) - 1);
+        toolong[sizeof(toolong) - 1] = 0;
+        CHECK(recomp_settings_set_text("keyboard", "a", toolong) == -1);
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "J , Mouse1"));
+
+        CHECK(recomp_settings_save(path) == 0);
+        CHECK(file_contains(path, "a = J , Mouse1"));
+        CHECK(file_contains(path, "b = \n") || file_contains(path, "b =\n"));
+        recomp_settings_set_text("keyboard", "a", "K");
+        CHECK(recomp_settings_load(path) == 2);
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "J , Mouse1"));
+
+        /* The environment wins and is not written. */
+        set_env("TEST_KEY_A", "Q");
+        recomp_settings_load(path);
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "Q"));
+        recomp_settings_save(path);
+        set_env("TEST_KEY_A", NULL);
+        CHECK(file_contains(path, "a = J , Mouse1"));
+        recomp_settings_load(path);
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "J , Mouse1"));
+
+        /* A file value too long for the setting falls back to the default. */
+        {
+            char line[RECOMP_SETTING_TEXT_MAX * 2 + 32];
+            snprintf(line, sizeof(line), "[keyboard]\na = %s\n", toolong);
+            write_file(path, line);
+            g_logged = 0;
+            recomp_settings_load(path);
+            CHECK(g_logged == 1);
+            CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "L, Space"));
+        }
+        remove(path);
+        recomp_settings_reset();
+    }
+
     if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
     printf("recomp_settings: all checks passed\n");
     return 0;

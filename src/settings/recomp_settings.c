@@ -93,8 +93,17 @@ static int parse_value(const RecompSetting *s, const char *text, int *out)
             if (equal_nocase(text, s->choices[i])) { *out = i; return 1; }
         return 0;
     }
+    case RECOMP_SETTING_STRING:
+        *out = 0;
+        return strlen(text) < RECOMP_SETTING_TEXT_MAX;
     }
     return 0;
+}
+
+/* The text a string setting is reset to. */
+static void default_text(RecompSetting *s)
+{
+    snprintf(s->stored_text, sizeof(s->stored_text), "%s", s->def_text ? s->def_text : "");
 }
 
 static int valid_value(const RecompSetting *s, int *value)
@@ -111,6 +120,8 @@ static int valid_value(const RecompSetting *s, int *value)
     case RECOMP_SETTING_ENUM:
         while (s->choices && s->choices[n]) n++;
         return *value >= 0 && *value < n;
+    case RECOMP_SETTING_STRING:
+        return 0;           /* text only: see recomp_settings_set_text */
     }
     return 0;
 }
@@ -121,11 +132,14 @@ static void apply_env(RecompSetting *s)
     const char *e = s->env ? getenv(s->env) : NULL;
     int v;
     s->value = s->stored;
+    memcpy(s->value_text, s->stored_text, sizeof(s->value_text));
     if (s->source == RECOMP_SETTING_FROM_ENV)
         s->source = RECOMP_SETTING_FROM_DEFAULT;
     if (!e || !*e) return;
     if (parse_value(s, e, &v)) {
         s->value = v;
+        if (s->type == RECOMP_SETTING_STRING)
+            snprintf(s->value_text, sizeof(s->value_text), "%s", e);
         s->source = RECOMP_SETTING_FROM_ENV;
     } else {
         report("settings: %s=%s is not a valid value for %s.%s; ignored",
@@ -140,6 +154,7 @@ void recomp_settings_register(RecompSetting *table, size_t count)
     g_count = count;
     for (i = 0; i < count; i++) {
         table[i].stored = table[i].def;
+        default_text(&table[i]);
         table[i].source = RECOMP_SETTING_FROM_DEFAULT;
         apply_env(&table[i]);
     }
@@ -176,6 +191,18 @@ int recomp_settings_get(const char *section, const char *key, int fallback)
     return s ? s->value : fallback;
 }
 
+const char *recomp_settings_get_text(const char *section, const char *key,
+                                     char *buf, size_t size, const char *fallback)
+{
+    const RecompSetting *s = recomp_settings_find(section, key);
+    if (!buf || !size) return fallback;
+    if (!s || s->type != RECOMP_SETTING_STRING) return fallback;
+    lock_enter();
+    snprintf(buf, size, "%s", s->value_text);
+    lock_leave();
+    return buf;
+}
+
 int recomp_settings_set(const char *section, const char *key, int value)
 {
     RecompSetting *s = recomp_settings_find(section, key);
@@ -198,9 +225,30 @@ int recomp_settings_set(const char *section, const char *key, int value)
 
 int recomp_settings_set_text(const char *section, const char *key, const char *text)
 {
-    const RecompSetting *s = recomp_settings_find(section, key);
+    RecompSetting *s = recomp_settings_find(section, key);
     int v;
-    if (!s || !text || !parse_value(s, text, &v)) return -1;
+    if (!s || !text) return -1;
+    if (s->type == RECOMP_SETTING_STRING) {
+        char copy[RECOMP_SETTING_TEXT_MAX], *t;
+        int stored_changed, effective_changed;
+        if (strlen(text) >= sizeof(copy)) return -1;
+        snprintf(copy, sizeof(copy), "%s", text);
+        t = trim(copy);
+        lock_enter();
+        stored_changed = strcmp(s->stored_text, t) != 0;
+        effective_changed = 0;
+        snprintf(s->stored_text, sizeof(s->stored_text), "%s", t);
+        if (s->source != RECOMP_SETTING_FROM_ENV) {
+            effective_changed = strcmp(s->value_text, t) != 0;
+            snprintf(s->value_text, sizeof(s->value_text), "%s", t);
+            s->source = RECOMP_SETTING_FROM_FILE;
+        }
+        lock_leave();
+        if (effective_changed && g_changed)
+            g_changed(s, g_changed_user);
+        return stored_changed;
+    }
+    if (!parse_value(s, text, &v)) return -1;
     return recomp_settings_set(section, key, v);
 }
 
@@ -215,6 +263,7 @@ const char *recomp_settings_format(const RecompSetting *s, int value, char *buf,
         snprintf(buf, size, "%s", value >= 0 && value < n ? s->choices[value] : "");
         break;
     }
+    case RECOMP_SETTING_STRING: snprintf(buf, size, "%s", s->stored_text); break;
     }
     return buf;
 }
@@ -249,6 +298,7 @@ int recomp_settings_load(const char *path)
 
     for (i = 0; i < g_count; i++) {
         g_table[i].stored = g_table[i].def;
+        default_text(&g_table[i]);
         g_table[i].source = RECOMP_SETTING_FROM_DEFAULT;
     }
     g_unknown_count = 0;
@@ -294,6 +344,8 @@ int recomp_settings_load(const char *path)
         }
         if (parse_value(s, val, &v)) {
             s->stored = v;
+            if (s->type == RECOMP_SETTING_STRING)
+                snprintf(s->stored_text, sizeof(s->stored_text), "%s", val);
             s->source = RECOMP_SETTING_FROM_FILE;
             read++;
         } else {
@@ -324,7 +376,7 @@ static int section_is_known(const char *section)
 
 int recomp_settings_save(const char *path)
 {
-    char tmp[1024], text[64];
+    char tmp[1024], text[RECOMP_SETTING_TEXT_MAX];
     FILE *f;
     size_t i, j;
     int ok;
