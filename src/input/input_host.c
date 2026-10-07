@@ -45,6 +45,10 @@ typedef struct Slot {
     ULONGLONG applied_at;
 } Slot;
 
+static void (*g_need_players)(int count);
+
+void xbox_HostInputOnPadSlot(void (*need_players)(int count)) { g_need_players = need_players; }
+
 static struct Host {
     int running;
     CRITICAL_SECTION cs;
@@ -181,7 +185,7 @@ static bool SDLCALL virtual_rumble(void *userdata, Uint16 low, Uint16 high)
 static void attach_virtual_pads(int n)
 {
     int i;
-    for (i = 0; i < n && i < SLOTS; i++) {
+    for (i = g_virtual_count; i < n && i < SLOTS; i++) {
         SDL_VirtualJoystickDesc desc;
         SDL_INIT_INTERFACE(&desc);
         desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
@@ -230,6 +234,7 @@ static void assign_device(int d)
         H.slot[s].device = d;
         H.dev[d].slot = s;
         log_line("[INPUT] %s is player %d\n", H.dev[d].name, s + 1);
+        if (g_need_players) g_need_players(s + 1);
         return;
     }
     log_line("[INPUT] %s ignored: all four players have a device\n", H.dev[d].name, 0);
@@ -328,7 +333,16 @@ static void apply_rumble(int s, int focused)
     sl->applied_at = now;
 #ifdef XBOXRECOMP_HAVE_SDL3
     if (dv->backend == 1 && dv->gp) {
-        SDL_RumbleGamepad(dv->gp, low, high, (low | high) ? RUMBLE_HOLD_MS : 0);
+        {
+            static int logged;
+            bool ok = SDL_RumbleGamepad(dv->gp, low, high, (low | high) ? RUMBLE_HOLD_MS : 0);
+            if ((low | high) && logged < 12) {
+                logged++;
+                fprintf(stderr, "[INPUT] rumble %u %u on player %d (%s): %s%s\n", (unsigned)low, (unsigned)high,
+                        s + 1, dv->name, ok ? "sent" : "FAILED ", ok ? "" : SDL_GetError());
+                fflush(stderr);
+            }
+        }
         return;
     }
 #endif
@@ -529,9 +543,25 @@ static DWORD WINAPI reader_thread(LPVOID unused)
     fflush(stderr);
     SetEvent(H.ready);
 
-    while (WaitForSingleObject(H.stop, POLL_MS) == WAIT_TIMEOUT) {
-        hotplug_once();
-        poll_once();
+    {
+        ULONGLONG started = GetTickCount64();
+        int late_done = 0;
+        while (WaitForSingleObject(H.stop, POLL_MS) == WAIT_TIMEOUT) {
+#ifdef XBOXRECOMP_HAVE_SDL3
+            /* Test hook: one more virtual pad arrives while the game runs. */
+            if (H.sdl && H.cfg.virtual_late_ms && !late_done &&
+                GetTickCount64() - started >= (ULONGLONG)H.cfg.virtual_late_ms) {
+                late_done = 1;
+                attach_virtual_pads(g_virtual_count + 1);
+                fprintf(stderr, "[INPUT] a virtual pad was plugged in\n");
+                fflush(stderr);
+            }
+#else
+            (void)started; (void)late_done;
+#endif
+            hotplug_once();
+            poll_once();
+        }
     }
 
     /* Stop the motors before the devices go. */

@@ -195,7 +195,7 @@ static int s_device_hc;
  * MCPX's own hubs have; RECOMP_USB_NDP exists because which slot XAPI gives a
  * pad is decided somewhere in here and the mapping is worth measuring. */
 static unsigned s_ndp = OHCI_PORTS;
-static int s_npads = 1;          /* RECOMP_USB_PADS */
+static volatile int s_npads = 1; /* RECOMP_USB_PADS; raised at run time by xbox_UsbSetPadCount */
 static int s_enabled;
 static int s_trace;
 static uint64_t s_last_write_rip;
@@ -1491,6 +1491,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         ohci_raise(hc, status);
     }
     return 0;
+}
+
+void xbox_UsbSetPadCount(int n)
+{
+    if (n > USB_GAMEPAD_MAX) n = USB_GAMEPAD_MAX;
+    if (n > s_npads) s_npads = n;
 }
 
 void xbox_OhciInit(void)

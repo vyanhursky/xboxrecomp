@@ -49,6 +49,7 @@ typedef struct InputHostConfig {
     int  ignore_focus;          /* test only: read devices without the window's focus */
     int  no_pads;               /* test only: open no physical pad, whatever is plugged in */
     int  virtual_pads;          /* test only: attach this many SDL virtual gamepads (0-4) */
+    int  virtual_late_ms;       /* test only: attach one more virtual gamepad this long after start */
     InputPadMap   padmap;
     InputBindings keys;
 } InputHostConfig;
@@ -61,6 +62,11 @@ void xbox_HostInputDefaults(InputHostConfig *cfg);
  * the caller can size the emulated hub from what it finds. Returns the number
  * of pads opened. Call once, before the title starts polling. */
 int xbox_HostInputStart(const InputHostConfig *cfg);
+
+/* Called with the number of controllers a slot needs (slot + 1) whenever a pad
+ * takes a slot, so the host program can plug one more into the emulated hub for a
+ * pad that arrives while the game runs. Called from the reader thread. */
+void xbox_HostInputOnPadSlot(void (*need_players)(int count));
 
 /* Stop the reader, close the devices, stop any rumble. */
 void xbox_HostInputStop(void);

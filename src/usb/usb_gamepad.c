@@ -247,7 +247,8 @@ void usb_gamepad_out(int pad, const uint8_t *data, int len)
         if (log_left > 0 && now_pair != last[pad]) {
             last[pad] = now_pair;
             log_left--;
-            fprintf(stderr, "  [USB] pad %d rumble: left %u right %u\n", pad + 1,
+            fprintf(stderr, "  [USB] pad %d rumble at %llu ms: left %u right %u\n", pad + 1,
+                    (unsigned long long)GetTickCount64(),
                     (unsigned)v.wLeftMotorSpeed, (unsigned)v.wRightMotorSpeed);
             fflush(stderr);
         }

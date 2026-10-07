@@ -34,6 +34,12 @@
  * behaving exactly as it did. */
 void xbox_OhciInit(void);
 
+/* Make sure the hub has at least `n` controllers (1-4). Raising the count at run
+ * time plugs the next controller in the way start-up does: on the next root
+ * port, once the one before it is configured, so the title sees an ordinary
+ * hot-plug and enumerates it. Never lowers the count. Safe from any thread. */
+void xbox_UsbSetPadCount(int n);
+
 /* 1 if the address is inside a controller this model owns. */
 int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 
