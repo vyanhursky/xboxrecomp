@@ -23,6 +23,7 @@
 #define POLL_MS       2
 #define RUMBLE_REFRESH_MS 100
 #define RUMBLE_HOLD_MS    300
+#define CONNECT_BUZZ_MS   250
 
 typedef struct Device {
     int used;
@@ -43,6 +44,8 @@ typedef struct Slot {
     WORD low, high;                 /* what the title last asked for */
     WORD applied_low, applied_high; /* what the pad was last told */
     ULONGLONG applied_at;
+    ULONGLONG hold_until;           /* the pulse in progress runs at least until then */
+    ULONGLONG buzz_until;           /* the buzz for a pad that just connected */
 } Slot;
 
 static void (*g_need_players)(int count);
@@ -74,6 +77,9 @@ void xbox_HostInputDefaults(InputHostConfig *cfg)
     cfg->keyboard = INPUT_HOST_KEYBOARD_AUTO;
     cfg->use_sdl = 1;
     cfg->rumble_percent = 100;
+    cfg->rumble_floor = 60;
+    cfg->rumble_min_ms = 200;
+    cfg->rumble_on_connect = 1;
     input_padmap_defaults(&cfg->padmap);
 }
 
@@ -235,6 +241,8 @@ static void assign_device(int d)
         H.dev[d].slot = s;
         log_line("[INPUT] %s is player %d\n", H.dev[d].name, s + 1);
         if (g_need_players) g_need_players(s + 1);
+        if (H.cfg.rumble_on_connect && !H.dev[d].is_virtual)
+            H.slot[s].buzz_until = GetTickCount64() + CONNECT_BUZZ_MS;
         return;
     }
     log_line("[INPUT] %s ignored: all four players have a device\n", H.dev[d].name, 0);
@@ -312,44 +320,62 @@ static void open_sdl_gamepad(SDL_JoystickID id)
 
 /* ---- the reader thread ----------------------------------------------------- */
 
-static void apply_rumble(int s, int focused)
+static void apply_rumble(int s, int focused, const InputHostConfig *cfg)
 {
     Slot *sl = &H.slot[s];
     Device *dv;
-    WORD low, high;
+    unsigned low = 0, high = 0, pct = (unsigned)cfg->rumble_percent;
     ULONGLONG now = GetTickCount64();
+    DWORD hold_ms;
     if (sl->device < 0) return;
     dv = &H.dev[sl->device];
-    low = high = 0;
-    if (focused && H.cfg.rumble_percent > 0) {
-        low = (WORD)((unsigned)sl->low * (unsigned)H.cfg.rumble_percent / 100u);
-        high = (WORD)((unsigned)sl->high * (unsigned)H.cfg.rumble_percent / 100u);
+    if (focused && pct > 0) {
+        unsigned floor_v = 65535u * (unsigned)cfg->rumble_floor / 100u;
+        low = sl->low;
+        high = sl->high;
+        /* The title's pulses are brief and often faint; a modern pad's motors
+         * need a stronger, longer push than the console's to be felt. */
+        if (low && low < floor_v) low = floor_v;
+        if (high && high < floor_v) high = floor_v;
+        if (now < sl->buzz_until) {
+            low = 65535u;
+            high = 49152u;
+        }
+        low = low * pct / 100u;
+        high = high * pct / 100u;
+        /* Let a pulse finish its minimum length before it is cut short. */
+        if (!(low | high) && (sl->applied_low | sl->applied_high) && now < sl->hold_until) {
+            low = sl->applied_low;
+            high = sl->applied_high;
+        }
     }
     if (low == sl->applied_low && high == sl->applied_high &&
         (!(low | high) || now - sl->applied_at < RUMBLE_REFRESH_MS))
         return;
-    sl->applied_low = low;
-    sl->applied_high = high;
+    if ((low | high) && (low != sl->applied_low || high != sl->applied_high))
+        sl->hold_until = now + (ULONGLONG)(cfg->rumble_min_ms > 0 ? cfg->rumble_min_ms : 0);
+    sl->applied_low = (WORD)low;
+    sl->applied_high = (WORD)high;
     sl->applied_at = now;
+    hold_ms = RUMBLE_HOLD_MS;
+    if ((DWORD)cfg->rumble_min_ms + 100 > hold_ms) hold_ms = (DWORD)cfg->rumble_min_ms + 100;
 #ifdef XBOXRECOMP_HAVE_SDL3
     if (dv->backend == 1 && dv->gp) {
-        {
-            static int logged;
-            bool ok = SDL_RumbleGamepad(dv->gp, low, high, (low | high) ? RUMBLE_HOLD_MS : 0);
-            if ((low | high) && logged < 12) {
-                logged++;
-                fprintf(stderr, "[INPUT] rumble %u %u on player %d (%s): %s%s\n", (unsigned)low, (unsigned)high,
-                        s + 1, dv->name, ok ? "sent" : "FAILED ", ok ? "" : SDL_GetError());
-                fflush(stderr);
-            }
+        static int logged;
+        bool ok = SDL_RumbleGamepad(dv->gp, (Uint16)low, (Uint16)high, (low | high) ? hold_ms : 0);
+        if ((low | high) && logged < 12) {
+            logged++;
+            fprintf(stderr, "[INPUT] rumble %u %u on player %d (%s): %s%s\n", low, high,
+                    s + 1, dv->name, ok ? "sent" : "FAILED ", ok ? "" : SDL_GetError());
+            fflush(stderr);
         }
         return;
     }
 #endif
     if (dv->backend == 2) {
         XINPUT_VIBRATION v;
-        v.wLeftMotorSpeed = low;
-        v.wRightMotorSpeed = high;
+        v.wLeftMotorSpeed = (WORD)low;
+        v.wRightMotorSpeed = (WORD)high;
         XInputSetState(dv->xi_index, &v);
     }
 }
@@ -417,7 +443,7 @@ static void poll_once(void)
     }
     LeaveCriticalSection(&H.cs);
 
-    for (s = 0; s < SLOTS; s++) apply_rumble(s, live);
+    for (s = 0; s < SLOTS; s++) apply_rumble(s, live, &cfg);
 }
 
 static void hotplug_once(void)
@@ -568,7 +594,7 @@ static DWORD WINAPI reader_thread(LPVOID unused)
     EnterCriticalSection(&H.cs);
     for (i = 0; i < SLOTS; i++) { H.slot[i].low = H.slot[i].high = 0; }
     LeaveCriticalSection(&H.cs);
-    for (i = 0; i < SLOTS; i++) apply_rumble(i, 0);
+    for (i = 0; i < SLOTS; i++) apply_rumble(i, 0, &H.cfg);
     EnterCriticalSection(&H.cs);
     for (d = 0; d < MAX_DEVICES; d++)
         if (H.dev[d].used) free_device(d);

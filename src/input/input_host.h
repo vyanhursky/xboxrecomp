@@ -46,6 +46,9 @@ typedef struct InputHostConfig {
     int  players;               /* 0: as many as there are devices; 1-4: at least this many */
     int  use_sdl;               /* prefer SDL pads when the build has them */
     int  rumble_percent;        /* 0 turns rumble off; 100 is as the title asks */
+    int  rumble_floor;          /* percent: a pulse weaker than this is raised to it (the title's are often faint) */
+    int  rumble_min_ms;         /* a pulse is held at least this long, however briefly the title asks for it */
+    int  rumble_on_connect;     /* buzz a pad for a moment when it takes a player, to show it works */
     int  ignore_focus;          /* test only: read devices without the window's focus */
     int  no_pads;               /* test only: open no physical pad, whatever is plugged in */
     int  virtual_pads;          /* test only: attach this many SDL virtual gamepads (0-4) */
