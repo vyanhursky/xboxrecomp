@@ -183,7 +183,13 @@ int xa2_get_buffer_size(void)
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
 #define XA2_NUM_BUFS      3
-#define RING_FRAMES       8192   /* power of two, well over the three buffers */
+#define RING_FRAMES       8192   /* power of two, well over what is ever queued */
+/* The device starts, and starts again after running out, once this much is
+ * waiting: two submissions, 43 ms. Without it the ring sits near empty and
+ * any lateness in the mixer is a gap. Above XA2_RING_MAX a submission is
+ * refused, which bounds the delay when the mixer's clock runs fast. */
+#define XA2_PREROLL       (2 * XA2_BUF_SAMPLES)
+#define XA2_RING_MAX      (4 * XA2_BUF_SAMPLES)
 
 /* A ring the device's callback drains. SDL's own queue cannot tell "empty
  * because the device took it all into its buffer" from "empty because nothing
@@ -194,6 +200,7 @@ static unsigned g_ring_r, g_ring_w;         /* frame counters, free-running */
 static int g_xa2_initialized;
 static int g_xa2_frames_written;
 static int g_dry;                           /* the callback is in a gap */
+static int g_primed;                        /* enough is queued to play from */
 /* As on Windows: submissions refused because three buffers were waiting, and
  * times the device ran out (a gap in what is heard). */
 int  g_xa2_dropped, g_xa2_starved;
@@ -205,6 +212,13 @@ static void sdl_callback(void *user, Uint8 *stream, int len)
     unsigned have = g_ring_w - g_ring_r;
 
     (void)user;
+    if (!g_primed) {
+        if (have < XA2_PREROLL) {
+            memset(stream, 0, (size_t)len);
+            return;
+        }
+        g_primed = 1;
+    }
     if (have > want)
         have = want;
     for (i = 0; i < have; i++)
@@ -218,6 +232,7 @@ static void sdl_callback(void *user, Uint8 *stream, int len)
             g_dry = 1;
             g_xa2_starved++;
         }
+        g_primed = 0;
     } else {
         g_dry = 0;
     }
@@ -254,8 +269,14 @@ int xa2_init(void)
         return 1;
     /* A run without a display is an unattended one: keep its timing (the
      * dummy driver consumes at the real rate) and keep it quiet. */
-    if (getenv("RECOMP_HEADLESS") && !getenv("SDL_AUDIODRIVER"))
+    if (getenv("RECOMP_HEADLESS") && !getenv("SDL_AUDIODRIVER") && !getenv("SDL_AUDIO_DRIVER")) {
+#ifdef XBOXRECOMP_HAVE_SDL3
+        /* SDL3 reads its own copy of the environment, taken before this. */
+        SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+#else
         setenv("SDL_AUDIODRIVER", "dummy", 1);
+#endif
+    }
 #ifdef XBOXRECOMP_HAVE_SDL3
     {
         SDL_AudioSpec spec;
@@ -335,7 +356,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 #else
     SDL_LockAudioDevice(g_sdl_dev);
 #endif
-    if (g_ring_w - g_ring_r + n > XA2_BUF_SAMPLES * XA2_NUM_BUFS) {
+    if (g_ring_w - g_ring_r + n > XA2_RING_MAX) {
         g_xa2_dropped++;
         ok = 0;
     } else {

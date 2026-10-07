@@ -338,6 +338,9 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+extern unsigned g_apu_trap_stalls, g_apu_trap_expired;
+extern int64_t  g_apu_trap_stall_us;
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
@@ -428,6 +431,11 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                         peak, mcpx_apu_vp_count_voices(d),
                         d->regs[NV_PAPU_SECTL], d->regs[NV_PAPU_FECTL],
                         g_xa2_dropped, g_xa2_starved);
+                if (lines % 10 == 0)
+                    fprintf(stderr, "[APU] front-end stops waited out: %u (%u outlasted"
+                                    " the wait), %lld ms in all\n",
+                            g_apu_trap_stalls, g_apu_trap_expired,
+                            (long long)(g_apu_trap_stall_us / 1000));
                 g_xa2_dropped = g_xa2_starved = 0;
             }
             if (lines % 5 == 1 && lines < 120) {
@@ -508,8 +516,10 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    /* Up to four periods late is made up, which covers the front-end traps
+     * the frame thread waits out; later than that and the clock starts again. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 4 * EP_FRAME_US) {
         d->next_frame_time_us = now_us;
     }
 
@@ -567,6 +577,11 @@ static void se_frame(MCPXAPUState *d)
  * ============================================================ */
 
 void mcpx_apu_vp_dump_voices(MCPXAPUState *d);   /* apu_vp.c */
+
+/* Front-end stops waited out rather than played as silence: how many, how
+ * many outlasted the wait, and the time spent. */
+unsigned g_apu_trap_stalls, g_apu_trap_expired;
+int64_t  g_apu_trap_stall_us;
 
 static void *mcpx_apu_frame_thread(void *arg)
 {
@@ -643,6 +658,59 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (d->set_irq) {
             d->set_irq = false;
             update_irq(d);
+        }
+
+        /* A front end that is trapped or halted is waiting for the title to
+         * service the interrupt just raised, which takes it a millisecond or
+         * so. Stop the clock for that long instead of playing the slices as
+         * silence. This thread runs a period's eight slices back to back and
+         * then sleeps, so once the front end stopped at slice k the rest of
+         * the period was silent: a hole of 32 to 224 samples cut into
+         * whatever else was playing. A title that asks to be told when a
+         * voice ends stops on every effect -- 232 holes in two minutes of a
+         * Def Jam fight, heard as distortion on every loud note. The frames
+         * are made up afterwards, throttle() permitting. A front end that
+         * stays stopped past the wait plays silence as before, so the
+         * software mixer keeps its frames, and is not waited for again until
+         * it has run. */
+        {
+            static int gave_up;
+            static unsigned stalls, expired;
+
+            if (apu_active) {
+                gave_up = 0;
+            } else if (!gave_up && xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF &&
+                       !g_test_tone.active) {
+                int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME), waited_us = 0;
+
+                while ((fectl & NV_PAPU_FECTL_FEMETHMODE) && waited_us < 20000 &&
+                       !qatomic_read(&d->exiting)) {
+                    if (waited_us < 2000) {
+                        qemu_mutex_unlock(&d->lock);
+                        SwitchToThread();
+                        qemu_mutex_lock(&d->lock);
+                    } else {
+                        qemu_cond_timedwait(&d->cond, &d->lock, 1);
+                    }
+                    if (d->set_irq) {
+                        d->set_irq = false;
+                        update_irq(d);
+                    }
+                    fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+                    waited_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us;
+                }
+                if (fectl & NV_PAPU_FECTL_FEMETHMODE) {
+                    expired++;
+                    gave_up = 1;
+                }
+                g_apu_trap_stalls = ++stalls;
+                g_apu_trap_expired = expired;
+                g_apu_trap_stall_us += waited_us;
+                xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                    NV_PAPU_SECTL_XCNTMODE);
+                apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                             !(fectl & NV_PAPU_FECTL_FEMETHMODE);
+            }
         }
 
         if (apu_active && !g_test_tone.active) {
