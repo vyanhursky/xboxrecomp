@@ -169,13 +169,89 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32 -- the same interface on SDL's audio queue */
 
+#include <SDL.h>
+#include <stdlib.h>
+
+#define XA2_SAMPLE_RATE   48000
+#define XA2_CHANNELS      2
+#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
+#define XA2_NUM_BUFS      3
+
+static SDL_AudioDeviceID g_sdl_dev;
+static int g_xa2_initialized;
+static int g_xa2_frames_written;
+/* As on Windows: submissions refused because the queue was full, and
+ * submissions that found it empty (a gap in what is heard). */
 int  g_xa2_dropped, g_xa2_starved;
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
+
+int xa2_init(void)
+{
+    SDL_AudioSpec want, have;
+
+    if (g_xa2_initialized)
+        return 1;
+    /* A run without a display is an unattended one: keep its timing (the
+     * dummy driver consumes at the real rate) and keep it quiet. */
+    if (getenv("RECOMP_HEADLESS") && !getenv("SDL_AUDIODRIVER"))
+        setenv("SDL_AUDIODRIVER", "dummy", 1);
+    if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        fprintf(stderr, "[XA2] SDL audio unavailable: %s\n", SDL_GetError());
+        return 0;
+    }
+    SDL_zero(want);
+    want.freq = XA2_SAMPLE_RATE;
+    want.format = AUDIO_S16SYS;
+    want.channels = XA2_CHANNELS;
+    want.samples = XA2_BUF_SAMPLES;
+    g_sdl_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (!g_sdl_dev) {
+        fprintf(stderr, "[XA2] no audio device: %s\n", SDL_GetError());
+        return 0;
+    }
+    SDL_PauseAudioDevice(g_sdl_dev, 0);
+    g_xa2_initialized = 1;
+    g_xa2_frames_written = 0;
+    fprintf(stderr, "[XA2] SDL audio output initialized (%d Hz, %d channels, driver %s)\n",
+            have.freq, have.channels, SDL_GetCurrentAudioDriver());
+    return 1;
+}
+
+void xa2_shutdown(void)
+{
+    if (g_sdl_dev) {
+        SDL_CloseAudioDevice(g_sdl_dev);
+        g_sdl_dev = 0;
+    }
+    if (g_xa2_initialized)
+        fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
+    g_xa2_initialized = 0;
+}
+
+int xa2_is_active(void) { return g_xa2_initialized; }
+
+int xa2_submit_samples(const int16_t *samples, int num_samples)
+{
+    const Uint32 one = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
+    Uint32 queued;
+    int n = num_samples > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : num_samples;
+
+    if (!g_xa2_initialized || !g_sdl_dev)
+        return 0;
+    queued = SDL_GetQueuedAudioSize(g_sdl_dev);
+    if (queued == 0 && g_xa2_frames_written > 0)
+        g_xa2_starved++;
+    if (queued >= one * XA2_NUM_BUFS) {
+        g_xa2_dropped++;
+        return 0;
+    }
+    if (SDL_QueueAudio(g_sdl_dev, samples, (Uint32)n * XA2_CHANNELS * sizeof(int16_t)) != 0)
+        return 0;
+    g_xa2_frames_written++;
+    return 1;
+}
+
+int xa2_get_buffer_size(void) { return XA2_BUF_SAMPLES; }
 
 #endif /* _WIN32 */
