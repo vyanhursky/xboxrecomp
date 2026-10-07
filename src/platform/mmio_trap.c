@@ -452,6 +452,7 @@ static int install(void)
     sa.sa_sigaction = on_fault;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGUSR2);   /* no guest-CPU hand-over inside a trap */
     /* Darwin reports a protection fault as SIGBUS, Linux as SIGSEGV. */
     if (sigaction(SIGSEGV, &sa, &g_prev_segv) || sigaction(SIGBUS, &sa, &g_prev_bus))
         return -1;

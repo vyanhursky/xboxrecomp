@@ -551,14 +551,24 @@ void xbox_PinToGuestCore(void)
         sched_setaffinity(0, sizeof set, &set);
     }
 #else
-    /* Darwin on Apple Silicon has no thread affinity. Guest threads run on
-     * any core here until the one-guest-CPU rule has a mechanism that does
-     * not need one; a title that relies on a single core can race. */
-    static volatile LONG said;
+    /* Darwin on Apple Silicon has no thread affinity. The same rule is kept
+     * with a token instead: one joined thread runs at a time, and a waiting
+     * one preempts the holder (win32_compat.c). */
+    static volatile LONG init;
+    static int spread;
 
-    if (InterlockedCompareExchange(&said, 1, 0) == 0)
-        fprintf(stderr, "  [KERNEL] this host cannot pin threads: guest threads"
-                        " are NOT held to one CPU\n");
+    if (InterlockedCompareExchange(&init, 1, 0) == 0) {
+        const char *s = getenv("RECOMP_GUEST_CORES");
+        spread = s && !strcmp(s, "all");
+        fprintf(stderr, spread ? "  [KERNEL] guest threads are NOT held to one CPU\n"
+                               : "  [KERNEL] guest threads take turns on one guest CPU"
+                                 " (RECOMP_GUEST_CORES=all to spread them)\n");
+        InterlockedExchange(&init, 2);
+    }
+    while (init != 2)
+        YieldProcessor();
+    if (!spread)
+        guest_cpu_join();
 #endif
 }
 
@@ -10520,6 +10530,16 @@ static void kernel_thunk_dispatch_body(void)
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
+#if !defined(_WIN32) && !defined(__linux__)
+            {
+                uint64_t handoffs, kicks;
+                guest_cpu_counts(&handoffs, &kicks);
+                fprintf(stderr, "  [KERNEL] guest CPU: %llu preemptions, %llu requests,"
+                                " longest wait %ld ms\n",
+                        (unsigned long long)handoffs, (unsigned long long)kicks,
+                        guest_cpu_longest_wait_ms());
+            }
+#endif
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
              * title sitting still is actually asking the kernel for, and
@@ -10643,6 +10663,9 @@ static void kernel_thunk_dispatch_body(void)
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
         fflush(stderr);
     }
+#if !defined(_WIN32)
+    guest_cpu_checkpoint();   /* back to the title: let a waiting thread in */
+#endif
 }
 
 /* ── Dispatch lookup ────────────────────────────────────── */
