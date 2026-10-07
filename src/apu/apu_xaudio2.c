@@ -171,7 +171,11 @@ int xa2_get_buffer_size(void)
 
 #else /* !_WIN32 -- the same interface on an SDL audio device */
 
+#ifdef XBOXRECOMP_HAVE_SDL3
+#include <SDL3/SDL.h>
+#else
 #include <SDL.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -219,9 +223,32 @@ static void sdl_callback(void *user, Uint8 *stream, int len)
     }
 }
 
+#ifdef XBOXRECOMP_HAVE_SDL3
+/* SDL3 asks a stream for more instead of handing over a buffer. */
+static void SDLCALL sdl3_feed(void *user, SDL_AudioStream *stream, int additional, int total)
+{
+    static Uint8 chunk[4096];
+    (void)total;
+    while (additional > 0) {
+        int n = additional < (int)sizeof chunk ? additional : (int)sizeof chunk;
+        n -= n % (XA2_CHANNELS * (int)sizeof(int16_t));
+        if (n <= 0)
+            break;
+        sdl_callback(user, chunk, n);
+        SDL_PutAudioStreamData(stream, chunk, n);
+        additional -= n;
+    }
+}
+static SDL_AudioStream *g_sdl_stream;
+#endif
+
 int xa2_init(void)
 {
+#ifdef XBOXRECOMP_HAVE_SDL3
+    SDL_AudioSpec have;
+#else
     SDL_AudioSpec want, have;
+#endif
 
     if (g_xa2_initialized)
         return 1;
@@ -229,6 +256,28 @@ int xa2_init(void)
      * dummy driver consumes at the real rate) and keep it quiet. */
     if (getenv("RECOMP_HEADLESS") && !getenv("SDL_AUDIODRIVER"))
         setenv("SDL_AUDIODRIVER", "dummy", 1);
+#ifdef XBOXRECOMP_HAVE_SDL3
+    {
+        SDL_AudioSpec spec;
+        if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            fprintf(stderr, "[XA2] SDL audio unavailable: %s\n", SDL_GetError());
+            return 0;
+        }
+        spec.freq = XA2_SAMPLE_RATE;
+        spec.format = SDL_AUDIO_S16;
+        spec.channels = XA2_CHANNELS;
+        g_sdl_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec,
+                                                 sdl3_feed, NULL);
+        if (!g_sdl_stream) {
+            fprintf(stderr, "[XA2] no audio device: %s\n", SDL_GetError());
+            return 0;
+        }
+        g_sdl_dev = SDL_GetAudioStreamDevice(g_sdl_stream);
+        SDL_ResumeAudioStreamDevice(g_sdl_stream);
+        have.freq = spec.freq;
+        have.channels = spec.channels;
+    }
+#else
     if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "[XA2] SDL audio unavailable: %s\n", SDL_GetError());
         return 0;
@@ -245,6 +294,7 @@ int xa2_init(void)
         return 0;
     }
     SDL_PauseAudioDevice(g_sdl_dev, 0);
+#endif
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
     fprintf(stderr, "[XA2] SDL audio output initialized (%d Hz, %d channels, driver %s)\n",
@@ -254,10 +304,18 @@ int xa2_init(void)
 
 void xa2_shutdown(void)
 {
+#ifdef XBOXRECOMP_HAVE_SDL3
+    if (g_sdl_stream) {
+        SDL_DestroyAudioStream(g_sdl_stream);
+        g_sdl_stream = NULL;
+    }
+    g_sdl_dev = 0;
+#else
     if (g_sdl_dev) {
         SDL_CloseAudioDevice(g_sdl_dev);
         g_sdl_dev = 0;
     }
+#endif
     if (g_xa2_initialized)
         fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
     g_xa2_initialized = 0;
@@ -272,7 +330,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     if (!g_xa2_initialized || !g_sdl_dev)
         return 0;
+#ifdef XBOXRECOMP_HAVE_SDL3
+    SDL_LockAudioStream(g_sdl_stream);
+#else
     SDL_LockAudioDevice(g_sdl_dev);
+#endif
     if (g_ring_w - g_ring_r + n > XA2_BUF_SAMPLES * XA2_NUM_BUFS) {
         g_xa2_dropped++;
         ok = 0;
@@ -283,7 +345,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         g_ring_w += n;
         g_xa2_frames_written++;
     }
+#ifdef XBOXRECOMP_HAVE_SDL3
+    SDL_UnlockAudioStream(g_sdl_stream);
+#else
     SDL_UnlockAudioDevice(g_sdl_dev);
+#endif
     return ok;
 }
 

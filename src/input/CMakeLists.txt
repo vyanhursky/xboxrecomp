@@ -21,6 +21,14 @@ if(WIN32)
         target_link_libraries(xbox_input PUBLIC SDL3::SDL3-static)
         target_compile_definitions(xbox_input PUBLIC XBOXRECOMP_HAVE_SDL3=1)
     endif()
+elseif(XBOXRECOMP_SDL3)
+    # Off Windows SDL3 is the system's, shared: the program's window and
+    # sound use it as well, and a process cannot hold SDL2 and SDL3 at once
+    # (they export the same names). Pads then go through the host input layer.
+    find_package(SDL3 REQUIRED CONFIG)
+    target_sources(xbox_input PRIVATE input_host.c)
+    target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
+    target_compile_definitions(xbox_input PUBLIC XBOXRECOMP_HAVE_SDL3=1)
 else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)

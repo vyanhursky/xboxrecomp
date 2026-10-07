@@ -1,6 +1,7 @@
 /* The PC's pads, keyboard and mouse as Xbox controllers. See input_host.h. */
 
 #define _CRT_SECURE_NO_WARNINGS
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,6 +10,13 @@
 #include <xinput.h>
 
 #pragma comment(lib, "winmm.lib")
+#else
+/* Off Windows there is no XInput: pads are SDL3's or there are none. The
+ * threads, events and clocks are the POSIX layer's. */
+#include "../platform/win32_compat.h"
+#define timeBeginPeriod(ms) ((void)0)
+#define timeEndPeriod(ms)   ((void)0)
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -104,6 +112,7 @@ static int16_t clamp_axis(int v)
     return (int16_t)(v < -32767 ? -32767 : v > 32767 ? 32767 : v);
 }
 
+#if defined(_WIN32)
 static int read_xinput(DWORD index, InputRaw *r)
 {
     XINPUT_STATE s;
@@ -136,6 +145,7 @@ static int read_xinput(DWORD index, InputRaw *r)
     raw_directions(r);
     return 1;
 }
+#endif
 
 #ifdef XBOXRECOMP_HAVE_SDL3
 static void read_sdl(SDL_Gamepad *gp, InputRaw *r)
@@ -374,12 +384,14 @@ static void apply_rumble(int s, int focused, const InputHostConfig *cfg)
         return;
     }
 #endif
+#if defined(_WIN32)
     if (dv->backend == 2) {
         XINPUT_VIBRATION v;
         v.wLeftMotorSpeed = (WORD)low;
         v.wRightMotorSpeed = (WORD)high;
         XInputSetState(dv->xi_index, &v);
     }
+#endif
 }
 
 static void to_state(const InputPad *p, XBOX_INPUT_STATE *out, DWORD packet)
@@ -426,7 +438,9 @@ static void poll_once(void)
 #ifdef XBOXRECOMP_HAVE_SDL3
         if (dv->backend == 1 && dv->gp) { read_sdl(dv->gp, &raw); have = 1; }
 #endif
+#if defined(_WIN32)
         if (dv->backend == 2) have = read_xinput(dv->xi_index, &raw);
+#endif
         if (have && live) {
             raws[s] = raw;
             if (!ui) input_pad_map(&cfg.padmap, &raw, &next[s]);
@@ -456,13 +470,38 @@ static void poll_once(void)
         apply_rumble(s, live && (!ui || GetTickCount64() < H.slot[s].buzz_until), &cfg);
 }
 
+#if defined(XBOXRECOMP_HAVE_SDL3) && !defined(_WIN32)
+/* Off Windows the program's window is SDL's too, and its own thread takes
+ * events off the same queue. So pads arriving and leaving are noted by a
+ * watch, which sees every event whoever ends up reading it, and this thread
+ * only removes the joystick and gamepad events from the queue. */
+#define PAD_EVENTS 32
+static struct { SDL_JoystickID id; int added; } g_pad_event[PAD_EVENTS];
+static int g_pad_events;
+static SDL_SpinLock g_pad_event_lock;
+
+static bool SDLCALL pad_watch(void *user, SDL_Event *e)
+{
+    (void)user;
+    if (e->type == SDL_EVENT_GAMEPAD_ADDED || e->type == SDL_EVENT_GAMEPAD_REMOVED) {
+        SDL_LockSpinlock(&g_pad_event_lock);
+        if (g_pad_events < PAD_EVENTS) {
+            g_pad_event[g_pad_events].id = e->gdevice.which;
+            g_pad_event[g_pad_events].added = e->type == SDL_EVENT_GAMEPAD_ADDED;
+            g_pad_events++;
+        }
+        SDL_UnlockSpinlock(&g_pad_event_lock);
+    }
+    return true;
+}
+#endif
+
 static void hotplug_once(void)
 {
-    static ULONGLONG xi_scan;
-    ULONGLONG now = GetTickCount64();
     int d;
 #ifdef XBOXRECOMP_HAVE_SDL3
     if (H.sdl) {
+#if defined(_WIN32)
         SDL_Event e;
         SDL_UpdateGamepads();
         while (SDL_PollEvent(&e)) {
@@ -477,9 +516,45 @@ static void hotplug_once(void)
                 LeaveCriticalSection(&H.cs);
             }
         }
+#else
+        SDL_Event drop[16];
+        int n, k;
+        SDL_UpdateGamepads();
+        while (SDL_PeepEvents(drop, 16, SDL_GETEVENT, SDL_EVENT_JOYSTICK_AXIS_MOTION,
+                              SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED) > 0)
+            ;
+        for (;;) {
+            SDL_JoystickID id = 0;
+            int added = 0;
+            SDL_LockSpinlock(&g_pad_event_lock);
+            n = g_pad_events;
+            if (n) {
+                id = g_pad_event[0].id;
+                added = g_pad_event[0].added;
+                for (k = 1; k < n; k++) g_pad_event[k - 1] = g_pad_event[k];
+                g_pad_events = n - 1;
+            }
+            SDL_UnlockSpinlock(&g_pad_event_lock);
+            if (!n) break;
+            if (added) {
+                if (!(H.cfg.no_pads && !is_virtual_id(id)))
+                    open_sdl_gamepad(id);
+            } else {
+                EnterCriticalSection(&H.cs);
+                for (d = 0; d < MAX_DEVICES; d++)
+                    if (H.dev[d].used && H.dev[d].backend == 1 && H.dev[d].id == id)
+                        free_device(d);
+                LeaveCriticalSection(&H.cs);
+            }
+        }
+#endif
         return;
     }
 #endif
+#if defined(_WIN32)
+    {
+    static ULONGLONG xi_scan;
+    ULONGLONG now = GetTickCount64();
     if (H.cfg.no_pads || now - xi_scan < 1000) return;
     xi_scan = now;
     for (d = 0; d < XUSER_MAX_COUNT; d++) {
@@ -505,6 +580,10 @@ static void hotplug_once(void)
             LeaveCriticalSection(&H.cs);
         }
     }
+    }
+#else
+    (void)d;
+#endif
 }
 
 static DWORD WINAPI reader_thread(LPVOID unused)
@@ -518,6 +597,9 @@ static DWORD WINAPI reader_thread(LPVOID unused)
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
         if (SDL_Init(SDL_INIT_GAMEPAD)) {
             H.sdl = 1;
+#if !defined(_WIN32)
+            SDL_AddEventWatch(pad_watch, NULL);
+#endif
             attach_virtual_pads(H.cfg.virtual_pads);
         } else {
             log_line("[INPUT] SDL gamepads unavailable (%s); using XInput\n", SDL_GetError(), 0);
@@ -554,6 +636,7 @@ static DWORD WINAPI reader_thread(LPVOID unused)
         SDL_free(ids);
     }
 #endif
+#if defined(_WIN32)
     if (!H.sdl && !H.cfg.no_pads) {
         for (i = 0; i < XUSER_MAX_COUNT; i++) {
             InputRaw raw;
@@ -565,6 +648,7 @@ static DWORD WINAPI reader_thread(LPVOID unused)
             }
         }
     }
+#endif
 
     EnterCriticalSection(&H.cs);
     plan_slots(H.found > SLOTS ? SLOTS : H.found);
@@ -629,6 +713,9 @@ static DWORD WINAPI reader_thread(LPVOID unused)
             g_virtual_ids[i] = 0;
         }
         g_virtual_count = 0;
+#if !defined(_WIN32)
+        SDL_RemoveEventWatch(pad_watch, NULL);
+#endif
         SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     }
 #endif

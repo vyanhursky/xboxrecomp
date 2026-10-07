@@ -37,6 +37,9 @@ else()
         target_link_libraries(xbox_d3d8 PUBLIC platform Vulkan::Vulkan PkgConfig::SHADERC)
         target_compile_definitions(xbox_d3d8 PUBLIC XBOXRECOMP_HAVE_VULKAN=1)
         message(STATUS "xbox_d3d8: Vulkan device (shaderc ${SHADERC_VERSION})")
+    elseif(XBOXRECOMP_SDL3)
+        message(FATAL_ERROR "XBOXRECOMP_SDL3 off Windows needs the Vulkan device "
+                            "(the Vulkan loader and shaderc); the OpenGL one is built on SDL2.")
     else()
         add_library(xbox_d3d8 STATIC
             d3d8_gl.c
