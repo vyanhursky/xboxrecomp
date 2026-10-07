@@ -169,22 +169,55 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- the same interface on SDL's audio queue */
+#else /* !_WIN32 -- the same interface on an SDL audio device */
 
 #include <SDL.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
 #define XA2_NUM_BUFS      3
+#define RING_FRAMES       8192   /* power of two, well over the three buffers */
 
+/* A ring the device's callback drains. SDL's own queue cannot tell "empty
+ * because the device took it all into its buffer" from "empty because nothing
+ * was sent", and the second is the one that is heard. */
 static SDL_AudioDeviceID g_sdl_dev;
+static int16_t  g_ring[RING_FRAMES][XA2_CHANNELS];
+static unsigned g_ring_r, g_ring_w;         /* frame counters, free-running */
 static int g_xa2_initialized;
 static int g_xa2_frames_written;
-/* As on Windows: submissions refused because the queue was full, and
- * submissions that found it empty (a gap in what is heard). */
+static int g_dry;                           /* the callback is in a gap */
+/* As on Windows: submissions refused because three buffers were waiting, and
+ * times the device ran out (a gap in what is heard). */
 int  g_xa2_dropped, g_xa2_starved;
+
+static void sdl_callback(void *user, Uint8 *stream, int len)
+{
+    int16_t (*out)[XA2_CHANNELS] = (void *)stream;
+    unsigned want = (unsigned)len / (XA2_CHANNELS * sizeof(int16_t)), i;
+    unsigned have = g_ring_w - g_ring_r;
+
+    (void)user;
+    if (have > want)
+        have = want;
+    for (i = 0; i < have; i++)
+        memcpy(out[i], g_ring[(g_ring_r + i) % RING_FRAMES], sizeof out[i]);
+    g_ring_r += have;
+    if (have < want) {
+        memset(out[have], 0, (size_t)(want - have) * sizeof out[0]);
+        /* One gap however many callbacks it lasts, and none before the title
+         * has sent anything. */
+        if (!g_dry && g_xa2_frames_written > 0) {
+            g_dry = 1;
+            g_xa2_starved++;
+        }
+    } else {
+        g_dry = 0;
+    }
+}
 
 int xa2_init(void)
 {
@@ -204,7 +237,8 @@ int xa2_init(void)
     want.freq = XA2_SAMPLE_RATE;
     want.format = AUDIO_S16SYS;
     want.channels = XA2_CHANNELS;
-    want.samples = XA2_BUF_SAMPLES;
+    want.samples = 512;
+    want.callback = sdl_callback;
     g_sdl_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (!g_sdl_dev) {
         fprintf(stderr, "[XA2] no audio device: %s\n", SDL_GetError());
@@ -233,23 +267,24 @@ int xa2_is_active(void) { return g_xa2_initialized; }
 
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
-    const Uint32 one = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
-    Uint32 queued;
-    int n = num_samples > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : num_samples;
+    unsigned n = (unsigned)(num_samples > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : num_samples), i;
+    int ok = 1;
 
     if (!g_xa2_initialized || !g_sdl_dev)
         return 0;
-    queued = SDL_GetQueuedAudioSize(g_sdl_dev);
-    if (queued == 0 && g_xa2_frames_written > 0)
-        g_xa2_starved++;
-    if (queued >= one * XA2_NUM_BUFS) {
+    SDL_LockAudioDevice(g_sdl_dev);
+    if (g_ring_w - g_ring_r + n > XA2_BUF_SAMPLES * XA2_NUM_BUFS) {
         g_xa2_dropped++;
-        return 0;
+        ok = 0;
+    } else {
+        for (i = 0; i < n; i++)
+            memcpy(g_ring[(g_ring_w + i) % RING_FRAMES], samples + i * XA2_CHANNELS,
+                   sizeof g_ring[0]);
+        g_ring_w += n;
+        g_xa2_frames_written++;
     }
-    if (SDL_QueueAudio(g_sdl_dev, samples, (Uint32)n * XA2_CHANNELS * sizeof(int16_t)) != 0)
-        return 0;
-    g_xa2_frames_written++;
-    return 1;
+    SDL_UnlockAudioDevice(g_sdl_dev);
+    return ok;
 }
 
 int xa2_get_buffer_size(void) { return XA2_BUF_SAMPLES; }

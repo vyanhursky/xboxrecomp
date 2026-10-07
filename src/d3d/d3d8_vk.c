@@ -1544,6 +1544,51 @@ static void present_rect(uint32_t ww, uint32_t wh, VkOffset3D dst[2])
     dst[1].z = 1;
 }
 
+/* RECOMP_PRESENT_PACING=1: every two seconds, how evenly frames were
+ * finished -- the line and the arithmetic of the Direct3D 11 backend's
+ * d3d8_present_trace_pacing, which the test tooling reads. Without a window
+ * these are frames completed, not frames shown. */
+static void trace_pacing(void)
+{
+    static int on = -1;
+    static LARGE_INTEGER freq, last, window_start;
+    static double ms[512], sorted[512];
+    static unsigned n;
+    LARGE_INTEGER now;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PRESENT_PACING");
+        on = e && *e == '1';
+        QueryPerformanceFrequency(&freq);
+    }
+    if (!on)
+        return;
+    QueryPerformanceCounter(&now);
+    if (last.QuadPart && n < 512)
+        ms[n++] = (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    last = now;
+    if (!window_start.QuadPart)
+        window_start = now;
+    if (now.QuadPart - window_start.QuadPart >= 2 * freq.QuadPart && n) {
+        double lo = ms[0], hi = ms[0], sum = 0, median;
+        unsigned i, j, late = 0;
+        for (i = 0; i < n; i++) {
+            if (ms[i] < lo) lo = ms[i];
+            if (ms[i] > hi) hi = ms[i];
+            sum += ms[i];
+            for (j = i; j > 0 && sorted[j - 1] > ms[i]; j--) sorted[j] = sorted[j - 1];
+            sorted[j] = ms[i];
+        }
+        median = sorted[n / 2];
+        for (i = 0; i < n; i++) if (ms[i] > median * 1.5) late++;
+        fprintf(stderr, "[PACING] %u presents, interval %.2f / %.2f / %.2f ms (min/mean/max), "
+                        "median %.2f, %u late, sync interval %d\n",
+                n, lo, sum / n, hi, median, late, 0);
+        n = 0;
+        window_start = now;
+    }
+}
+
 static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const RECT *dst,
                                      HWND wnd, void *dirty)
 {
@@ -1625,6 +1670,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         r = vkQueuePresentKHR(vk.queue, &pi);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
             swapchain_make();
+        trace_pacing();
     } else if (vk.swap && s_have_host && s_host.drawable_size) {
         /* A window that changed size without the swap chain saying so. */
         int w = 0, h = 0;
@@ -1632,6 +1678,8 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         if (w > 0 && h > 0 && ((uint32_t)w != vk.swap_ext.width || (uint32_t)h != vk.swap_ext.height))
             swapchain_make();
     }
+    if (!have)
+        trace_pacing();
     return D3D_OK;
 }
 
