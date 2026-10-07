@@ -40,9 +40,15 @@
 #ifndef XBOXRECOMP_D3D8_COMBINERS_H
 #define XBOXRECOMP_D3D8_COMBINERS_H
 
-#include <d3d11.h>
 #include <stdint.h>
+#if defined(_WIN32)
+#include <d3d11.h>
 #include <windows.h>
+#else
+/* Off Windows this header is the combiner state and its HLSL generator
+ * only; a backend compiles and binds the shader its own way. */
+#include "d3d8_xbox.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -306,6 +312,7 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
 int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                                  char *buf, int bufsize);
 
+#if defined(_WIN32)
 /**
  * Get or create a compiled pixel shader for the given combiner state.
  *
@@ -317,6 +324,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
  *               The shader is owned by the cache - do NOT release it.
  */
 ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state);
+#endif
 
 /**
  * Prepare for a draw call using register combiners.
@@ -363,6 +371,13 @@ void d3d8_combiners_set_nv2a(const DWORD color_icw[8], const DWORD alpha_icw[8],
                              DWORD control, DWORD final_cw0, DWORD final_cw1,
                              DWORD final_c0, DWORD final_c1, DWORD shader_stages);
 void d3d8_combiners_clear_nv2a(void);
+
+/**
+ * The NV2A-mode state set by d3d8_combiners_set_nv2a, or NULL when no
+ * combiner program is active (fixed function). For a backend that builds its
+ * own shader from d3d8_combiners_generate_hlsl.
+ */
+const NV2ACombinerState *d3d8_combiners_nv2a_state(void);
 
 #ifdef __cplusplus
 }

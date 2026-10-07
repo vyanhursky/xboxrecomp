@@ -32,13 +32,20 @@
  *    and binds everything to the D3D11 pipeline.
  */
 
+#if defined(_WIN32)
 #include "d3d8_internal.h"
+#endif
 #include "d3d8_combiners.h"
+#if defined(_WIN32)
 #include <d3dcompiler.h>
+#endif
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
+#if defined(_WIN32)
 #pragma comment(lib, "d3dcompiler.lib")
+#endif
 
 /* ================================================================
  * Internal State
@@ -53,6 +60,7 @@ static NV2ACombinerState g_combiner_state;
 /** Dirty flag - set when any PS render state changes. */
 static BOOL g_dirty = TRUE;
 
+#if defined(_WIN32)
 /** PS constant buffer (uploaded to GPU each draw). */
 static ID3D11Buffer *g_combiner_cb = NULL;
 
@@ -77,6 +85,7 @@ typedef struct CombinerCacheEntry {
 
 static CombinerCacheEntry g_cache[COMBINER_CACHE_SIZE];
 static uint32_t g_frame_counter = 0;
+#endif /* _WIN32 */
 
 /* ================================================================
  * Hashing
@@ -801,6 +810,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
 
 #undef EMIT
 
+#if defined(_WIN32)
 /* ================================================================
  * Shader Compilation & Cache
  * ================================================================ */
@@ -984,6 +994,8 @@ void d3d8_combiners_shutdown(void)
     fprintf(stderr, "NV2A combiners: Shut down\n");
 }
 
+#endif /* _WIN32 */
+
 /* ================================================================
  * Draw Integration
  * ================================================================ */
@@ -1110,6 +1122,12 @@ void d3d8_combiners_mark_dirty(void)
     g_dirty = TRUE;
 }
 
+const NV2ACombinerState *d3d8_combiners_nv2a_state(void)
+{
+    return g_nv2a_mode ? &g_combiner_state : NULL;
+}
+
+#if defined(_WIN32)
 BOOL d3d8_combiners_prepare_draw(void)
 {
     ID3D11DeviceContext *ctx;
@@ -1189,3 +1207,4 @@ BOOL d3d8_combiners_prepare_draw(void)
 
     return TRUE;
 }
+#endif /* _WIN32 */
