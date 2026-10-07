@@ -25,6 +25,9 @@ static bool SDLCALL on_rumble(void *userdata, Uint16 low, Uint16 high)
     return true;
 }
 
+static volatile int g_need_players;
+static void need_players(int count) { if (count > g_need_players) g_need_players = count; }
+
 typedef struct VPad { SDL_JoystickID id; SDL_Joystick *joy; } VPad;
 
 static VPad attach(const char *name)
@@ -68,6 +71,7 @@ int main(void)
     VPad pad1, pad2;
     char name[64];
 
+    xbox_HostInputOnPadSlot(need_players);
     CHECK(SDL_Init(SDL_INIT_GAMEPAD));
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 
@@ -78,10 +82,15 @@ int main(void)
 
     xbox_HostInputDefaults(&cfg);
     keys_for_test(&cfg);
+    /* The exact-value checks below want the title's rumble passed through as it is. */
+    cfg.rumble_floor = 0;
+    cfg.rumble_min_ms = 0;
+    cfg.rumble_on_connect = 0;
     CHECK(xbox_HostInputStart(&cfg) == 1);
     CHECK(xbox_HostInputActive());
     CHECK(xbox_HostInputPlayerCount() == 2);
     CHECK(xbox_HostInputKeyboardSlot() == 1);
+    CHECK(g_need_players == 1);                       /* the pad in slot 0 needs one controller */
     CHECK(xbox_HostInputSlotInfo(0, name, sizeof(name)) == 1 && strstr(name, "Test pad 1"));
     CHECK(xbox_HostInputSlotInfo(1, name, sizeof(name)) == 2);
     CHECK(xbox_HostInputSlotInfo(2, NULL, 0) == 0);
@@ -177,6 +186,28 @@ int main(void)
     cfg.rumble_percent = 100;
     xbox_HostInputConfigure(&cfg);
 
+    /* A faint, brief pulse is made felt: raised to the floor and held for the
+     * minimum length, then released. */
+    cfg.rumble_floor = 60;
+    cfg.rumble_min_ms = 250;
+    xbox_HostInputConfigure(&cfg);
+    xbox_HostInputRumble(0, 0x4000, 0);
+    settle();
+    CHECK(g_rumble_low == 0x9999 && g_rumble_high == 0);          /* 60% of full */
+    xbox_HostInputRumble(0, 0, 0);                                /* the title stops it at once */
+    settle();
+    CHECK(g_rumble_low == 0x9999);                                /* still running: under 250 ms */
+    Sleep(300);
+    CHECK(g_rumble_low == 0 && g_rumble_high == 0);
+    xbox_HostInputRumble(0, 0xFFFF, 0);                           /* strong pulses pass unchanged */
+    settle();
+    CHECK(g_rumble_low == 0xFFFF);
+    xbox_HostInputRumble(0, 0, 0);
+    Sleep(300);
+    cfg.rumble_floor = 0;
+    cfg.rumble_min_ms = 0;
+    xbox_HostInputConfigure(&cfg);
+
     /* Remapping applies live: swap A and B. */
     cfg.padmap.source[INPUT_A] = INPUT_SRC_EAST;
     cfg.padmap.source[INPUT_B] = INPUT_SRC_SOUTH;
@@ -193,6 +224,7 @@ int main(void)
     pad2 = attach("Test pad 2");
     settle();
     CHECK(xbox_HostInputSlotInfo(2, name, sizeof(name)) == 1);
+    CHECK(g_need_players == 3);                       /* the host is asked to plug a third controller in */
     SDL_SetJoystickVirtualButton(pad2.joy, SDL_GAMEPAD_BUTTON_EAST, true);
     settle();
     s = get(2, &rc);
@@ -258,6 +290,17 @@ int main(void)
     settle();
     s = get(2, &rc);
     CHECK(rc == ERROR_SUCCESS && s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    xbox_HostInputStop();
+
+    /* A pad that takes a player buzzes for a moment, then stops. */
+    g_rumble_calls = 0;
+    g_rumble_low = g_rumble_high = 0;
+    xbox_HostInputDefaults(&cfg);
+    CHECK(xbox_HostInputStart(&cfg) == 1);
+    settle();
+    CHECK(g_rumble_calls > 0 && g_rumble_low == 0xFFFF);
+    Sleep(500);
+    CHECK(g_rumble_low == 0 && g_rumble_high == 0);
     xbox_HostInputStop();
 
     SDL_CloseJoystick(pad1.joy);
