@@ -66,6 +66,8 @@ static struct Host {
     Slot slot[SLOTS];
     InputPad out[SLOTS];
     InputPad last[SLOTS];
+    InputRaw raw[SLOTS];            /* the pads as read, for a host menu */
+    volatile LONG ui_active;
     DWORD packet[SLOTS];
     int found;                      /* pads opened at start */
     int sdl;                        /* SDL is the pad backend */
@@ -395,10 +397,12 @@ static void to_state(const InputPad *p, XBOX_INPUT_STATE *out, DWORD packet)
 static void poll_once(void)
 {
     InputPad next[SLOTS];
+    InputRaw raws[SLOTS];
     uint8_t keys[INPUT_KEY_COUNT];
     InputHostConfig cfg;
     ULONGLONG now = GetTickCount64();
     int focused = InterlockedCompareExchange(&H.focused, 0, 0);
+    int ui = InterlockedCompareExchange(&H.ui_active, 0, 0);
     int s, live;
 
     EnterCriticalSection(&H.cs);
@@ -412,6 +416,7 @@ static void poll_once(void)
     keys[INPUT_KEY_WHEEL_DOWN] = now < H.wheel_until[1];
 
     memset(next, 0, sizeof(next));
+    memset(raws, 0, sizeof(raws));
     for (s = 0; s < SLOTS; s++) {
         InputRaw raw;
         Device *dv;
@@ -422,9 +427,12 @@ static void poll_once(void)
         if (dv->backend == 1 && dv->gp) { read_sdl(dv->gp, &raw); have = 1; }
 #endif
         if (dv->backend == 2) have = read_xinput(dv->xi_index, &raw);
-        if (have && live) input_pad_map(&cfg.padmap, &raw, &next[s]);
+        if (have && live) {
+            raws[s] = raw;
+            if (!ui) input_pad_map(&cfg.padmap, &raw, &next[s]);
+        }
     }
-    if (live) {
+    if (live && !ui) {
         InputPad kp;
         if (H.kb_slot >= 0 || H.kb_merge) {
             input_keys_resolve(&cfg.keys, keys, &kp);
@@ -440,10 +448,12 @@ static void poll_once(void)
             H.packet[s]++;
         }
         H.out[s] = next[s];
+        H.raw[s] = raws[s];
     }
     LeaveCriticalSection(&H.cs);
 
-    for (s = 0; s < SLOTS; s++) apply_rumble(s, live, &cfg);
+    for (s = 0; s < SLOTS; s++)
+        apply_rumble(s, live && (!ui || GetTickCount64() < H.slot[s].buzz_until), &cfg);
 }
 
 static void hotplug_once(void)
@@ -585,6 +595,17 @@ static DWORD WINAPI reader_thread(LPVOID unused)
 #else
             (void)started; (void)late_done;
 #endif
+#ifdef XBOXRECOMP_HAVE_SDL3
+            if (H.sdl && H.cfg.virtual_chord_ms && g_virtual_joys[0]) {
+                ULONGLONG t = GetTickCount64() - started;
+                ULONGLONG c = (ULONGLONG)H.cfg.virtual_chord_ms;
+                bool clicks = t >= c && t < c + 1800;
+                bool east = t >= c + 3500 && t < c + 3800;
+                SDL_SetJoystickVirtualButton(g_virtual_joys[0], SDL_GAMEPAD_BUTTON_LEFT_STICK, clicks);
+                SDL_SetJoystickVirtualButton(g_virtual_joys[0], SDL_GAMEPAD_BUTTON_RIGHT_STICK, clicks);
+                SDL_SetJoystickVirtualButton(g_virtual_joys[0], SDL_GAMEPAD_BUTTON_EAST, east);
+            }
+#endif
             hotplug_once();
             poll_once();
         }
@@ -722,6 +743,31 @@ void xbox_HostInputScriptVirtual(int slot, const uint8_t *held)
 #else
     (void)slot; (void)held;
 #endif
+}
+
+void xbox_HostInputSetUiActive(int active)
+{
+    InterlockedExchange(&H.ui_active, active ? 1 : 0);
+}
+
+void xbox_HostInputRumbleTest(int slot)
+{
+    if (!H.running || slot < 0 || slot >= SLOTS) return;
+    H.slot[slot].buzz_until = GetTickCount64() + 400;
+}
+
+int xbox_HostInputUiActive(void) { return InterlockedCompareExchange(&H.ui_active, 0, 0); }
+
+int xbox_HostInputRawPad(int slot, InputRaw *raw)
+{
+    int have = 0;
+    if (raw) memset(raw, 0, sizeof(*raw));
+    if (!H.running || slot < 0 || slot >= SLOTS || !raw) return 0;
+    EnterCriticalSection(&H.cs);
+    have = H.slot[slot].device >= 0;
+    if (have) *raw = H.raw[slot];
+    LeaveCriticalSection(&H.cs);
+    return have;
 }
 
 void xbox_HostInputScriptControls(const uint8_t *held)

@@ -92,6 +92,19 @@ static inline unsigned d3d8_present_interval_for(unsigned hz)
 /* 1 = smooth (bilinear), 0 = sharp (nearest). */
 void d3d8_present_set_linear_filter(int linear);
 
+/* A host program's drawing on top of the picture, in window pixels, after the
+ * title's target has been scaled into the window: a menu, an on-screen display.
+ * It runs on the thread that presents, on the immediate context (the pointers are Direct3D 11 interfaces; plain
+ * pointers here keep this header free of Direct3D types), with the
+ * window's back buffer as the render target; it must leave nothing bound that
+ * the title's pipeline depends on (the title's own state is restored after the
+ * blit, not after this). The picture a harness captures is the title's target,
+ * so nothing drawn here is ever in a capture. */
+typedef void (*D3D8PresentOverlay)(void *device /* ID3D11Device */, void *context /* ID3D11DeviceContext */,
+                                   void *window /* ID3D11RenderTargetView */, unsigned width, unsigned height,
+                                   void *user);
+void d3d8_present_set_overlay(D3D8PresentOverlay overlay, void *user);
+
 #ifdef __cplusplus
 }
 #endif

@@ -257,6 +257,15 @@ static HRESULT present_follow_window(void)
     return hr;
 }
 
+static D3D8PresentOverlay g_overlay;
+static void *g_overlay_user;
+
+void d3d8_present_set_overlay(D3D8PresentOverlay overlay, void *user)
+{
+    g_overlay_user = user;
+    g_overlay = overlay;
+}
+
 /* Draw the title's target into the window's buffer. */
 HRESULT d3d8_present_blit(void)
 {
@@ -299,5 +308,8 @@ HRESULT d3d8_present_blit(void)
      * back exactly as it was. */
     ID3D11DeviceContext_ExecuteCommandList(d3d8_GetD3D11Context(), commands, TRUE);
     ID3D11CommandList_Release(commands);
+    if (g_overlay)
+        g_overlay(d3d8_GetD3D11Device(), d3d8_GetD3D11Context(), g_window_rtv,
+                  g_window_width, g_window_height, g_overlay_user);
     return S_OK;
 }
