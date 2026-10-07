@@ -111,6 +111,12 @@ int recomp_settings_set(const char *section, const char *key, int value);
  * rejected, with -1, if it does not fit. */
 int recomp_settings_set_text(const char *section, const char *key, const char *text);
 
+/* Put a setting back to its default. Same return values as recomp_settings_set. */
+int recomp_settings_reset_to_default(const char *section, const char *key);
+
+/* The default as the file writes it ("true", "15", "south", "K, Space"). Returns `buf`. */
+const char *recomp_settings_default_text(const RecompSetting *setting, char *buf, size_t size);
+
 /* The value as it is written to the file. Returns `buf`. A string setting is
  * formatted from the setting's own stored text; `value` is not used. */
 const char *recomp_settings_format(const RecompSetting *setting, int value,

@@ -268,6 +268,25 @@ const char *recomp_settings_format(const RecompSetting *s, int value, char *buf,
     return buf;
 }
 
+const char *recomp_settings_default_text(const RecompSetting *s, char *buf, size_t size)
+{
+    if (s->type == RECOMP_SETTING_STRING)
+        snprintf(buf, size, "%s", s->def_text ? s->def_text : "");
+    else
+        recomp_settings_format(s, s->def, buf, size);
+    return buf;
+}
+
+int recomp_settings_reset_to_default(const char *section, const char *key)
+{
+    const RecompSetting *s = recomp_settings_find(section, key);
+    char text[RECOMP_SETTING_TEXT_MAX];
+    if (!s) return -1;
+    if (s->type == RECOMP_SETTING_STRING)
+        return recomp_settings_set_text(section, key, recomp_settings_default_text(s, text, sizeof(text)));
+    return recomp_settings_set(section, key, s->def);
+}
+
 void recomp_settings_on_change(RecompSettingChanged callback, void *user)
 {
     g_changed = callback;

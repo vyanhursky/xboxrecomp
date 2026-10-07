@@ -209,6 +209,15 @@ int main(void)
         recomp_settings_load(path);
         CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "J , Mouse1"));
 
+        /* Back to the default, text and notification included. */
+        g_changes = 0;
+        CHECK(recomp_settings_set_text("keyboard", "a", "Z") == 1);
+        CHECK(recomp_settings_reset_to_default("keyboard", "a") == 1);
+        CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "L, Space"));
+        CHECK(recomp_settings_reset_to_default("keyboard", "a") == 0);
+        CHECK(recomp_settings_reset_to_default("keyboard", "nope") == -1);
+        CHECK(!strcmp(recomp_settings_default_text(recomp_settings_find("keyboard", "a"), buf, sizeof(buf)), "L, Space"));
+
         /* A file value too long for the setting falls back to the default. */
         {
             char line[RECOMP_SETTING_TEXT_MAX * 2 + 32];

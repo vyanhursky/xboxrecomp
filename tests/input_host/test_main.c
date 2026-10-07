@@ -131,6 +131,39 @@ int main(void)
     s = get(0, &rc);
     CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0 && !(s.Gamepad.wButtons & XBOX_GAMEPAD_START));
 
+    /* A host menu open: the title polls everything at rest, the menu still reads the pads, and a
+     * rumble test still gets through while the title's own rumble does not. */
+    {
+        InputRaw raw;
+        SDL_SetJoystickVirtualButton(pad1.joy, SDL_GAMEPAD_BUTTON_SOUTH, true);
+        xbox_HostInputSetUiActive(1);
+        CHECK(xbox_HostInputUiActive() == 1);
+        settle();
+        s = get(0, &rc);
+        CHECK(rc == ERROR_SUCCESS && s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+        s = get(1, &rc);
+        CHECK(rc == ERROR_SUCCESS && s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0 && s.Gamepad.sThumbLX == 0);
+        CHECK(xbox_HostInputRawPad(0, &raw) == 1);
+        CHECK(raw.src[INPUT_SRC_SOUTH] > 16384);
+        CHECK(xbox_HostInputRawPad(1, &raw) == 0);               /* the keyboard's slot has no pad */
+        g_rumble_low = g_rumble_high = 0;
+        xbox_HostInputRumble(0, 0xFFFF, 0xFFFF);
+        settle();
+        CHECK(g_rumble_low == 0);                                /* the title's rumble is held back */
+        xbox_HostInputRumble(0, 0, 0);
+        xbox_HostInputRumbleTest(0);
+        settle();
+        CHECK(g_rumble_low == 0xFFFF);                           /* the menu's test buzz is not */
+        Sleep(500);
+        CHECK(g_rumble_low == 0 && g_rumble_high == 0);
+        xbox_HostInputSetUiActive(0);
+        settle();
+        s = get(0, &rc);
+        CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);   /* back to the game, still held */
+        SDL_SetJoystickVirtualButton(pad1.joy, SDL_GAMEPAD_BUTTON_SOUTH, false);
+        settle();
+    }
+
     /* Losing the focus reads as everything released, and keys do not stick. */
     xbox_HostInputFocus(0);
     SDL_SetJoystickVirtualButton(pad1.joy, SDL_GAMEPAD_BUTTON_SOUTH, true);

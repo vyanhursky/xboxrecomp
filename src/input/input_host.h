@@ -53,6 +53,8 @@ typedef struct InputHostConfig {
     int  no_pads;               /* test only: open no physical pad, whatever is plugged in */
     int  virtual_pads;          /* test only: attach this many SDL virtual gamepads (0-4) */
     int  virtual_late_ms;       /* test only: attach one more virtual gamepad this long after start */
+    int  virtual_chord_ms;      /* test only: this long after start virtual pad 1 holds both stick clicks for 1.8 s,
+                                 * then presses B once (opens and closes a host menu) */
     InputPadMap   padmap;
     InputBindings keys;
 } InputHostConfig;
@@ -107,6 +109,20 @@ int xbox_HostInputKeyboardSlot(void);
 void xbox_HostInputKey(int code, int down);
 void xbox_HostInputWheel(int notches);          /* positive is away from the user */
 void xbox_HostInputFocus(int focused);          /* losing focus releases every key */
+
+/* A host menu is open: the title polls every pad (and the keyboard player) at
+ * rest, and keys and buttons are the menu's. The devices are still read, so the
+ * menu can navigate with them (xbox_HostInputRawPad). Rumble stops. */
+void xbox_HostInputSetUiActive(int active);
+int xbox_HostInputUiActive(void);
+
+/* Buzz the pad in `slot` for a moment (a menu's rumble test), even while a host menu is open. */
+void xbox_HostInputRumbleTest(int slot);
+
+/* What pad `slot` is doing now, before any mapping, for a menu to navigate and
+ * to learn which control a player presses. Zero when there is no pad in the slot
+ * or the window is unfocused. Returns 1 if a pad is there. */
+int xbox_HostInputRawPad(int slot, InputRaw *raw);
 
 /* The state the title polls. ERROR_DEVICE_NOT_CONNECTED when no device is in
  * the slot. While the window is unfocused a device reads as at rest. */
