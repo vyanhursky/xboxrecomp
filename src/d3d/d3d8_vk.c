@@ -82,9 +82,27 @@ void d3d8_present_set_vsync(int vsync)             { s_vsync = vsync; }
 void d3d8_present_set_linear_filter(int linear)    { s_linear = linear; }
 /* The title's own 60 Hz timer paces the frames here; the display never does. */
 int  d3d8_present_display_paced(void)              { return 0; }
-/* ponytail: the gamma ramp is not applied to the window yet; captures apply
- * it themselves (the host's capture code), so tests see it either way. */
-void d3d8_gamma_set(const void *ramp)              { (void)ramp; }
+/* The title's gamma ramp, applied to what the window shows (gamma_pass below).
+ * Captures read the picture before it and apply the ramp themselves. */
+static float s_gamma[256][4];
+static int   s_gamma_on, s_gamma_dirty;
+void d3d8_gamma_set(const void *ramp)
+{
+    const D3DGAMMARAMP *r = ramp;
+    int i, on = 0;
+    if (!r)
+        return;
+    for (i = 0; i < 256; i++) {
+        s_gamma[i][0] = (float)r->red[i] / 65535.0f;
+        s_gamma[i][1] = (float)r->green[i] / 65535.0f;
+        s_gamma[i][2] = (float)r->blue[i] / 65535.0f;
+        s_gamma[i][3] = 1.0f;
+        if (r->red[i] != i * 257 || r->green[i] != i * 257 || r->blue[i] != i * 257)
+            on = 1;
+    }
+    s_gamma_on = on;
+    s_gamma_dirty = 1;
+}
 
 static const char *g_window_title = "Xbox Game";
 void xbox_D3D8SetWindowTitle(const char *title)    { if (title && *title) g_window_title = title; }
@@ -165,6 +183,19 @@ static struct {
     VkImageView    color_view, depth_view;
     VkRenderPass   pass;
     VkFramebuffer  fb;
+
+    /* The picture after the gamma ramp, which is what the window is given. */
+    VkImage        final;
+    VkDeviceMemory final_mem;
+    VkImageView    final_view;
+    VkRenderPass   gamma_pass;
+    VkFramebuffer  gamma_fb;
+    VkDescriptorSetLayout gamma_dsl;
+    VkPipelineLayout      gamma_pl;
+    VkDescriptorPool      gamma_pool;
+    VkDescriptorSet       gamma_set;
+    VkPipeline            gamma_pipe;
+    Ring                  gamma_ubo;
 
     VkCommandPool   pool;
     VkCommandBuffer cmd, cmd_up;
@@ -1544,6 +1575,223 @@ static void present_rect(uint32_t ww, uint32_t wh, VkOffset3D dst[2])
     dst[1].z = 1;
 }
 
+/* The Direct3D 11 backend's gamma shader: each channel through the ramp. */
+static const char s_gamma_vs[] =
+    "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+    "    return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1);\n"
+    "}\n";
+static const char s_gamma_ps[] =
+    "Texture2D pixels : register(t0);\n"
+    "cbuffer Gamma : register(b0) { float4 ramp[256]; };\n"
+    "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "    float4 c = pixels.Load(int3(p.xy, 0));\n"
+    "    uint3 i = (uint3)(saturate(c.rgb) * 255 + 0.5);\n"
+    "    return float4(ramp[i.r].r, ramp[i.g].g, ramp[i.b].b, c.a);\n"
+    "}\n";
+
+/* Everything the gamma pass needs, made the first time a ramp is in force.
+ * Returns 0 if it cannot be made; the window then shows the picture as drawn. */
+static int gamma_make(void)
+{
+    static int tried;
+    VkAttachmentDescription att;
+    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub;
+    VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    VkFramebufferCreateInfo fbci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    VkDescriptorSetLayoutBinding b[2];
+    VkDescriptorSetLayoutCreateInfo dlci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    VkDescriptorPoolSize ps[2];
+    VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    VkWriteDescriptorSet w[2];
+    VkDescriptorBufferInfo bi;
+    VkDescriptorImageInfo ii;
+    VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    VkPipelineShaderStageCreateInfo st[2];
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    VkPipelineColorBlendAttachmentState catt;
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    uint32_t vs, fs;
+
+    if (vk.gamma_pipe)
+        return 1;
+    if (tried)
+        return 0;
+    tried = 1;
+
+    if (!image_make(vk.tw, vk.th, VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, &vk.final, &vk.final_mem, &vk.final_view)
+            || !ring_make(&vk.gamma_ubo, sizeof s_gamma, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT))
+        return 0;
+    memset(&att, 0, sizeof att);
+    att.format = VK_FORMAT_R8G8B8A8_UNORM;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    memset(&sub, 0, sizeof sub);
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    if (vkCreateRenderPass(vk.dev, &rpci, NULL, &vk.gamma_pass) != VK_SUCCESS)
+        return 0;
+    fbci.renderPass = vk.gamma_pass;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &vk.final_view;
+    fbci.width = vk.tw;
+    fbci.height = vk.th;
+    fbci.layers = 1;
+    if (vkCreateFramebuffer(vk.dev, &fbci, NULL, &vk.gamma_fb) != VK_SUCCESS)
+        return 0;
+
+    /* b0 at binding 0, t0 at binding 8, as shaderc is told to place them. */
+    memset(b, 0, sizeof b);
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].binding = 8;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    b[1].descriptorCount = 1;
+    b[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    dlci.bindingCount = 2;
+    dlci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(vk.dev, &dlci, NULL, &vk.gamma_dsl) != VK_SUCCESS)
+        return 0;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &vk.gamma_dsl;
+    if (vkCreatePipelineLayout(vk.dev, &plci, NULL, &vk.gamma_pl) != VK_SUCCESS)
+        return 0;
+    ps[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; ps[0].descriptorCount = 1;
+    ps[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;  ps[1].descriptorCount = 1;
+    dpci.maxSets = 1;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(vk.dev, &dpci, NULL, &vk.gamma_pool) != VK_SUCCESS)
+        return 0;
+    ai.descriptorPool = vk.gamma_pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &vk.gamma_dsl;
+    if (vkAllocateDescriptorSets(vk.dev, &ai, &vk.gamma_set) != VK_SUCCESS)
+        return 0;
+    memset(w, 0, sizeof w);
+    bi.buffer = vk.gamma_ubo.buf;
+    bi.offset = 0;
+    bi.range = sizeof s_gamma;
+    memset(&ii, 0, sizeof ii);
+    ii.imageView = vk.color_view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = w[1].dstSet = vk.gamma_set;
+    w[0].dstBinding = 0;
+    w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w[0].pBufferInfo = &bi;
+    w[1].dstBinding = 8;
+    w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w[1].pImageInfo = &ii;
+    vkUpdateDescriptorSets(vk.dev, 2, w, 0, NULL);
+
+    vs = shader_make(s_gamma_vs, 1, "gamma_vs");
+    fs = shader_make(s_gamma_ps, 0, "gamma_ps");
+    if (!vs || !fs)
+        return 0;
+    memset(st, 0, sizeof st);
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    st[0].module = vk.shaders[vs - 1];
+    st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    st[1].module = vk.shaders[fs - 1];
+    st[1].pName = "main";
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vps.viewportCount = 1;
+    vps.scissorCount = 1;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    memset(&catt, 0, sizeof catt);
+    catt.colorWriteMask = 0xF;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &catt;
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    ci.stageCount = 2;
+    ci.pStages = st;
+    ci.pVertexInputState = &vi;
+    ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vps;
+    ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms;
+    ci.pColorBlendState = &cb;
+    ci.pDynamicState = &dy;
+    ci.layout = vk.gamma_pl;
+    ci.renderPass = vk.gamma_pass;
+    if (vkCreateGraphicsPipelines(vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &vk.gamma_pipe) != VK_SUCCESS) {
+        vk.gamma_pipe = VK_NULL_HANDLE;
+        LOG("the gamma pass could not be built; the window shows the picture without the ramp");
+        return 0;
+    }
+    LOG("gamma ramp applied at presentation");
+    return 1;
+}
+
+/* The picture through the ramp into vk.final, left ready to be copied from.
+ * The main pass has ended; the colour target comes back as an attachment. */
+static int gamma_draw(void)
+{
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    VkViewport vp;
+    VkRect2D sc;
+
+    if (!s_gamma_on || !gamma_make())
+        return 0;
+    if (s_gamma_dirty) {
+        memcpy(vk.gamma_ubo.map, s_gamma, sizeof s_gamma);
+        s_gamma_dirty = 0;
+    }
+    image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    rp.renderPass = vk.gamma_pass;
+    rp.framebuffer = vk.gamma_fb;
+    rp.renderArea.extent.width = vk.tw;
+    rp.renderArea.extent.height = vk.th;
+    vkCmdBeginRenderPass(vk.cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    vp.x = vp.y = 0.0f;
+    vp.width = (float)vk.tw; vp.height = (float)vk.th;
+    vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent.width = vk.tw; sc.extent.height = vk.th;
+    vkCmdSetViewport(vk.cmd, 0, 1, &vp);
+    vkCmdSetScissor(vk.cmd, 0, 1, &sc);
+    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.gamma_pipe);
+    vkCmdBindDescriptorSets(vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.gamma_pl, 0, 1,
+                            &vk.gamma_set, 0, NULL);
+    vkCmdDraw(vk.cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(vk.cmd);
+    image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    return 1;
+}
+
 /* RECOMP_PRESENT_PACING=1: every two seconds, how evenly frames were
  * finished -- the line and the arithmetic of the Direct3D 11 backend's
  * d3d8_present_trace_pacing, which the test tooling reads. Without a window
@@ -1638,10 +1886,16 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         VkClearColorValue black;
         VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
+        VkImage from = vk.color;
+        int ramped = gamma_draw();
+
         memset(&black, 0, sizeof black);
         black.float32[3] = 1.0f;
-        image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
-                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        if (ramped)
+            from = vk.final;                /* already a transfer source */
+        else
+            image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdClearColorImage(vk.cmd, vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1653,13 +1907,14 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         blit.srcOffsets[1].y = (int32_t)vk.th;
         blit.srcOffsets[1].z = 1;
         present_rect(vk.swap_ext.width, vk.swap_ext.height, blit.dstOffsets);
-        vkCmdBlitImage(vk.cmd, vk.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        s_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
         image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (!ramped)
+            image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
     frame_submit_wait(have ? vk.acquired : VK_NULL_HANDLE);
     if (have) {
