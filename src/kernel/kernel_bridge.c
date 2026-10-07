@@ -772,9 +772,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
-#ifdef _WIN32
             xbox_dir_context_drop(h);
-#endif
             CloseHandle(h);
         }
     }
@@ -4111,11 +4109,11 @@ static void bridge_NtReadFile(void)
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X  h=%08X\n",
                     g_xbox_kernel_caller,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, STACK_ARG(0));
         fflush(stderr);
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
@@ -5461,10 +5459,35 @@ static void bridge_XcSHAUpdate(void)
     g_eax = 0;
 }
 
+/* RECOMP_CRYPTO_TRACE=1: the first few hundred digests and keyed digests a
+ * title asks for, with the guest return address. A save a title refuses is
+ * usually a signature that came out different, and this says which. */
+static int crypto_trace(void)
+{
+    static int on = -1;
+    static volatile LONG n;
+    if (on < 0)
+        on = getenv("RECOMP_CRYPTO_TRACE") != NULL;
+    return on && InterlockedIncrement(&n) <= 400;
+}
+
+static void crypto_hex(const char *label, const UCHAR *p, ULONG n)
+{
+    ULONG i;
+    fprintf(stderr, " %s", label);
+    for (i = 0; p && i < n && i < 24; i++)
+        fprintf(stderr, "%02X", p[i]);
+}
+
 static void bridge_XcSHAFinal(void)
 {
     xbox_XcSHAFinal((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                     (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)));
+    if (crypto_trace()) {
+        fprintf(stderr, "  [CRYPTO] XcSHAFinal from 0x%08X", BRIDGE_MEM32(g_esp));
+        crypto_hex("digest ", (const UCHAR *)XBOX_TO_NATIVE(STACK_ARG(1)), 20);
+        fputc(10, stderr);
+    }
     g_eax = 0;
 }
 
@@ -5492,6 +5515,14 @@ static void bridge_XcHMAC(void)
                 (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
                 (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
                 (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(6)));
+    if (crypto_trace()) {
+        fprintf(stderr, "  [CRYPTO] XcHMAC from 0x%08X key %u bytes", BRIDGE_MEM32(g_esp), STACK_ARG(1));
+        crypto_hex("", (const UCHAR *)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1));
+        fprintf(stderr, " data %u+%u bytes", STACK_ARG(3), STACK_ARG(5));
+        crypto_hex("first ", (const UCHAR *)XBOX_TO_NATIVE(STACK_ARG(2)), 8);
+        crypto_hex("digest ", (const UCHAR *)XBOX_TO_NATIVE(STACK_ARG(6)), 20);
+        fputc(10, stderr);
+    }
     g_eax = 0;
 }
 
