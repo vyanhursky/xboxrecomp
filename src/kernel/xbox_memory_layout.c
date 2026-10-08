@@ -3925,6 +3925,20 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return g_contig_next - XBOX_CONTIG_BASE;
 }
 
+/* Live contiguous usage for memory statistics; the addressable high-water
+ * range above remains unchanged for physical GPU address translation. */
+uint32_t xbox_ContiguousLiveBytes(void)
+{
+    uint32_t live = XBOX_CONTIG_RESERVED;
+    int i;
+    if (!xbox_HeapReclaimEnabled()) return xbox_ContiguousAllocatedBytes();
+    AcquireSRWLockShared(&g_contig_lock);
+    for (i = 0; i < g_contig_block_count; i++)
+        if (!g_contig_blocks[i].free) live += g_contig_blocks[i].size;
+    ReleaseSRWLockShared(&g_contig_lock);
+    return live;
+}
+
 /* Bytes the general heap has handed out and not had back.
  *
  * MmQueryStatistics needs "how much of the console's 64 MB is in use", and a

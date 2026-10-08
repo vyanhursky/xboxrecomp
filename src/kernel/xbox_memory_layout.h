@@ -190,6 +190,7 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+uint32_t xbox_ContiguousLiveBytes(void);
 /* Bytes the general heap has handed out and not had back (live blocks). */
 uint32_t xbox_HeapLiveBytes(void);
 

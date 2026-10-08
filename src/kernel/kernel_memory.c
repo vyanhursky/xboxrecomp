@@ -169,7 +169,7 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
                 image_size = *(const uint32_t *)(mem + 0x10000u + 0x10Cu);
         }
         used = (uint64_t)KERNEL + image_size
-             + xbox_HeapLiveBytes() + xbox_ContiguousAllocatedBytes();
+             + xbox_HeapLiveBytes() + xbox_ContiguousLiveBytes();
         MemoryStatistics->TotalPhysicalPages = TOTAL / PAGE;               /* 16384 */
         MemoryStatistics->AvailablePages =
             used >= TOTAL ? 0 : (ULONG)((TOTAL - used) / PAGE);
@@ -179,7 +179,7 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
                     (unsigned long)MemoryStatistics->AvailablePages,
                     (unsigned long)MemoryStatistics->TotalPhysicalPages,
                     image_size / 1024, xbox_HeapLiveBytes() / 1024,
-                    xbox_ContiguousAllocatedBytes() / 1024);
+                    xbox_ContiguousLiveBytes() / 1024);
     }
     (void)ms;
 

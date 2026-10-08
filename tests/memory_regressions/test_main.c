@@ -51,11 +51,12 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
 
-enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
+enum { S_ALLOC, S_FREE, S_QUERY, S_STATS, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
     184,   /* NtAllocateVirtualMemory */
     199,   /* NtFreeVirtualMemory */
     217,   /* NtQueryVirtualMemory */
+    181,   /* MmQueryStatistics */
 };
 
 static uint32_t scratch;                 /* guest VA of a 64 KB block */
@@ -169,7 +170,8 @@ static void set_env(const char *name, const char *value)
 #ifdef _WIN32
     _putenv_s(name, value);
 #else
-    setenv(name, value, 1);
+    if (*value) setenv(name, value, 1);
+    else unsetenv(name);
 #endif
 }
 
@@ -190,6 +192,9 @@ int main(int argc, char **argv)
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
+    set_env("RECOMP_HEAP_RECLAIM", "");
+    set_env("RECOMP_EXT_VMA", "");
+    set_env("RECOMP_GPU_PREEMPT", "0");
     if (reclaim)
         set_env("RECOMP_HEAP_RECLAIM", "1");
     if (ext)
@@ -303,9 +308,23 @@ int main(int argc, char **argv)
     if (!ext) {
         extern int xbox_ContiguousFree(uint32_t addr);
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
-        uint32_t c2;
+        uint32_t c2, before_live = xbox_ContiguousLiveBytes();
+        uint32_t before_range = xbox_ContiguousAllocatedBytes();
+        uint32_t stats_args[1] = { OUT_VA + 0x100 };
+        uint32_t available;
+        *G(stats_args[0]) = sizeof(XBOX_MM_STATISTICS);
+        check(call(S_STATS, 1, stats_args) == 0, "MmQueryStatistics succeeds before free", NULL);
+        available = ((PXBOX_MM_STATISTICS)G(stats_args[0]))->AvailablePages;
 
         snprintf(d, sizeof d, "free said %d", xbox_ContiguousFree(c1));
+        check(xbox_ContiguousAllocatedBytes() == before_range,
+              "free preserves the physical addressable high-water range", NULL);
+        check(xbox_ContiguousLiveBytes() == before_live - (reclaim ? 0x20000u : 0u),
+              "memory statistics exclude reclaimed contiguous blocks", NULL);
+        check(call(S_STATS, 1, stats_args) == 0 &&
+              ((PXBOX_MM_STATISTICS)G(stats_args[0]))->AvailablePages ==
+                  available + (reclaim ? 0x20000u / 4096u : 0u),
+              "MmQueryStatistics reports reclaimed pages through the bridge", NULL);
         c2 = xbox_ContiguousAlloc(0x20000, 4096);
         if (reclaim) {
             char d2[160];
