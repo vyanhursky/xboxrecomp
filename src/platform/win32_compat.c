@@ -67,9 +67,9 @@ VOID  SetLastError(DWORD code)      { t_last_error = code; }
  *     thread spinning on a flag another thread sets still lets that thread
  *     run. A holder that was in host code may hold a lock the next thread
  *     needs (the C library's, a device model's), so it only notes the
- *     request and hands over at guest_cpu_checkpoint(), which the kernel
+ *     request and hands over at guest_turn_checkpoint(), which the kernel
  *     layer calls on the way back to the title. What counts as guest code is
- *     the range the program gives guest_cpu_set_code(); with none, every
+ *     the range the program gives guest_turn_set_code(); with none, every
  *     hand-over waits for a checkpoint or a blocking call. A
  *     thread coming out of a wait, and one at time-critical priority (the
  *     kernel layer's interrupt thread), does not wait the millisecond.
@@ -198,7 +198,7 @@ static void gc_setup(void)
     sigaction(GC_SIGNAL, &sa, NULL);
 }
 
-void guest_cpu_join(void)
+void guest_turn_join(void)
 {
     gc_thread *t = t_gc;
 
@@ -213,7 +213,7 @@ void guest_cpu_join(void)
     gc_acquire(t, 0);
 }
 
-void guest_cpu_set_code(const void *start, size_t size)
+void guest_turn_set_code(const void *start, size_t size)
 {
     gc_code_lo = (uintptr_t)start;
     gc_code_hi = (uintptr_t)start + size;
@@ -221,7 +221,7 @@ void guest_cpu_set_code(const void *start, size_t size)
 
 static void gc_note_late(gc_thread *t);
 
-void guest_cpu_checkpoint(void)
+void guest_turn_checkpoint(void)
 {
     gc_thread *t = t_gc;
 
@@ -236,7 +236,7 @@ void guest_cpu_checkpoint(void)
     }
 }
 
-long guest_cpu_longest_wait_ms(void)
+long guest_turn_longest_wait_ms(void)
 {
     long ms = gc_longest_wait_ms;
 
@@ -244,7 +244,7 @@ long guest_cpu_longest_wait_ms(void)
     return ms;
 }
 
-void guest_cpu_counts(uint64_t *handoffs, uint64_t *kicks)
+void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks)
 {
     if (handoffs) *handoffs = gc_handoffs;
     if (kicks)    *kicks = gc_kicks;

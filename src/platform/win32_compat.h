@@ -597,17 +597,17 @@ static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERR
  * calling thread runs guest code from here on, and only while no other
  * thread that has joined is running. The blocking primitives above give the
  * CPU up while they block. */
-void guest_cpu_join(void);
+void guest_turn_join(void);
 /* Where the title's own code is. A thread there can be preempted at any
  * instruction; anywhere else it finishes what it is doing first. */
-void guest_cpu_set_code(const void *start, size_t size);
+void guest_turn_set_code(const void *start, size_t size);
 /* On the way from host code back to the title: hand over if asked to. */
-void guest_cpu_checkpoint(void);
+void guest_turn_checkpoint(void);
 /* Times the holder was interrupted to hand over, and signals sent to ask. */
-void guest_cpu_counts(uint64_t *handoffs, uint64_t *kicks);
+void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks);
 /* The longest a thread that was due to run at once (woken, or time-critical)
  * has waited for the guest CPU since this was last asked. */
-long guest_cpu_longest_wait_ms(void);
+long guest_turn_longest_wait_ms(void);
 
 #ifdef __cplusplus
 }

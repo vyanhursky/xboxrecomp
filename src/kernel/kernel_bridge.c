@@ -568,7 +568,7 @@ void xbox_PinToGuestCore(void)
     while (init != 2)
         YieldProcessor();
     if (!spread)
-        guest_cpu_join();
+        guest_turn_join();
 #endif
 }
 
@@ -10533,11 +10533,11 @@ static void kernel_thunk_dispatch_body(void)
 #if !defined(_WIN32) && !defined(__linux__)
             {
                 uint64_t handoffs, kicks;
-                guest_cpu_counts(&handoffs, &kicks);
+                guest_turn_counts(&handoffs, &kicks);
                 fprintf(stderr, "  [KERNEL] guest CPU: %llu preemptions, %llu requests,"
                                 " longest wait %ld ms\n",
                         (unsigned long long)handoffs, (unsigned long long)kicks,
-                        guest_cpu_longest_wait_ms());
+                        guest_turn_longest_wait_ms());
             }
 #endif
             /* And which ones, ranked. "Latest" names whatever the sample
@@ -10664,7 +10664,7 @@ static void kernel_thunk_dispatch_body(void)
         fflush(stderr);
     }
 #if !defined(_WIN32)
-    guest_cpu_checkpoint();   /* back to the title: let a waiting thread in */
+    guest_turn_checkpoint();   /* back to the title: let a waiting thread in */
 #endif
 }
 

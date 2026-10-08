@@ -27,14 +27,14 @@ static HANDLE g_event;
 
 /* Everything a "guest" thread runs is in this file, so the whole address
  * space stands in for the title's code, except in part 4. */
-static void whole_space_is_guest(void) { guest_cpu_set_code((void *)0, SIZE_MAX); }
+static void whole_space_is_guest(void) { guest_turn_set_code((void *)0, SIZE_MAX); }
 
 static DWORD WINAPI exclusive(LPVOID arg)
 {
     int me = (int)(intptr_t)arg;
     long i;
 
-    guest_cpu_join();
+    guest_turn_join();
     for (i = 0; i < ROUNDS; i++)
         g_count[me] = i;
     g_done[me] = 1;
@@ -44,7 +44,7 @@ static DWORD WINAPI exclusive(LPVOID arg)
 static DWORD WINAPI spinner(LPVOID arg)
 {
     (void)arg;
-    guest_cpu_join();
+    guest_turn_join();
     g_go = 1;
     while (!g_flag) { }      /* no kernel call, no wait: only preemption ends it */
     return 0;
@@ -55,7 +55,7 @@ static DWORD WINAPI setter(LPVOID arg)
     (void)arg;
     while (!g_go)
         Sleep(1);
-    guest_cpu_join();
+    guest_turn_join();
     g_flag = 1;
     return 0;
 }
@@ -63,7 +63,7 @@ static DWORD WINAPI setter(LPVOID arg)
 static DWORD WINAPI waiter(LPVOID arg)
 {
     (void)arg;
-    guest_cpu_join();
+    guest_turn_join();
     g_go = 1;
     return WaitForSingleObject(g_event, 10000) == WAIT_OBJECT_0 ? 0 : 1;
 }
@@ -73,7 +73,7 @@ static DWORD WINAPI signaller(LPVOID arg)
     (void)arg;
     while (!g_go)
         Sleep(1);
-    guest_cpu_join();
+    guest_turn_join();
     SetEvent(g_event);
     return 0;
 }
@@ -85,15 +85,15 @@ static DWORD WINAPI host_spinner(LPVOID arg)
     uint64_t before, after;
 
     (void)arg;
-    guest_cpu_join();
+    guest_turn_join();
     g_go = 1;
-    guest_cpu_counts(&before, NULL);
+    guest_turn_counts(&before, NULL);
     while (n < 400000000 && !g_flag)
         n++;
-    guest_cpu_counts(&after, NULL);
+    guest_turn_counts(&after, NULL);
     if (g_flag || after != before)
         return 1;                       /* it was switched in host code */
-    guest_cpu_checkpoint();             /* the setter runs here */
+    guest_turn_checkpoint();             /* the setter runs here */
     return g_flag ? 0 : 2;
 }
 
@@ -138,7 +138,7 @@ int main(void)
         }
         WaitForSingleObject(t[0], INFINITE);
         WaitForSingleObject(t[1], INFINITE);
-        guest_cpu_counts(&handoffs, &kicks);
+        guest_turn_counts(&handoffs, &kicks);
         printf("exclusion: both threads moved in %ld of %ld windows, %llu change-overs\n",
                both, windows, (unsigned long long)handoffs);
         /* One change-over can straddle two windows; a join and an exit are
@@ -160,7 +160,7 @@ int main(void)
     }
     printf("wait: a blocked thread gave the guest CPU up\n");
 
-    guest_cpu_set_code((void *)0, 0);       /* nothing is guest code */
+    guest_turn_set_code((void *)0, 0);       /* nothing is guest code */
     if (!run_pair(host_spinner, setter, &ra, &rb) || ra != 0) {
         fprintf(stderr, "checkpoint: host code was switched, or never handed over (%lu)\n",
                 (unsigned long)ra);
