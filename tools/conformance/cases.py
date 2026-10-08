@@ -346,6 +346,16 @@ CASES = [
          _FP, "fpu", tol=1e-15),
     Case("fpu_ptan", "fptan replaces st0 and pushes 1.0 -- depth grows by one",
          ["fld qword ptr [eax]", "fptan"], _FP, "fpu", tol=1e-15),
+    Case("fpu_fprem_completion", "FPREM clears FXAM's C2 after complete reduction",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
+    Case("fpu_fprem1_completion", "FPREM1 clears C2 and rounds the quotient to nearest",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem1", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
 
     # ══ SSE ═════════════════════════════════════════════════════════════════
     #

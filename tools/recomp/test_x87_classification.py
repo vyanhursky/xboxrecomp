@@ -53,3 +53,45 @@ int main(void) {
         assert result.returncode==0,result.stderr
         result=subprocess.run([str(exe)],capture_output=True,text=True)
         assert result.returncode==0,result.stdout+result.stderr
+
+
+@pytest.mark.parametrize('mnemonic,expected', [('fprem', 2.0), ('fprem1', -1.0)])
+def test_remainder_completes_after_classification(mnemonic, expected):
+    """A finite FXAM sets C2; a completed remainder must release CRT polling."""
+    cc = compiler()
+    if not cc:
+        pytest.skip('C compiler unavailable')
+    emitted = '\n'.join(Lifter().lift_instruction(Instruction(0, 2, mnemonic, '', '')))
+    source = '''
+#include <stdint.h>
+#include <math.h>
+static double values[8];
+static unsigned g_fp_top;
+static uint16_t g_fp_cc;
+#define fp_top() values[g_fp_top]
+#define fp_st1() values[(g_fp_top + 1) & 7]
+static void reduce(void) {
+''' + emitted + '''
+}
+int main(void) {
+    for (unsigned top = 0; top < 8; top++) {
+        g_fp_top = top; fp_top() = 8.0; fp_st1() = 3.0;
+        g_fp_cc = 0x0400; /* FXAM's finite-normal classification */
+        unsigned polls = 0;
+        do { reduce(); } while ((g_fp_cc & 0x0400) && ++polls < 3);
+        if (polls || g_fp_top != top || fp_st1() != 3.0 || fp_top() != EXPECTED)
+            return 1;
+    }
+    return 0;
+}
+'''.replace('EXPECTED', repr(expected))
+    with tempfile.TemporaryDirectory() as tmp:
+        path, exe = Path(tmp)/'remainder.c', Path(tmp)/'remainder.exe'
+        for text, wanted in [(source, 0),
+                             (source.replace('g_fp_cc &= (uint16_t)~0x0400u;', ''), 1)]:
+            path.write_text(text)
+            built = subprocess.run(compile_command(cc, [path], exe,
+                gnu_flags=[] if os.name=='nt' else ['-lm']), capture_output=True, text=True)
+            assert built.returncode == 0, built.stdout + built.stderr
+            ran = subprocess.run([str(exe)], capture_output=True, text=True, timeout=5)
+            assert ran.returncode == wanted, ran.stdout + ran.stderr
