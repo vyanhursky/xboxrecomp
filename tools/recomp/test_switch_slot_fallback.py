@@ -28,7 +28,8 @@ unsigned failed,site;
     functions, checks=[],[]
     cases=(('normal',bytes.fromhex('83e003'),TABLE,0),
            ('positive',bytes.fromhex('83e003'),TABLE-4,1),
-           ('negative',bytes.fromhex('83e904'),TABLE+12,-3))
+           ('negative',bytes.fromhex('83e904'),TABLE+12,-3),
+           ('last',bytes.fromhex('83e902'),TABLE+8,-2))
     for tag,prefix,disp,first in cases:
         body=_image(prefix,disp)
         functions.append(_translate(body).replace('sub_00010000','switch_'+tag))
@@ -36,14 +37,14 @@ unsigned failed,site;
         setup=f'{{const uint8_t original[]={{{initializer}}};memcpy(image,original,sizeof original);}}'
         for ordinal in range(3):
             index=first+ordinal
-            incoming=index+4 if tag=='negative' else index
+            incoming=index+4 if tag=='negative' else (index+2 if tag=='last' else index)
             # A corrupted target may use a proven index. A valid runtime arm wins.
             for runtime,want in ((0xdeadbeef,ordinal+1),(ARMS[2],3)):
                 checks.append(setup+f'MEM32(0x{TABLE+ordinal*4:X})=0x{runtime:X}u;'
                     +f'eax=ecx={incoming}u;esp=0x1000;failed=0;switch_{tag}();'
                     +f'if(eax!={want}||failed||esp!=0x1004)return 1;')
         # Outside the proven ordinal set must retain the tail diagnostic path.
-        outside=3 if tag=='normal' else 0
+        outside=3 if tag in ('normal', 'last') else 0
         checks.append(setup+f'eax=ecx={outside};esp=0x1000;failed=0;switch_{tag}();'
             +f'if(failed!=1||site!=0x{BASE+3:X})return 2;')
     ran=_build_and_run(prelude+'\n'.join(functions)+'int main(void){'+''.join(checks)+'return 0;}')
@@ -70,7 +71,8 @@ def test_compiled_foreign_arms_keep_value_first_and_guest_tail_frame():
     lifter.func_start, lifter.func_end = BASE, BASE + 10
     bodies, checks = [], []
     for tag, disp, first, step in (('normal', TABLE, 0, 1), ('positive', TABLE-4, 1, 1),
-                                   ('negative', TABLE+12, -1, -1)):
+                                   ('negative', TABLE+12, -1, -1),
+                                   ('last', TABLE+8, 0, -1)):
         op = Operand(type='mem', mem_index='ecx', mem_scale=4, mem_disp=disp, mem_size=4)
         insn = Instruction(BASE+3, 7, 'jmp', '', '', operands=[op])
         body = '\n'.join(lifter._lift_jmp(insn, [op]))
@@ -84,7 +86,7 @@ def test_compiled_foreign_arms_keep_value_first_and_guest_tail_frame():
                               f'esp=0x1000;ebp=0x1234;jump_{tag}();'
                               f'if(target!=0x{want:X}||site!=0x{BASE+3:X}||esp!=0x1004||g_seh_ebp!=0x1234)return 1;')
         # A live target outside the proven ordinal set retains generic dispatch.
-        outside = 3 if tag == 'normal' else 0
+        outside = 3 if tag == 'normal' else (1 if tag == 'last' else 0)
         checks.append(f'ecx=(uint32_t){outside};MEM32(0x{disp+outside*4:X})=0xdeadbeef;'
                       f'esp=0x1000;jump_{tag}();if(target!=0xdeadbeef||esp!=0x1004)return 2;')
     prelude = r'''
@@ -103,11 +105,11 @@ def test_foreign_table_requires_full_bounded_known_census():
     lifter = Lifter(func_db={a: {} for a in ARMS})
     lifter.func_start, lifter.func_end = BASE, BASE + 10
     # Rejected first census must not be trimmed into an apparently valid table.
-    lifter._read_jump_table = lambda va: [0x10001, *ARMS] if va == TABLE else ARMS
+    lifter._read_jump_table = lambda va, max_entries=None: [0x10001, *ARMS] if va == TABLE else ARMS
     assert lifter._foreign_switch_index_pairs(op) == []
-    lifter._read_jump_table = lambda va: ARMS * 22 if va == TABLE else ARMS
+    lifter._read_jump_table = lambda va, max_entries=None: ARMS * 22 if va == TABLE else ARMS
     assert lifter._foreign_switch_index_pairs(op) == []
-    lifter._read_jump_table = lambda va: ARMS
+    lifter._read_jump_table = lambda va, max_entries=None: ARMS
     lifter.jump_table_targets = {TABLE: []}
     assert lifter._foreign_switch_index_pairs(op) == []
     lifter.jump_table_targets = {}

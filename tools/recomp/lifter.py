@@ -2780,10 +2780,12 @@ class Lifter:
                 or op.mem_seg or not 2 <= len(targets) <= 64):
             return []
         base = op.mem_disp
+        inside = self._leading_arms(self._read_jump_table(base, max_entries=1))
         possibilities = [
             (self._leading_arms(self._read_jump_table(base)), 0, 1),
             (self._leading_arms(self._read_jump_table(base + 4)), 1, 1),
-            (self._leading_arms(self._read_jump_table_backward(base - 4)), -1, -1),
+            (inside + self._leading_arms(self._read_jump_table_backward(base - 4)),
+             0 if inside else -1, -1),
         ]
         for actual, first, step in possibilities:
             if len(actual) >= 2:
@@ -2805,11 +2807,12 @@ class Lifter:
                 or op.mem_seg or op.mem_disp in self.jump_table_targets):
             return []
         base = op.mem_disp
-        for read, address, first, step in (
-                (self._read_jump_table, base, 0, 1),
-                (self._read_jump_table, base + 4, 1, 1),
-                (self._read_jump_table_backward, base - 4, -1, -1)):
-            targets = read(address)
+        inside = self._read_jump_table(base, max_entries=1)
+        for targets, first, step in (
+                (self._read_jump_table(base), 0, 1),
+                (self._read_jump_table(base + 4), 1, 1),
+                (inside + self._read_jump_table_backward(base - 4),
+                 0 if inside else -1, -1)):
             if len(targets) < 2:
                 continue
             if (len(targets) <= 64 and all(
