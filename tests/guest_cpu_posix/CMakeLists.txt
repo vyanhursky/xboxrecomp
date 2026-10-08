@@ -12,6 +12,6 @@ add_executable(guest_cpu_posix_test test_main.c
     ../../src/platform/win32_compat.c ../../src/platform/mmio_trap.c)
 target_include_directories(guest_cpu_posix_test PRIVATE ../../src/platform)
 target_compile_options(guest_cpu_posix_test PRIVATE -Wall -Wextra -O2)
-target_link_libraries(guest_cpu_posix_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(guest_cpu_posix_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)
 enable_testing()
 add_test(NAME guest_cpu_posix_test COMMAND guest_cpu_posix_test)
