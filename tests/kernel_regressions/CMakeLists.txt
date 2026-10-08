@@ -10,10 +10,12 @@ target_include_directories(kernel_regressions_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_regressions_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME kernel_regressions_test COMMAND kernel_regressions_test)
+set_tests_properties(kernel_regressions_test PROPERTIES ENVIRONMENT "RECOMP_GPU_PREEMPT=0")
 
 # The 2^31-call counter check takes tens of seconds; opt in with
 # -DXBOX_SLOW_TESTS=ON, or run the executable with the argument "wrap".
 option(XBOX_SLOW_TESTS "Also run the slow 2^31 kernel-call counter check" OFF)
 if(XBOX_SLOW_TESTS)
     add_test(NAME kernel_regressions_wrap_test COMMAND kernel_regressions_test wrap)
+    set_tests_properties(kernel_regressions_wrap_test PROPERTIES ENVIRONMENT "RECOMP_GPU_PREEMPT=0")
 endif()
