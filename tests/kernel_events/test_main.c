@@ -9,8 +9,8 @@
  * One process per mode, because the switch is read once:
  *
  *   default        No switch set. Pins what every title gets today: the guest
- *                  address goes to Win32 as a HANDLE, so a set is lost and a
- *                  wait fails instead of reporting the event's state.
+ *                  lazy shadow object implements kernel set/reset/wait calls;
+ *                  direct header writes are not authoritative in this mode.
  *   title-kevents  RECOMP_TITLE_KEVENTS=1. Each check fails without it:
  *
  *   1. A synchronization event that is not set times out.
@@ -37,11 +37,15 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
 
-enum { S_SET, S_WAIT, S_RESET, N_SLOTS };
+enum { S_SET, S_WAIT, S_RESET, S_MULTI, S_PULSE, S_INIT, S_RELEASE, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
     145,   /* KeSetEvent */
     159,   /* KeWaitForSingleObject */
     138,   /* KeResetEvent */
+    158,   /* KeWaitForMultipleObjects */
+    123,   /* KePulseEvent */
+    108,   /* KeInitializeEvent */
+    132,   /* KeReleaseSemaphore */
 };
 
 #define STATUS_TIMEOUT 0x00000102u
@@ -80,6 +84,8 @@ static uint32_t call(int slot, int nargs, const uint32_t *args)
     g_esp = STACK_VA;
     g_eax = 0xDEADBEEFu;
     recomp_lookup_kernel(slot_va[slot])();
+    check(g_esp == STACK_VA + 4u + (uint32_t)nargs * 4u,
+          "thunk consumes the return address and stdcall arguments", NULL);
     return g_eax;
 }
 
@@ -147,8 +153,8 @@ int main(int argc, char **argv)
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
-    if (on)
-        _putenv_s("RECOMP_TITLE_KEVENTS", "1");
+    _putenv_s("RECOMP_TITLE_KEVENTS", on ? "1" : "0");
+    _putenv_s("RECOMP_GPU_PREEMPT", "0");
 
     xbe = load_file(path, &xbe_len);
     if (!xbe) {
@@ -179,11 +185,28 @@ int main(int argc, char **argv)
     build_event(NOTIF_VA, 0, 0);
 
     if (!on) {
+        check(ke_wait(SYNC_VA) == STATUS_TIMEOUT, "default: unset event times out", NULL);
         ke_set(SYNC_VA);
-        st = ke_wait(SYNC_VA);
-        snprintf(d, sizeof d, "status 0x%08X", st);
-        check(st != 0 && st != STATUS_TIMEOUT,
-              "default: a title-built event is not a host event (the wait fails)", d);
+        check(ke_wait(SYNC_VA) == 0, "default: kernel set signals the shadow event", NULL);
+        check(ke_wait(SYNC_VA) == STATUS_TIMEOUT, "default: synchronization event auto-resets", NULL);
+        G(SYNC_VA)[1] = 1;
+        check(ke_wait(SYNC_VA) == STATUS_TIMEOUT, "default: direct header writes do not signal it", NULL);
+        ke_set(NOTIF_VA);
+        check(ke_wait(NOTIF_VA) == 0 && ke_wait(NOTIF_VA) == 0,
+              "default: notification event remains signalled", NULL);
+        ke_reset(NOTIF_VA);
+        check(ke_wait(NOTIF_VA) == STATUS_TIMEOUT, "default: kernel reset clears it", NULL);
+        {
+            uint32_t array = scratch + 0x3400;
+            uint32_t multi[8] = { 2, array, 1, 0, 0, 0, ZERO_VA, 0 };
+            G(array)[0] = SYNC_VA; G(array)[1] = NOTIF_VA;
+            ke_set(NOTIF_VA);
+            check(call(S_MULTI, 8, multi) == 1, "default: WaitAny resolves shadow objects", NULL);
+            multi[2] = 0; ke_set(SYNC_VA);
+            check(call(S_MULTI, 8, multi) == 0, "default: WaitAll resolves shadow objects", NULL);
+            check(ke_wait(SYNC_VA) == STATUS_TIMEOUT && ke_wait(NOTIF_VA) == 0,
+                  "default: multiple wait consumes only the synchronization event", NULL);
+        }
     } else {
         /* 1. Not set: times out. */
         st = ke_wait(SYNC_VA);
@@ -217,6 +240,60 @@ int main(int argc, char **argv)
         snprintf(d, sizeof d, "status 0x%08X, SignalState %u", st, G(NOTIF_VA)[1]);
         check(st == STATUS_TIMEOUT && G(NOTIF_VA)[1] == 0,
               "KeResetEvent clears it", d);
+    }
+
+    if (on) {
+        uint32_t a = scratch + 0x3200, b = scratch + 0x3300;
+        uint32_t array = scratch + 0x3400;
+        uint32_t multi[8] = { 2, array, 1, 0, 0, 0, ZERO_VA, 0 };
+        uint32_t init[3] = { a, 1, 0 };
+        uint32_t pulse[3] = { a, 0, 0 };
+        build_event(a, 1, 0); build_event(b, 1, 1);
+        G(array)[0] = a; G(array)[1] = b;
+        check(call(S_MULTI, 8, multi) == 1 && G(a)[1] == 0 && G(b)[1] == 0,
+              "WaitAny first access consumes the nonzero selected index", NULL);
+        G(a)[1] = 1; G(b)[1] = 1;
+        check(call(S_MULTI, 8, multi) == 0 && G(a)[1] == 0 && G(b)[1] == 1,
+              "WaitAny leaves the unselected signalled header alone", NULL);
+        G(b)[1] = 0;
+        check(call(S_MULTI, 8, multi) == STATUS_TIMEOUT && G(b)[1] == 0,
+              "direct header reset is reconciled before a multiple wait", NULL);
+        multi[2] = 0; G(a)[1] = 1;
+        check(call(S_MULTI, 8, multi) == STATUS_TIMEOUT && G(a)[1] == 1,
+              "WaitAll timeout does not consume a signalled member", NULL);
+        G(b)[1] = 1;
+        check(call(S_MULTI, 8, multi) == 0 && G(a)[1] == 0 && G(b)[1] == 0,
+              "successful WaitAll consumes both synchronization headers", NULL);
+        G(array)[1] = NOTIF_VA; G(a)[1] = G(NOTIF_VA)[1] = 1;
+        check(call(S_MULTI, 8, multi) == 0 && G(a)[1] == 0 && G(NOTIF_VA)[1] == 1,
+              "WaitAll preserves notification SignalState", NULL);
+        G(a)[1] = 1; call(S_PULSE, 3, pulse);
+        check(G(a)[1] == 0 && ke_wait(a) == STATUS_TIMEOUT,
+              "pulse clears the header and leaves no persistent signal", NULL);
+        call(S_INIT, 3, init);
+        /* Keep the inline-header shape deliberately plausible: explicit
+         * initialization must transfer ownership to the regular shadow. */
+        G(a)[0] = 1u | (4u << 16); G(a)[1] = 1;
+        check(ke_wait(a) == STATUS_TIMEOUT,
+              "explicit reinitialization supersedes header-event ownership", NULL);
+        ke_set(a);
+        check(ke_wait(a) == 0 && ke_wait(a) == STATUS_TIMEOUT,
+              "reinitialized object still has native auto-reset semantics", NULL);
+    }
+
+    {
+        /* Event recognition must leave other dispatcher types on the fork's
+         * lazy-object path, including first access through a multiple wait. */
+        uint32_t sem = scratch + 0x3600, array = scratch + 0x3700;
+        uint32_t multi[8] = { 1, array, 1, 0, 0, 0, ZERO_VA, 0 };
+        uint32_t release[4] = { sem, 0, 2, 0 };
+        build_event(sem, 5, 1); G(sem)[0] = 5u | (5u << 16); G(sem)[4] = 2;
+        G(array)[0] = sem;
+        check(call(S_MULTI, 8, multi) == 0 && ke_wait(sem) == STATUS_TIMEOUT,
+              "inline semaphore resolves on first multiple wait and consumes its count", NULL);
+        call(S_RELEASE, 4, release);
+        check(ke_wait(sem) == 0 && ke_wait(sem) == 0 && ke_wait(sem) == STATUS_TIMEOUT,
+              "inline semaphore release restores exactly two permits in both modes", NULL);
     }
 
     xbox_MemoryLayoutShutdown();

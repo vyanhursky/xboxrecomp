@@ -1601,6 +1601,23 @@ static void bridge_KeSetEvent(void)
                 guest_va, h, g_eax, GetCurrentThreadId());
 }
 
+/* Header-backed events use guest SignalState as the source of truth. Both
+ * wait APIs must prepare and consume the same shadow event. Explicitly
+ * initialized objects remain owned by the regular shadow-object path. */
+static HANDLE ke_guest_event_prepare(uint32_t va, int *type)
+{
+    HANDLE h = ke_guest_event(va, type);
+    if (h) {
+        if (BRIDGE_MEM32(va + 4) == 0) {
+            ResetEvent(h);
+            if (BRIDGE_MEM32(va + 4) != 0) SetEvent(h);
+        } else {
+            SetEvent(h);
+        }
+    }
+    return h;
+}
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
@@ -1611,23 +1628,14 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
-    {   /* An event the title built itself (see ke_guest_event). Its
-         * SignalState in guest memory is the truth -- XDK code resets it by
-         * writing 0 there -- so bring the host event in line first. */
+    {
         int type;
-        HANDLE ge = ke_guest_event(object, &type);
+        HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
-            if (BRIDGE_MEM32(object + 4) == 0) {
-                ResetEvent(ge);
-                if (BRIDGE_MEM32(object + 4) != 0)     /* set meanwhile */
-                    SetEvent(ge);
-            } else {
-                SetEvent(ge);                          /* set by a header write */
-            }
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
-            if (g_eax == 0 && type == 1)               /* synchronization: consumed */
+            if (g_eax == 0 && type == 1)
                 BRIDGE_MEM32(object + 4) = 0;
             return;
         }
@@ -5226,7 +5234,8 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
     uint32_t timeout_va = STACK_ARG(6);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
-    uint32_t i;
+    uint32_t i, guest_events[BRIDGE_MAXIMUM_WAIT_OBJECTS] = {0};
+    int event_types[BRIDGE_MAXIMUM_WAIT_OBJECTS];
 
     if (count == 0) {
         g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
@@ -5251,7 +5260,9 @@ static void bridge_KeWaitForMultipleObjects(void)
         }
         for (i = 0; i < count; i++) {
             uint32_t va = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
-            handles[i] = ke_object_resolve(va);
+            handles[i] = ke_guest_event_prepare(va, &event_types[i]);
+            if (handles[i]) guest_events[i] = va;
+            else handles[i] = ke_object_resolve(va);
             if (trace)
                 fprintf(stderr, "    [%u] VA=0x%08X type=%u signal=%d -> %p\n", i, va,
                         va ? BRIDGE_MEM8(va) : 0, va ? (int)BRIDGE_MEM32(va + 4) : 0, handles[i]);
@@ -5262,6 +5273,14 @@ static void bridge_KeWaitForMultipleObjects(void)
             STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
             (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
             XBOX_TO_NATIVE(STACK_ARG(7)));
+        /* WAIT_OBJECT_0 + index is success for WaitAny; WaitAll returns 0.
+         * Timeouts and failures must leave every guest header untouched. */
+        if ((wait_type == 0 && g_eax == 0) || (wait_type == 1 && g_eax < count)) {
+            for (i = 0; i < count; i++)
+                if (guest_events[i] && event_types[i] == 1
+                        && (wait_type == 0 || i == g_eax))
+                    BRIDGE_MEM32(guest_events[i] + 4) = 0;
+        }
         if (trace)
             fprintf(stderr, "    -> 0x%08X\n", g_eax);
     }
