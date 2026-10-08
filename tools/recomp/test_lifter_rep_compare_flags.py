@@ -63,6 +63,7 @@ static uint8_t mem[512];
 #define LO16(v) ((uint16_t)(v))
 #define RECOMP_DF_STEP(n) (n)
 #define CMP_EQ(a, b) ((a) == (b))
+#define RECOMP_PARITY8(v) ((0x9669u >> (((v) ^ ((v) >> 4)) & 15u)) & 1u)
 """
 
 MAIN = r"""

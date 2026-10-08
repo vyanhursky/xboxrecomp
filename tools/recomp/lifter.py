@@ -504,17 +504,19 @@ def _dynamic_condition(jcc, needs_cf=True):
     """Conditions at an unknown CFG join read flags published by the path taken.
 
     Unsupported producers clear validity rather than expose stale arithmetic
-    flags. Parity remains on upstream's tracked-producer path.
+    flags. Partial producers preserve only their architecturally valid bits.
     """
     aliases = {"jz": "je", "jnz": "jne", "jnae": "jb", "jc": "jb",
                "jnb": "jae", "jnc": "jae", "jna": "jbe", "jnbe": "ja",
-               "jnge": "jl", "jnl": "jge", "jng": "jle", "jnle": "jg"}
+               "jnge": "jl", "jnl": "jge", "jng": "jle", "jnle": "jg",
+               "jpe": "jp", "jpo": "jnp"}
     jcc = aliases.get(jcc, jcc)
     if needs_cf and jcc in ("jb", "jae"):
         return "_cf" if jcc == "jb" else "!_cf"
     flags = {"je": (1, "_flags"), "jne": (1, "!_flags"),
              "js": (2, "_sf"), "jns": (2, "!_sf"),
              "jo": (4, "_of"), "jno": (4, "!_of"),
+             "jp": (8, "_pf"), "jnp": (8, "!_pf"),
              "jl": (6, "_sf != _of"), "jge": (6, "_sf == _of"),
              "jle": (7, "_flags || _sf != _of"),
              "jg": (7, "!_flags && _sf == _of")}
@@ -1595,7 +1597,13 @@ class Lifter:
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
-            return ["/* sahf - store AH to flags */"]
+            out = []
+            if self.needs_dynamic_flags:
+                out.append("_sf = (HI8(eax) >> 7) & 1u; _flags = (HI8(eax) >> 6) & 1u;"
+                           " _pf = (HI8(eax) >> 2) & 1u; _fv |= 11u; /* sahf preserves OF */")
+            if self.needs_cf:
+                out.append("_cf = HI8(eax) & 1u;")
+            return out or ["/* sahf - no flag consumer */"]
         if m == "shld":
             return self._lift_shld(insn, ops)
         if m == "shrd":
@@ -1624,11 +1632,9 @@ class Lifter:
             else:
                 address = "ebx + LO8(eax)"
             return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
-        if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
-                 "setl", "setge", "setle", "setg", "sets", "setns", "seto", "setno"):
+        if m.startswith("set") and "j" + m[3:] in COND_MAP:
             return self._lift_setcc(insn, ops, m)
-        if m in ("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
-                 "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns", "cmovo", "cmovno"):
+        if m.startswith("cmov") and "j" + m[4:] in COND_MAP:
             return self._lift_cmovcc(insn, ops, m)
 
         # ── SSE (scalar float) ──
@@ -1783,7 +1789,7 @@ class Lifter:
                         f"XBOX_PTR({addr}), _addend);",
                         "  _fa = _old + _addend; _fb = _addend; _fas = (int32_t)_fa; _fbs = (int32_t)_fb;",
                         ("  _flags = (_fa == 0); _sf = (_fas < 0);"
-                         " _of = ((~(_old ^ _addend) & (_old ^ _fa) & 0x80000000u) != 0); _fv = 7;"
+                         " _of = ((~(_old ^ _addend) & (_old ^ _fa) & 0x80000000u) != 0); _pf = RECOMP_PARITY8(_fa); _fv = 15;"
                          if self.needs_dynamic_flags else ""),
                         ("  _cf = ((uint64_t)_old + _addend > 0xFFFFFFFFu);" if self.needs_cf else ""),
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
@@ -1802,7 +1808,7 @@ class Lifter:
                     "  _fas = (int32_t)_fa; _fbs = (int32_t)_fb;",
                     ("  _flags = (_cmp == _old);"
                      " _sf = (((_cmp - _old) & 0x80000000u) != 0);"
-                     " _of = (((_cmp ^ _old) & (_cmp ^ (_cmp - _old)) & 0x80000000u) != 0); _fv = 7;"
+                     " _of = (((_cmp ^ _old) & (_cmp ^ (_cmp - _old)) & 0x80000000u) != 0); _pf = RECOMP_PARITY8(_cmp - _old); _fv = 15;"
                      if self.needs_dynamic_flags else ""),
                     ("  _cf = (_cmp < _old);" if self.needs_cf else ""),
                     "  if (_old != _cmp) eax = _old; }"
@@ -1979,16 +1985,16 @@ class Lifter:
             sign = f"0x{1 << (size*8-1):X}u"
             snapshot += " _flags = (_fa == 0); _sf = (_fas < 0);"
             if m in ("and", "or", "xor"):
-                snapshot += " _of = 0; _fv = 7;"
+                snapshot += " _of = 0; _pf = RECOMP_PARITY8(_fa); _fv = 15;"
             elif m in ("add", "sub"):
                 recover = "-" if m == "add" else "+"
                 inversion = "~" if m == "add" else ""
                 snapshot += (f" {{ uint32_t _a = (_fa {recover} _fb) & {mask};"
-                    f" _of = (({inversion}(_a ^ _fb) & (_a ^ _fa) & {sign}) != 0); _fv = 7; }}")
+                    f" _of = (({inversion}(_a ^ _fb) & (_a ^ _fa) & {sign}) != 0); _pf = RECOMP_PARITY8(_fa); _fv = 15; }}")
             elif m == "neg":
-                snapshot += f" _of = (_fa == {sign}); _fv = 7;"
+                snapshot += f" _of = (_fa == {sign}); _pf = RECOMP_PARITY8(_fa); _fv = 15;"
             else:
-                snapshot += " _fv = 3; /* OF not modelled for this producer */"
+                snapshot += " _pf = RECOMP_PARITY8(_fa); _fv = 11; /* OF not modelled for this producer */"
         return snapshot
 
     def _lift_alu_binop(self, insn, ops, m):
@@ -2038,7 +2044,7 @@ class Lifter:
         out += [f"_fa = (uint32_t)({val}) & {mask};",
                 f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
         if self.needs_dynamic_flags:
-            out.append("_flags = (_fa == 0); _sf = (_fas < 0); _of = (_fb != 0); _fv = 7;")
+            out.append("_flags = (_fa == 0); _sf = (_fas < 0); _of = (_fb != 0); _pf = RECOMP_PARITY8(_fa); _fv = 15;")
         return out
 
     def _lift_neg(self, insn, ops, preserve_carry=False):
@@ -2105,7 +2111,7 @@ class Lifter:
                 f" _cf = (int)((_t >> {width}) & 1u); "
                 + _fmt_operand_write(ops[0], "(uint32_t)_t")
                 + self._result_snapshot(ops, m)
-                + f" _of = (({invert}(_a ^ _b) & (_a ^ _fa) & {sign}) != 0); _fv = 7; }}"]
+                + f" _of = (({invert}(_a ^ _b) & (_a ^ _fa) & {sign}) != 0); _pf = RECOMP_PARITY8(_fa); _fv = 15; }}"]
 
     def _lift_double_shift(self, insn, ops, m):
         """SHLD/SHRD, with x86's count rules rather than C's.
@@ -2146,7 +2152,7 @@ class Lifter:
                     f" uint32_t _src = (uint32_t)({src}) & {mask}; "
                     + (f"_cf = (int)({carry} & 1u); " if self.needs_cf else "")
                     + _fmt_operand_write(ops[0], expr) + self._result_snapshot(ops, m)
-                    + f" if (_c == 1) {{ _of = (((_v ^ _fa) >> {w-1}) & 1u); _fv = 7; }} }} }}"]
+                    + f" if (_c == 1) {{ _of = (((_v ^ _fa) >> {w-1}) & 1u); _pf = RECOMP_PARITY8(_fa); _fv = 15; }} }} }}"]
         expr = (f"({dst} << _c) | ({src} >> ({w} - _c))" if m == "shld"
                 else f"({dst} >> _c) | ({src} << ({w} - _c))")
         # A masked count of zero leaves the destination AND the flags alone,
@@ -2219,7 +2225,7 @@ class Lifter:
                     f" if (_c) {{ {carry} "
                     + _fmt_operand_write(ops[0], f"_v {c_op} _c")
                     + self._result_snapshot(ops, "shift")
-                    + f" if (_c == 1) {{ _of = {of}; _fv = 7; }} }} }}"]
+                    + f" if (_c == 1) {{ _of = {of}; _pf = RECOMP_PARITY8(_fa); _fv = 15; }} }} }}"]
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
@@ -2273,7 +2279,7 @@ class Lifter:
                     f" int32_t _v = (int32_t)(int{width}_t)({dst}); if (_c) {{ {carry} "
                     + _fmt_operand_write(ops[0], "(uint32_t)(_v >> _c)")
                     + self._result_snapshot(ops, "sar")
-                    + " if (_c == 1) { _of = 0; _fv = 7; } } }"]
+                    + " if (_c == 1) { _of = 0; _pf = RECOMP_PARITY8(_fa); _fv = 15; } } }"]
         cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         width = (_operand_width(ops[0]) or 4) * 8
         signed = f"(int32_t)(int{width}_t)({dst})"
@@ -2314,7 +2320,7 @@ class Lifter:
                         else f"((_rcv >> {width-1}) ^ (_rcv >> {width-2})) & 1u")
             return [f"{{ uint32_t _c = (uint32_t)({cnt}) & 31u; if (_c) {{"
                     f" uint32_t _rcv = RC_ROT((uint32_t)({dst}), _c, &_cf, {width}, {left}); "
-                    + write + f" _fv &= 3u; if (_c == 1) {{ _of = {overflow}; _fv |= 4u; }} }} }}"]
+                    + write + f" _fv &= 11u; if (_c == 1) {{ _of = {overflow}; _fv |= 4u; }} }} }}"]
         return [
             f"{{ uint32_t _rcv = RC_ROT((uint32_t)({dst}), (unsigned)({cnt}),"
             f" &_cf, {width}, {left});",
@@ -2352,7 +2358,7 @@ class Lifter:
                     f" uint32_t _rv = {func}({dst}, _c); "
                     + _fmt_operand_write(ops[0], "_rv")
                     + (f" _cf = (int){carry};" if self.needs_cf else "")
-                    + f" _fv &= 3u; if (_c == 1) {{ _of = {overflow}; _fv |= 4u; }} }} }}"]
+                    + f" _fv &= 11u; if (_c == 1) {{ _of = {overflow}; _fv |= 4u; }} }} }}"]
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
     # ── Compare / Test (standalone) ──
@@ -2426,7 +2432,7 @@ class Lifter:
                         if kind == "cmp" else "0")
             out.append(f"{{ uint32_t _r = (_fa {op} _fb) & {mask};"
                        f" _flags = (_r == 0); _sf = ((_r & {sign}) != 0);"
-                       f" _of = {overflow}; _fv = 7; }}")
+                       f" _of = {overflow}; _pf = RECOMP_PARITY8(_r); _fv = 15; }}")
         return out
 
     def _lift_cmp(self, insn, ops):
@@ -3117,7 +3123,7 @@ class Lifter:
         if self.needs_dynamic_flags:
             lines.append(f"    {{ uint32_t _r = (_a - _b) & {mask};"
                          f" _sf = ((_r & {sign}) != 0);"
-                         f" _of = (((_a ^ _b) & (_a ^ _r) & {sign}) != 0); _fv = 7; }}")
+                         f" _of = (((_a ^ _b) & (_a ^ _r) & {sign}) != 0); _pf = RECOMP_PARITY8(_r); _fv = 15; }}")
         if self.needs_cf:
             lines.append("    _cf = (_a < _b);")
         lines += [
@@ -3559,8 +3565,17 @@ class Lifter:
                 # frequently a write to a register the operand address was
                 # built from -- so the operands have to be read now, while
                 # they still mean what the compare meant.
-                return [f"_fca = {_sse_read(ops[0])}; _fcb = {_sse_read(ops[1])};"
-                        f" /* {m} */"]
+                def compare_read(op):
+                    if m.endswith("sd") and _is_xmm(op):
+                        return f"{op.reg}.d[0]"
+                    return _sse_read(op)
+                out = [f"_fca = {compare_read(ops[0])}; _fcb = {compare_read(ops[1])};"]
+                if self.needs_dynamic_flags:
+                    out.append("_pf = (_fca != _fca || _fcb != _fcb);"
+                               " _flags = (_fca == _fcb || _pf); _sf = _of = 0; _fv = 15u;")
+                if self.needs_cf:
+                    out.append("_cf = (_fca < _fcb || _fca != _fca || _fcb != _fcb);")
+                return out + [f"/* {m} */"]
 
         # ── Bitwise ──
         # Done on the integer lanes: these carry sign-mask and select idioms
@@ -3983,8 +3998,13 @@ class Lifter:
             pops = m.endswith("pi") or m.endswith("ip")
             pop_code = " fp_pop();" if pops else ""
             rhs = self._fcom_rhs(ops)
-            return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
-                    f"{pop_code} /* {m} */"]
+            out = [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"]
+            if self.needs_dynamic_flags:
+                out.append("_pf = (g_fp_cmp == 2); _flags = (g_fp_cmp == 0 || _pf);"
+                           " _sf = _of = 0; _fv = 15u;")
+            if self.needs_cf:
+                out.append("_cf = (g_fp_cmp < 0 || g_fp_cmp == 2);")
+            return out + [f"{pop_code} /* {m} */"]
         if m == "fnstsw":
             # `fnstsw ax` after an FPU compare is half of the pre-SSE float
             # branch idiom `fcomp; fnstsw ax; test ah, mask; j(p/np/z/nz)`.
@@ -4050,7 +4070,24 @@ def _is_rep_compare(insn):
                                    "scasb", "scasw", "scasd"))
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+def flag_condition(jcc, setter, ops, *, dynamic, needs_cf):
+    """Use published flags for modeled producers, including partial writers."""
+    canonical = {"cmp", "test", "add", "sub", "and", "or", "xor", "inc", "dec",
+        "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd",
+        "rol", "ror", "rcl", "rcr", "bt", "bts", "btr", "btc", "bsf", "bsr",
+        "xadd", "cmpxchg", "__zf_from_dest", "sahf",
+        "comiss", "ucomiss", "comisd", "ucomisd",
+        "fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"}
+    producer = setter or ""
+    if dynamic and (producer in canonical or producer in _BARE_STRING_COMPARES
+                    or producer.startswith("rep")):
+        expr = _dynamic_condition(jcc, needs_cf)
+        if expr != "0":
+            return expr, "published flags"
+    return _make_condition(jcc, setter, ops)
+
+
+def lift_basic_block(lifter, bb, flag_state=None, condition_overrides=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -4077,20 +4114,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
         last_flag_ops = []
 
     def condition(jcc):
-        # Published flags carry the actual taken path, including count-zero
-        # shifts and arithmetic overflow. Static operand comparisons do not.
-        canonical = {"cmp", "test", "add", "sub", "and", "or", "xor", "inc", "dec",
-            "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd",
-            "rol", "ror", "rcl", "rcr", "bt", "bts", "btr", "btc", "bsf", "bsr",
-            "xadd", "cmpxchg", "__zf_from_dest"}
-        producer = last_flag_setter or ""
-        if (lifter.needs_dynamic_flags and
-                (producer in canonical or producer in _BARE_STRING_COMPARES
-                 or producer.startswith("rep"))):
-            dynamic = _dynamic_condition(jcc, lifter.needs_cf)
-            if dynamic != "0":
-                return dynamic, "published flags"
-        return _make_condition(jcc, last_flag_setter, last_flag_ops)
+        if condition_overrides and curr.address in condition_overrides:
+            return condition_overrides[curr.address], "flags of incoming edge"
+        return flag_condition(jcc, last_flag_setter, last_flag_ops,
+                              dynamic=lifter.needs_dynamic_flags, needs_cf=lifter.needs_cf)
 
     while i < len(insns):
         curr = insns[i]
@@ -4143,11 +4170,12 @@ def lift_basic_block(lifter, bb, flag_state=None):
         # camera, every matrix and the stunt-distance readout went NaN.
         # The flags come from the tracked setter, through the same
         # conditions the jcc forms use. AF is not modelled and reads 0.
-        if curr.mnemonic == "lahf" and last_flag_setter:
+        if curr.mnemonic == "lahf" and (last_flag_setter or lifter.needs_dynamic_flags):
             bits = []
             for jcc, bit in (("js", 0x80), ("je", 0x40), ("jp", 0x04),
                              ("jb", 0x01)):
-                probe = condition(jcc)
+                probe = ((_dynamic_condition(jcc, lifter.needs_cf), "published flags")
+                         if lifter.needs_dynamic_flags else condition(jcc))
                 if probe:
                     bits.append(f"(({probe[0]}) ? 0x{bit:02X}u : 0u)")
             stmts.append("eax = (eax & 0xFFFF00FFu) | ((uint32_t)("
@@ -4157,7 +4185,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
             continue
 
         # Check if this instruction uses flags (jcc, setcc, cmovcc)
-        if curr.is_cond_jump and last_flag_setter:
+        if curr.is_cond_jump and (last_flag_setter or (condition_overrides and curr.address in condition_overrides)):
             result = condition(curr.mnemonic)
             if result:
                 cond_expr, desc = result
@@ -4168,10 +4196,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
-                              "seta", "setl", "setge", "setle", "setg",
-                              "sets", "setns", "seto", "setno")
-                and last_flag_setter and len(curr.operands) >= 1):
+        if (curr.mnemonic.startswith("set") and "j" + curr.mnemonic[3:] in COND_MAP
+                and (last_flag_setter or (condition_overrides and curr.address in condition_overrides))
+                and len(curr.operands) >= 1):
             result = condition("j" + curr.mnemonic[3:])
             cond = result[0] if result else None
             if cond:
@@ -4182,10 +4209,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
-                              "cmovbe", "cmova", "cmovl", "cmovge",
-                              "cmovle", "cmovg", "cmovs", "cmovns", "cmovo", "cmovno")
-                and last_flag_setter and len(curr.operands) >= 2):
+        if (curr.mnemonic.startswith("cmov") and "j" + curr.mnemonic[4:] in COND_MAP
+                and (last_flag_setter or (condition_overrides and curr.address in condition_overrides))
+                and len(curr.operands) >= 2):
             result = condition("j" + curr.mnemonic[4:])
             cond = result[0] if result else None
             if cond:
@@ -4302,7 +4328,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if lifter.needs_dynamic_flags:
             m = curr.mnemonic
             published = m in {"xadd", "lock xadd", "cmpxchg", "lock cmpxchg", "cmp", "test", "add", "sub", "and", "or", "xor",
-                "inc", "dec", "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd", "bsf", "bsr"}
+                "inc", "dec", "neg", "adc", "sbb", "shl", "sal", "shr", "sar", "shld", "shrd", "bsf", "bsr",
+                "sahf", "comiss", "ucomiss", "comisd", "ucomisd",
+                "fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"}
             preserving = (m in _EFLAGS_PRESERVE or m in ("in", "out", "rdtsc", "cpuid", "lfence", "mfence", "stc", "clc", "cmc", "bt", "bts", "btr", "btc")
                 or curr.is_cond_jump or m.startswith(("j", "set", "cmov"))
                 or (m.startswith("f") and m not in ("fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"))

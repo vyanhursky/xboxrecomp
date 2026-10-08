@@ -23,9 +23,10 @@ unsigned reads;
 #define CMP_NE(a,b) ((a)!=(b))
 #define TEST_Z(a,b) (((a)&(b))==0)
 #define RECOMP_UNIMPL(a,m) ((void)0)
+#define RECOMP_PARITY8(v) ((0x9669u >> (((v) ^ ((v) >> 4)) & 15u)) & 1u)
 '''
-LOCALS = 'uint32_t _fa=0,_fb=0; int32_t _fas=0,_fbs=0; int _cf=c,_flags=0,_sf=0,_of=0; unsigned _fv=0;'
-CONDITIONS = ('je','jne','js','jns','jo','jno','jl','jge','jle','jg','jb','jae','jbe','ja')
+LOCALS = 'uint32_t _fa=0,_fb=0; int32_t _fas=0,_fbs=0; int _cf=c,_flags=0,_sf=0,_of=0,_pf=0; unsigned _fv=0;'
+CONDITIONS = ('je','jne','js','jns','jo','jno','jl','jge','jle','jg','jb','jae','jbe','ja','jp','jnp')
 
 
 def emitter():
@@ -61,9 +62,10 @@ def answer(m, a, b, c, bits):
         sn = signed(n,bits)
     zf, sf = (n & mask)==0, bool(n & (1 << (bits-1)))
     of = not (-(1 << (bits-1)) <= sn < (1 << (bits-1)))
+    pf = (n & 255).bit_count() % 2 == 0
     answers = (zf,not zf,sf,not sf,of,not of,sf!=of,sf==of,
                zf or sf!=of,not zf and sf==of,carry,not carry,
-               carry or zf,not carry and not zf)
+               carry or zf,not carry and not zf,pf,not pf)
     return sum(int(v) << i for i,v in enumerate(answers))
 
 
@@ -107,9 +109,9 @@ def test_signed_rep_compares_every_width_and_zero_count():
             sources.append(f'unsigned {name}(uint32_t a,uint32_t b,unsigned n,int df){{int c=0;{LOCALS}'
                            + 'eax=a;esi=32;edi=64;ecx=n;g_df=df;'
                            + f'MEM{bits}(32)=a;MEM{bits}(64)=b;'
-                           + '_flags=1;_sf=1;_of=0;_cf=1;_fv=7;'
+                           + '_flags=1;_sf=1;_of=0;_cf=1;_pf=1;_fv=15;'
                            + stmts + 'return '+predicates+'; }')
-            previous = sum(int(v)<<i for i,v in enumerate((1,0,1,0,0,1,1,0,1,0,1,0,1,0)))
+            previous = sum(int(v)<<i for i,v in enumerate((1,0,1,0,0,1,1,0,1,0,1,0,1,0,1,0)))
             for a in vals:
                 for b in vals:
                     for n in (0,1):
@@ -129,8 +131,8 @@ def test_zero_count_shifts_preserve_all_dynamic_flags():
             stmts=' '.join(lifter.lift_instruction(insn))
             name=f'shift_{m}_{bits}'
             sources.append(f'int {name}(unsigned count){{int c=1;{LOCALS}eax=0xDEADBEEF;ecx=count;'
-                           +'_flags=_sf=_of=1;_fv=7;'+stmts
-                           +'return !(_flags==1 && _sf==1 && _of==1 && _fv==7 && _cf==1 && eax==0xDEADBEEF);}')
+                           +'_flags=_sf=_of=_pf=1;_fv=15;'+stmts
+                           +'return !(_flags==1 && _sf==1 && _of==1 && _pf==1 && _fv==15 && _cf==1 && eax==0xDEADBEEF);}')
             checks.extend(f'if({name}({c}))return 1;' for c in (0,32,64))
     ran=_build_and_run(PRELUDE+'\n'.join(sources)+'int main(void){'+''.join(checks)+'return 0;}')
     assert ran.returncode == 0,ran.stdout+ran.stderr

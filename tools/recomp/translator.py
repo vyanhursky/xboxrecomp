@@ -117,7 +117,7 @@ def _incoming_flag_state(sources, known, is_entry):
 _REG_TOKEN = None
 
 
-def _edge_flag_plan(bb, sources, known):
+def _edge_flag_plan(bb, sources, known, *, dynamic=False, needs_cf=True):
     """Evaluate a join's flag condition on each incoming edge instead.
 
     When the predecessors reach a join with states that do not merge -- a
@@ -128,7 +128,7 @@ def _edge_flag_plan(bb, sources, known):
     condition itself just before it transfers control, into a variable the
     join then tests.
 
-    Returns (consumer mnemonic, {predecessor: condition}) or None. Only the
+    Returns (consumer address, mnemonic, {predecessor: condition}) or None. Only the
     first flag reader of the join counts, and only when every predecessor's
     condition is known. Instructions between the join's label and that reader
     must leave the flags alone, and when there are any, a condition that reads
@@ -136,8 +136,7 @@ def _edge_flag_plan(bb, sources, known):
     instructions may have changed it.
     """
     import re
-    from .lifter import (_EFLAGS_PRESERVE, _make_condition, _make_setcc_value,
-                         _make_cmovcc_cond)
+    from .lifter import _EFLAGS_PRESERVE, flag_condition
     global _REG_TOKEN
     if _REG_TOKEN is None:
         _REG_TOKEN = re.compile(
@@ -166,17 +165,13 @@ def _edge_flag_plan(bb, sources, known):
     conds = {}
     for p in sources:
         setter, ops = known[p]
-        if consumer.is_cond_jump:
-            r = _make_condition(m, setter, ops)
-            c = r[0] if r else None
-        elif m.startswith("set"):
-            c = _make_setcc_value(m, setter, ops)
-        else:
-            c = _make_cmovcc_cond(m, setter, ops)
+        jcc = m if consumer.is_cond_jump else "j" + m[3 if m.startswith("set") else 4:]
+        result = flag_condition(jcc, setter, ops, dynamic=dynamic, needs_cf=needs_cf)
+        c = result[0] if result else None
         if not c or (before and _REG_TOKEN.search(c)):
             return None
         conds[p] = c
-    return m, conds
+    return consumer.address, m, conds
 
 
 def write_if_changed(path, text):
@@ -1311,7 +1306,7 @@ class FunctionTranslator:
         last_setter = None
         for insn in instructions:
             m = insn.mnemonic
-            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
+            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr", "lahf"):
                 return True
             cc = None
             if m.startswith("j") and len(m) > 1:
@@ -2227,13 +2222,13 @@ class FunctionTranslator:
         # String compares write _flags themselves (the rep forms, and since
         # they are lifted, the bare ones), with or without a jcc after them.
         has_conditionals = any(
-            insn.is_cond_jump or insn.mnemonic in ("loope", "loopne") or insn.mnemonic.startswith("set")
+            insn.is_cond_jump or insn.mnemonic in ("loope", "loopne", "lahf") or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
             or "cmps" in insn.mnemonic or "scas" in insn.mnemonic
             for insn in instructions)
         if has_conditionals:
-            lines.append("    int _flags = 0, _sf = 0, _of = 0;")
-            lines.append("    unsigned _fv = 0; /* dynamic ZF/SF/OF validity */")
+            lines.append("    int _flags = 0, _sf = 0, _of = 0, _pf = 0;")
+            lines.append("    unsigned _fv = 0; /* dynamic ZF/SF/OF/PF validity */")
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -2414,6 +2409,7 @@ class FunctionTranslator:
             settled_state = out_state
             out_state = {}
 
+        flag_declaration_index = len(lines)
         unseen_entries = set(self.lifter.imm_code_refs)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
@@ -2438,26 +2434,21 @@ class FunctionTranslator:
             incoming = _incoming_flag_state(preds[bb.start], settled_state,
                                             bb.start == start)
 
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
-
-            # A join whose predecessors disagree: let each edge evaluate the
-            # condition (see _edge_flag_plan). Blocks that may be entered
-            # from somewhere the edge list does not know -- a switch table, a
-            # code address taken as an immediate, the function entry -- keep
-            # the fallback, since an unseen edge would leave the variable
-            # holding another edge's answer.
+            # Plan against instruction identity; generated predicate spelling is
+            # an implementation detail and cannot identify a consumer safely.
+            overrides = None
             if incoming is None and bb.start != start and bb.start not in unseen_entries:
-                plan = _edge_flag_plan(bb, preds[bb.start], settled_state)
+                plan = _edge_flag_plan(bb, preds[bb.start], settled_state,
+                                       dynamic=self.lifter.needs_dynamic_flags,
+                                       needs_cf=self.lifter.needs_cf)
                 if plan:
-                    m, conds = plan
+                    address, m, conds = plan
                     var = f"_jf_{bb.start:08X}"
-                    for k, stmt in enumerate(stmts):
-                        if f"_flags /* {m}" in stmt:
-                            stmts[k] = stmt.replace(f"_flags /* {m}", f"{var} /* {m}", 1)
-                            edge_vars.append(var)
-                            edge_sets.extend((p, var, c) for p, c in conds.items())
-                            break
+                    overrides = {address: var}
+                    edge_vars.append(var)
+                    edge_sets.extend((p, var, c) for p, c in conds.items())
+            stmts, out_state[bb.start] = lift_basic_block(
+                self.lifter, bb, flag_state=incoming, condition_overrides=overrides)
 
             first = len(lines)
             for stmt in stmts:
@@ -2489,10 +2480,8 @@ class FunctionTranslator:
         for at, text in sorted(inserts, key=lambda t: -t[0]):
             lines.insert(at, text)
         if edge_vars:
-            decl = next((k for k, ln in enumerate(lines) if "fallback flag var" in ln), None)
-            if decl is not None:
-                lines.insert(decl + 1, "    int " + ", ".join(f"{v} = 0" for v in edge_vars)
-                             + "; /* per-edge flags of joins */")
+            lines.insert(flag_declaration_index, "    int " + ", ".join(f"{v} = 0" for v in edge_vars)
+                         + "; /* per-edge flags of joins */")
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
