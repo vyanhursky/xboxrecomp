@@ -533,6 +533,14 @@ static void throttle(MCPXAPUState *d)
         }
     }
     d->next_frame_time_us += EP_FRAME_US;
+    /* A pause request cuts the wait short, and a frame thread kept running by
+     * the mixer while paused comes back here at once: the deadline then ran
+     * ahead of the clock by a period per pass, and the first frame after the
+     * pause waited it out -- 9.3 s was seen, with the title's audio clock and
+     * an audio-paced movie stopped behind it. Never more than four periods
+     * ahead, the counterpart of the catch-up limit above. */
+    if (d->next_frame_time_us > now_us + 4 * EP_FRAME_US)
+        d->next_frame_time_us = now_us + EP_FRAME_US;
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
 }
