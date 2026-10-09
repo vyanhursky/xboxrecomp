@@ -2513,7 +2513,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+#if defined(__linux__)
+        /* Linux places mappings top-down, so whatever sits just above an
+         * OS-chosen span belongs to libraries and earlier allocations -- the
+         * contiguous window (base + 0x80000000) failed on every Steam Deck
+         * boot and the kernel page inside it faulted. Hold the whole 32-bit
+         * guest window instead; the fixed mappings below take their slices
+         * of it through the compat layer's arena. macOS allocates bottom-up
+         * and keeps the narrower span. */
+        if (g_span_size < 0x100000000ULL - XBOX_MAP_START)
+            g_span_size = (size_t)(0x100000000ULL - XBOX_MAP_START);
+#endif
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+#if defined(__linux__)
+        if (g_span_base && !win32_reserve_arena(g_span_base, g_span_size)) {
+            VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+            g_span_base = NULL;
+        }
+#endif
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
