@@ -164,6 +164,45 @@ static void test_live(void)
     }
 #endif
 
+#if defined(__x86_64__)
+    /* Register reads folded into arithmetic, as GCC emits them. The OHCI
+     * interrupt routine's `and ecx, [rax+rsi]` (23 0C 30) stopped the game
+     * at boot on Linux. Each is checked for its result and its flags. */
+    {
+        volatile uint32_t *p = (volatile uint32_t *)(mem + 0x1300);
+        uint32_t v;
+        uint8_t zf, cf, lt;
+
+        plant(&a, 0x300, 0x000000F0u);
+        v = 0x0000003Cu;                                       /* and r32, r/m32 */
+        __asm__ volatile("andl (%[p]), %[v]; setz %[zf]"
+                         : [v] "+r"(v), [zf] "=r"(zf) : [p] "r"(p) : "cc", "memory");
+        CHECK(v == 0x30u && !zf && a.last_off == 0x300 && a.last_size == 4);
+        v = 0x0000000Fu;
+        __asm__ volatile("andl (%[p]), %[v]; setz %[zf]"
+                         : [v] "+r"(v), [zf] "=r"(zf) : [p] "r"(p) : "cc", "memory");
+        CHECK(v == 0 && zf);
+        v = 0x00000100u;                                       /* sub r32, r/m32 */
+        __asm__ volatile("subl (%[p]), %[v]; setc %[cf]"
+                         : [v] "+r"(v), [cf] "=r"(cf) : [p] "r"(p) : "cc", "memory");
+        CHECK(v == 0x10u && !cf);
+        v = 0x00000001u;                                       /* cmp r32, r/m32 */
+        __asm__ volatile("cmpl (%[p]), %[v]; setl %[lt]"
+                         : [lt] "=r"(lt) : [v] "r"(v), [p] "r"(p) : "cc", "memory");
+        CHECK(lt);
+        __asm__ volatile("cmpl $0xF0, (%[p]); setz %[zf]"     /* cmp r/m32, imm */
+                         : [zf] "=r"(zf) : [p] "r"(p) : "cc", "memory");
+        CHECK(zf && a.writes == 2);
+        __asm__ volatile("testl $0x80, (%[p]); setz %[zf]"    /* test r/m32, imm32 */
+                         : [zf] "=r"(zf) : [p] "r"(p) : "cc", "memory");
+        CHECK(!zf);
+        __asm__ volatile("orl $0x0F, (%[p])" : : [p] "r"(p) : "cc", "memory");
+        CHECK(a.reg[0x300 / 4] == 0xFFu && a.writes == 3);    /* or r/m32, imm8 */
+        __asm__ volatile("andl $0xFFFFFF0F, (%[p])" : : [p] "r"(p) : "cc", "memory");
+        CHECK(a.reg[0x300 / 4] == 0x0Fu && a.writes == 4);    /* and r/m32, imm32 */
+    }
+#endif
+
     /* A second device in the same 16 KB host page. */
     CHECK(mmio_trap_add(mem + 0x3000, 0x1000, (void *)&b, dev_read, dev_write) == 0);
     *(volatile uint32_t *)(mem + 0x3008) = 0x33333333u;
