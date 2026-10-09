@@ -538,6 +538,7 @@ translate:
 #include <sys/types.h>
 #include <errno.h>
 #include <dirent.h>
+#include <strings.h>
 #include <fcntl.h>
 
 static char s_game_dir[MAX_PATH];
@@ -550,6 +551,67 @@ static void strip_trailing_slash(char* s)
     size_t len = strlen(s);
     if (len > 1 && s[len - 1] == '/')
         s[len - 1] = '\0';
+}
+
+/* Match the path below the mapped root without regard to case.
+ *
+ * Xbox file systems ignore case, and titles rely on it: Def Jam opens
+ * D:\GCONFIG.XML and D:\FONTS\FONTS.VIV, and the disc has gconfig.xml and
+ * fonts/fonts.viv. Windows and a default macOS volume ignore case too, so this
+ * only shows on Linux, where the opens failed and the title went on with the
+ * data missing -- the front end then computed a 300 MB allocation, the zero
+ * fill after its failure ran over the kernel thunk table, and the boot ended
+ * in calls through null.
+ *
+ * Only runs when the exact path does not exist, and only below root_len, so a
+ * player's own folders are never touched. Each existing component is replaced
+ * in place by its on-disk spelling (an ASCII case difference keeps the
+ * length); the first component with no match ends the walk, so a file being
+ * created keeps the name the title gave it. */
+static void match_case_below(char* path, size_t root_len)
+{
+    struct stat st;
+    char* comp;
+
+    if (stat(path, &st) == 0 || strlen(path) <= root_len)
+        return;
+    comp = path + root_len;
+    while (*comp == '/')
+        comp++;
+    while (*comp) {
+        char* end = strchr(comp, '/');
+        char saved = 0;
+        DIR* dir;
+        struct dirent* ent;
+        int found = 0;
+
+        if (end) { saved = *end; *end = '\0'; }
+        if (lstat(path, &st) != 0) {
+            /* comp is the last component; its directory is everything before it. */
+            char* sep = comp - 1;
+            *sep = '\0';
+            dir = opendir(sep == path ? "/" : path);
+            *sep = '/';
+            if (dir) {
+                while ((ent = readdir(dir)) != NULL) {
+                    if (strlen(ent->d_name) == strlen(comp) && strcasecmp(ent->d_name, comp) == 0) {
+                        memcpy(comp, ent->d_name, strlen(comp));
+                        found = 1;
+                        break;
+                    }
+                }
+                closedir(dir);
+            }
+        } else {
+            found = 1;
+        }
+        if (end) *end = saved;
+        if (!found || !end)
+            return;
+        comp = end + 1;
+        while (*comp == '/')
+            comp++;
+    }
 }
 
 /* Recursively create a directory and all missing parents. */
@@ -818,6 +880,8 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        match_case_below(host_path_buf,
+                         strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;
