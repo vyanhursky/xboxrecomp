@@ -19,3 +19,12 @@ else()
 endif()
 enable_testing()
 add_test(NAME texture_pack COMMAND texture_pack_test)
+
+if(NOT WIN32)
+    # The portable SHA-256 (Linux) is also tested where the system one is used.
+    add_executable(texture_pack_portable_sha test_main.c)
+    target_include_directories(texture_pack_portable_sha PRIVATE ../../src ../../src/platform ../../src/d3d)
+    target_compile_definitions(texture_pack_portable_sha PRIVATE TEXTURE_PACK_PORTABLE_SHA=1)
+    target_compile_options(texture_pack_portable_sha PRIVATE -UNDEBUG)
+    add_test(NAME texture_pack_portable_sha COMMAND texture_pack_portable_sha)
+endif()

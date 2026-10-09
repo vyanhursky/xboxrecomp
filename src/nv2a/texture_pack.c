@@ -67,6 +67,9 @@ static uint8_t *read_png(const char *path, uint32_t *w, uint32_t *h, int *retry)
 typedef struct Sha Sha;
 #if defined(_WIN32)
 struct Sha { BCRYPT_HASH_HANDLE hash; };
+#elif defined(__APPLE__) && !defined(TEXTURE_PACK_PORTABLE_SHA)
+#include <CommonCrypto/CommonDigest.h>
+struct Sha { CC_SHA256_CTX ctx; };
 #else
 struct Sha { uint32_t state[8]; uint64_t bytes; uint8_t block[64]; size_t used; };
 #endif
@@ -659,6 +662,21 @@ static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
     return data;
 }
 
+#if defined(__APPLE__) && !defined(TEXTURE_PACK_PORTABLE_SHA)
+/* The system's SHA-256 uses the CPU's hash instructions; this runs on every texture bind. */
+static int sha_start(Sha *sha) { return CC_SHA256_Init(&sha->ctx); }
+static int sha_add(Sha *sha,const void *data,size_t bytes)
+{
+    const uint8_t *p=data;
+    while(bytes) {
+        CC_LONG take=bytes>0x40000000u ? 0x40000000u : (CC_LONG)bytes;
+        if(!CC_SHA256_Update(&sha->ctx,p,take)) return 0;
+        p+=take; bytes-=take;
+    }
+    return 1;
+}
+static int sha_finish(Sha *sha,uint8_t out[32]) { return CC_SHA256_Final(out,&sha->ctx); }
+#else
 static const uint32_t k_sha256[64]={
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
     0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
@@ -715,6 +733,7 @@ static int sha_finish(Sha *sha,uint8_t out[32])
     for(i=0;i<8;i++) { out[i*4]=(uint8_t)(sha->state[i]>>24); out[i*4+1]=(uint8_t)(sha->state[i]>>16); out[i*4+2]=(uint8_t)(sha->state[i]>>8); out[i*4+3]=(uint8_t)sha->state[i]; }
     return 1;
 }
+#endif
 static void host_init(void) {}
 static void host_shutdown(void) {}
 #endif

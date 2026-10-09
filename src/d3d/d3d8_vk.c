@@ -119,6 +119,8 @@ typedef struct {
 
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Retired;
 
+#define MAX_TEX_LEVELS 15
+
 typedef struct VkTex {
     IDirect3DTexture8 iface;
     LONG       ref;
@@ -126,6 +128,11 @@ typedef struct VkTex {
     D3DFORMAT  format;
     BYTE      *sys;             /* what LockRect hands out: the title's bytes */
     UINT       pitch, sys_bytes;
+    /* Mip chain (texture packs). Level 0 is sys/pitch; the others are owned here. */
+    UINT       levels;
+    BYTE      *lvl[MAX_TEX_LEVELS];
+    UINT       lvl_pitch[MAX_TEX_LEVELS];
+    uint32_t   have;            /* levels the title wrote since the image was made */
     VkImage        img;
     VkDeviceMemory mem;
     VkImageView    view;
@@ -209,7 +216,7 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout      pl;
     VkDescriptorPool      dpool;
-    VkSampler             samplers[4][4][2][2];
+    VkSampler             samplers[4][4][2][2][3];
     VkImage        dummy;
     VkDeviceMemory dummy_mem;
     VkImageView    dummy_view;
@@ -292,9 +299,9 @@ static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
     return 1;
 }
 
-static int image_make(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage,
-                      VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
-                      VkImageView *view)
+static int image_make_levels(uint32_t w, uint32_t h, uint32_t levels, VkFormat fmt, VkImageUsageFlags usage,
+                             VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
+                             VkImageView *view)
 {
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
@@ -304,7 +311,7 @@ static int image_make(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags us
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = fmt;
     ii.extent.width = w; ii.extent.height = h; ii.extent.depth = 1;
-    ii.mipLevels = 1; ii.arrayLayers = 1;
+    ii.mipLevels = levels; ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage;
@@ -320,13 +327,20 @@ static int image_make(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags us
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
     vi.subresourceRange.aspectMask = aspect;
-    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.levelCount = levels;
     vi.subresourceRange.layerCount = 1;
     return vkCreateImageView(vk.dev, &vi, NULL, view) == VK_SUCCESS;
 }
 
-static void image_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect,
-                         VkImageLayout from, VkImageLayout to)
+static int image_make(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage,
+                      VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
+                      VkImageView *view)
+{
+    return image_make_levels(w, h, 1, fmt, usage, aspect, img, mem, view);
+}
+
+static void image_layout_levels(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect,
+                                VkImageLayout from, VkImageLayout to, uint32_t base, uint32_t count)
 {
     VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
     b.oldLayout = from;
@@ -334,12 +348,19 @@ static void image_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags asp
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img;
     b.subresourceRange.aspectMask = aspect;
-    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.baseMipLevel = base;
+    b.subresourceRange.levelCount = count;
     b.subresourceRange.layerCount = 1;
     b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          0, 0, NULL, 0, NULL, 1, &b);
+}
+
+static void image_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect,
+                         VkImageLayout from, VkImageLayout to)
+{
+    image_layout_levels(cb, img, aspect, from, to, 0, 1);
 }
 
 static void retire(VkImage img, VkDeviceMemory mem, VkImageView view)
@@ -985,6 +1006,17 @@ static int tex_to_rgba(const VkTex *t, uint8_t *dst)
     return 1;
 }
 
+/* One level of the title's bytes as R8G8B8A8: tex_to_rgba on a shallow copy that has that level's shape. */
+static int convert_level(const VkTex *t, UINT level, uint8_t *dst)
+{
+    VkTex v = *t;
+    v.width = t->width >> level ? t->width >> level : 1;
+    v.height = t->height >> level ? t->height >> level : 1;
+    v.sys = level ? t->lvl[level] : t->sys;
+    v.pitch = level ? t->lvl_pitch[level] : t->pitch;
+    return tex_to_rgba(&v, dst);
+}
+
 /* ── IDirect3DTexture8 ─────────────────────────────────────────────────── */
 
 static HRESULT __stdcall tex_QueryInterface(IDirect3DTexture8 *s, const IID *iid, void **pp)
@@ -1002,6 +1034,8 @@ static ULONG __stdcall tex_Release(IDirect3DTexture8 *s)
                 vk.tex[i] = NULL;
         retire(t->img, t->mem, t->view);
         free(t->sys);
+        for (i = 1; i < (int)t->levels; i++)
+            free(t->lvl[i]);
         free(t);
     }
     return (ULONG)(r < 0 ? 0 : r);
@@ -1012,13 +1046,15 @@ static DWORD __stdcall tex_SetPriority(IDirect3DTexture8 *s, DWORD p) { (void)s;
 static DWORD __stdcall tex_GetPriority(IDirect3DTexture8 *s) { (void)s; return 0; }
 static void  __stdcall tex_PreLoad(IDirect3DTexture8 *s) { (void)s; }
 static DWORD __stdcall tex_GetType(IDirect3DTexture8 *s) { (void)s; return 0; }
-static DWORD __stdcall tex_GetLevelCount(IDirect3DTexture8 *s) { (void)s; return 1; }
+static DWORD __stdcall tex_GetLevelCount(IDirect3DTexture8 *s) { return ((VkTex *)s)->levels; }
 static HRESULT __stdcall tex_GetLevelDesc(IDirect3DTexture8 *s, UINT lvl, D3DSURFACE_DESC *d)
 {
     VkTex *t = (VkTex *)s;
-    if (!d || lvl) return D3DERR_INVALIDCALL;
+    if (!d || lvl >= t->levels) return D3DERR_INVALIDCALL;
     memset(d, 0, sizeof *d);
-    d->Format = t->format; d->Width = t->width; d->Height = t->height;
+    d->Format = t->format;
+    d->Width = t->width >> lvl ? t->width >> lvl : 1;
+    d->Height = t->height >> lvl ? t->height >> lvl : 1;
     return D3D_OK;
 }
 static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *s, UINT lvl, IDirect3DSurface8 **pp)
@@ -1028,57 +1064,86 @@ static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *s, UINT lvl, D3DLOCKED_
 {
     VkTex *t = (VkTex *)s;
     (void)r; (void)flags;
-    if (!lr || lvl || !t->sys) return D3DERR_INVALIDCALL;
-    lr->Pitch = (INT)t->pitch;
-    lr->pBits = t->sys;
+    if (!lr || lvl >= t->levels || !t->sys) return D3DERR_INVALIDCALL;
+    lr->Pitch = (INT)(lvl ? t->lvl_pitch[lvl] : t->pitch);
+    lr->pBits = lvl ? t->lvl[lvl] : t->sys;
     return D3D_OK;
+}
+
+/* Copy one level of what the title wrote into the image. Every level of an image stays in
+ * SHADER_READ_ONLY between uploads, so a level is rewritten from that state. */
+static int upload_level(VkTex *t, UINT level, VkDeviceSize at)
+{
+    VkBufferImageCopy region;
+    uint32_t lw = t->width >> level ? t->width >> level : 1, lh = t->height >> level ? t->height >> level : 1;
+
+    image_layout_levels(vk.cmd_up, t->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, level, 1);
+    memset(&region, 0, sizeof region);
+    region.bufferOffset = at;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = level;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent.width = lw;
+    region.imageExtent.height = lh;
+    region.imageExtent.depth = 1;
+    vkCmdCopyBufferToImage(vk.cmd_up, vk.stage.buf, t->img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    image_layout_levels(vk.cmd_up, t->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, level, 1);
+    return 1;
 }
 
 /* Convert what the title wrote and copy it into the image. An image a draw
  * already sampled this frame is replaced, not rewritten: the uploads of a
  * frame all run before its draws, so rewriting it would change those draws
- * too. That is a movie drawn twice in a frame, or a cache slot reused. */
+ * too. That is a movie drawn twice in a frame, or a cache slot reused. A
+ * replaced image gets every level the title had written back, from its copies. */
 static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *s, UINT lvl)
 {
     VkTex *t = (VkTex *)s;
-    VkBufferImageCopy region;
-    VkDeviceSize bytes = (VkDeviceSize)t->width * t->height * 4, at;
-    VkImageLayout from = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    uint32_t lw, lh, other;
+    VkDeviceSize bytes, at;
 
-    (void)lvl;
+    if (lvl >= t->levels)
+        return D3DERR_INVALIDCALL;
+    lw = t->width >> lvl ? t->width >> lvl : 1;
+    lh = t->height >> lvl ? t->height >> lvl : 1;
+    bytes = (VkDeviceSize)lw * lh * 4;
     if (!vk.ready)
         return D3DERR_INVALIDCALL;
     frame_begin();
     if (bytes > vk.stage.size)
         return D3DERR_INVALIDCALL;
     at = ring_take(&vk.stage, bytes, 4);
-    if (!tex_to_rgba(t, vk.stage.map + at))
+    if (!convert_level(t, lvl, vk.stage.map + at))
         return D3DERR_INVALIDCALL;
     if (!t->img || t->used_frame == vk.frame) {
         retire(t->img, t->mem, t->view);
         t->img = VK_NULL_HANDLE;
-        if (!image_make(t->width, t->height, VK_FORMAT_R8G8B8A8_UNORM,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        VK_IMAGE_ASPECT_COLOR_BIT, &t->img, &t->mem, &t->view))
+        if (!image_make_levels(t->width, t->height, t->levels, VK_FORMAT_R8G8B8A8_UNORM,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, &t->img, &t->mem, &t->view))
             return D3DERR_INVALIDCALL;
-        from = VK_IMAGE_LAYOUT_UNDEFINED;
+        image_layout_levels(vk.cmd_up, t->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, t->levels);
         t->used_frame = 0;
         /* A stage that holds this texture must pick up the new view. */
         vk.bound_set = VK_NULL_HANDLE;
+        upload_level(t, lvl, at);
+        for (other = 0; other < t->levels; other++) {
+            uint32_t ow = t->width >> other ? t->width >> other : 1, oh = t->height >> other ? t->height >> other : 1;
+            VkDeviceSize ob = (VkDeviceSize)ow * oh * 4, oat;
+            if (other == lvl || !(t->have & (1u << other)) || ob > vk.stage.size)
+                continue;
+            oat = ring_take(&vk.stage, ob, 4);
+            if (convert_level(t, other, vk.stage.map + oat))
+                upload_level(t, other, oat);
+        }
+    } else {
+        upload_level(t, lvl, at);
     }
-    image_layout(vk.cmd_up, t->img, VK_IMAGE_ASPECT_COLOR_BIT, from,
-                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    memset(&region, 0, sizeof region);
-    region.bufferOffset = at;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent.width = t->width;
-    region.imageExtent.height = t->height;
-    region.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(vk.cmd_up, vk.stage.buf, t->img,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    image_layout(vk.cmd_up, t->img, VK_IMAGE_ASPECT_COLOR_BIT,
-                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    t->have |= 1u << lvl;
     return D3D_OK;
 }
 
@@ -1156,7 +1221,7 @@ static const IDirect3DSurface8Vtbl g_sf_vtbl = {
 
 /* ── Drawing ───────────────────────────────────────────────────────────── */
 
-static VkSampler sampler_get(DWORD au, DWORD av, DWORD mag, DWORD min)
+static VkSampler sampler_get(DWORD au, DWORD av, DWORD mag, DWORD min, DWORD mip)
 {
     static const VkSamplerAddressMode modes[4] = {
         VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
@@ -1165,13 +1230,16 @@ static VkSampler sampler_get(DWORD au, DWORD av, DWORD mag, DWORD min)
     /* D3DTADDRESS: 1 wrap, 2 mirror, 3 clamp, 4 border; unset reads as wrap. */
     uint32_t u = (au >= 1 && au <= 4) ? au - 1 : 0, v = (av >= 1 && av <= 4) ? av - 1 : 0;
     uint32_t g = (mag == 1) ? 0 : 1, n = (min == 1) ? 0 : 1;
-    VkSampler *s = &vk.samplers[u][v][g][n];
+    /* D3DTEXF: 0 none, 1 point, 2 linear. Only a texture with a mip chain has more than level 0. */
+    uint32_t m = (mip == 1 || mip == 2) ? mip : 0;
+    VkSampler *s = &vk.samplers[u][v][g][n][m];
 
     if (!*s) {
         VkSamplerCreateInfo ci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         ci.magFilter = g ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         ci.minFilter = n ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        ci.mipmapMode = m == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        ci.maxLod = m ? VK_LOD_CLAMP_NONE : 0.0f;
         ci.addressModeU = modes[u];
         ci.addressModeV = modes[v];
         ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -1285,7 +1353,7 @@ static int bind_draw(uint32_t vs, uint8_t layout, uint8_t instanced, VkPrimitive
         } else {
             views[i] = vk.dummy_view;
         }
-        samplers[i] = sampler_get(vk.tss[i][13], vk.tss[i][14], vk.tss[i][16], vk.tss[i][17]);
+        samplers[i] = sampler_get(vk.tss[i][13], vk.tss[i][14], vk.tss[i][16], vk.tss[i][17], vk.tss[i][18]);
         if (views[i] != vk.set_views[i] || samplers[i] != vk.set_samplers[i])
             same = 0;
     }
@@ -2114,17 +2182,24 @@ static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *s, UINT w, UINT h, 
         DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DTexture8 **pp)
 {
     VkTex *t;
-    uint32_t cb = compressed_bytes(fmt, w, h);
+    uint32_t cb = compressed_bytes(fmt, w, h), longest, most = 1, l;
 
-    (void)s; (void)levels; (void)usage; (void)pool;
+    (void)s; (void)usage; (void)pool;
     if (!pp || !w || !h || w > 4096 || h > 4096)
         return D3DERR_INVALIDCALL;
+    /* One level unless a full chain is asked for (the title makes none; texture packs do). */
+    for (longest = w > h ? w : h; longest > 1; longest >>= 1)
+        most++;
+    if (levels == 0 || levels > MAX_TEX_LEVELS)
+        levels = levels ? MAX_TEX_LEVELS : 1;
+    if (levels > most)
+        levels = most;
     t = calloc(1, sizeof *t);
     if (!t)
         return D3DERR_INVALIDCALL;
     t->iface.lpVtbl = &g_tex_vtbl;
     t->ref = 1;
-    t->width = w; t->height = h; t->format = fmt;
+    t->width = w; t->height = h; t->format = fmt; t->levels = levels;
     if (cb) {
         t->pitch = cb / ((h + 3) / 4);
         t->sys_bytes = cb;
@@ -2137,6 +2212,22 @@ static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *s, UINT w, UINT h, 
     if (!t->sys) {
         free(t);
         return D3DERR_INVALIDCALL;
+    }
+    t->lvl[0] = t->sys;
+    t->lvl_pitch[0] = t->pitch;
+    for (l = 1; l < levels; l++) {
+        uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1, lcb = compressed_bytes(fmt, lw, lh), bytes;
+        UINT bpp = d3d8_format_bpp(fmt) / 8;
+        t->lvl_pitch[l] = lcb ? lcb / ((lh + 3) / 4) : lw * (bpp ? bpp : 4);
+        bytes = lcb ? lcb : t->lvl_pitch[l] * lh;
+        t->lvl[l] = calloc(1, bytes);
+        if (!t->lvl[l]) {
+            while (l-- > 1)
+                free(t->lvl[l]);
+            free(t->sys);
+            free(t);
+            return D3DERR_INVALIDCALL;
+        }
     }
     *pp = &t->iface;
     return D3D_OK;
