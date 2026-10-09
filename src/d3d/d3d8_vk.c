@@ -961,8 +961,34 @@ static int row_to_argb(uint32_t fmt, const uint8_t *p, uint32_t w, uint32_t *out
     }
 }
 
-/* The title's bytes as R8G8B8A8, w*h*4 bytes at dst. */
+/* The title's bytes as R8G8B8A8, w*h*4 bytes at dst.
+ *
+ * dst is the mapped staging ring, and on many drivers (RADV on the Steam Deck
+ * among them) host-visible coherent memory is write-combined: writes are fast
+ * and every read is an uncached trip to memory. The conversion reads what it
+ * has just written, so it is done in ordinary memory and dst only receives the
+ * finished image. Converting in place there took long enough per 640x480 movie
+ * frame that the push-buffer executor fell behind the title, which then waited
+ * for its fences: the intro movies ran at about ten frames a second and
+ * stopped presenting for seconds at a time. */
+static int tex_to_rgba_in(const VkTex *t, uint8_t *dst);
+
 static int tex_to_rgba(const VkTex *t, uint8_t *dst)
+{
+    size_t bytes = (size_t)t->width * t->height * 4;
+    uint8_t *work = malloc(bytes ? bytes : 1);
+    int ok;
+
+    if (!work)
+        return tex_to_rgba_in(t, dst);
+    ok = tex_to_rgba_in(t, work);
+    if (ok)
+        memcpy(dst, work, bytes);
+    free(work);
+    return ok;
+}
+
+static int tex_to_rgba_in(const VkTex *t, uint8_t *dst)
 {
     uint32_t fmt = (uint32_t)t->format, w = t->width, h = t->height, x, y;
     uint32_t *argb = (uint32_t *)dst;       /* converted in place, then reordered */
