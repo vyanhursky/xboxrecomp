@@ -3,9 +3,9 @@
 #include "../../src/nv2a/texture_pack.c"
 #include <assert.h>
 #if defined(_WIN32)
-static int make_dir(const char *path) { return make_dir(path); }
-static void remove_file(const char *path) { remove_file(path); }
-static void remove_dir(const char *path) { remove_dir(path); }
+static int make_dir(const char *path) { return CreateDirectoryA(path,NULL); }
+static void remove_file(const char *path) { DeleteFileA(path); }
+static void remove_dir(const char *path) { RemoveDirectoryA(path); }
 static void *no_access_page(void) { return VirtualAlloc(NULL,4096,MEM_RESERVE|MEM_COMMIT,PAGE_NOACCESS); }
 static void free_page(void *page) { assert(VirtualFree(page,0,MEM_RELEASE)); }
 static void temp_root(char *root,size_t size)
