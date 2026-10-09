@@ -218,6 +218,11 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem);
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect);
 BOOL   VirtualFree(LPVOID address, SIZE_T size, DWORD freeType);
 BOOL   VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect);
+/* Hand an existing PROT_NONE reservation to VirtualAlloc/MapViewOfFileEx:
+ * a fixed-address request lying wholly on its unclaimed pages takes them
+ * over, one touching a claimed page fails as on Win32, and releasing a range
+ * restores the placeholder. Releasing the whole range ends the arena. */
+BOOL   win32_reserve_arena(void *base, size_t size);
 
 /* ---- Time ------------------------------------------------------------- */
 VOID  GetSystemTimeAsFileTime(LPFILETIME ft);

@@ -12,7 +12,7 @@ ctest --test-dir build/kernel-memory --output-on-failure
 
 ## What it guarantees
 
-Six properties over 15 checks.
+Seven properties over 26 checks.
 
 **Allocation and release pair up.** A buffer from
 `MmAllocateContiguousMemory` can be passed to `MmFreeContiguousMemory` without
@@ -46,6 +46,15 @@ set.
 calls `xbox_MmGetPhysicalAddress` rather than repeating its arithmetic, so the
 property above cannot hold on one dispatch path and not the other.
 
+**A reserved arena lends its pages to fixed-address requests, and only its
+unclaimed ones.** Linux places mappings top-down, so on an OS-chosen guest base
+the space above it already belongs to libraries; the memory layout therefore
+reserves the whole guest window and registers it with `win32_reserve_arena`.
+A fixed `VirtualAlloc` or `MapViewOfFileEx` lying wholly on unclaimed pages
+takes them; one touching a claimed page fails, as on Win32, and leaves the
+live page's contents alone. A released range goes back to the arena rather
+than to the process, and releasing the whole span ends it.
+
 ## What it does not cover
 
 The bridge. These checks call the `Mm*` and `Nt*` functions directly, which is
@@ -61,7 +70,7 @@ ordinal through the dispatcher. It lives apart because
 
 **The first check forks.** Its failure mode is the allocator calling `abort()`,
 which is a SIGABRT rather than a return value: in-process there is nothing to
-inspect, and the crash would take the remaining fourteen checks with it. The
+inspect, and the crash would take the remaining checks with it. The
 child's exit status distinguishes the cases and the harness names the signal,
 because "it crashed" and "the allocator rejected the pointer" are different
 findings.

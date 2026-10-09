@@ -208,6 +208,50 @@ int main(void)
         }
     }
 
+    /* 7. A reserved arena lends its pages to fixed-address requests.
+     *
+     * Linux places mappings top-down, so the space above an OS-chosen guest
+     * base is someone else's, and the contiguous window at base + 2 GB failed
+     * on every Steam Deck boot. The layout now reserves the whole guest
+     * window and the fixed mappings take it over page by page; that must not
+     * turn into a way to map over a live view. */
+    {
+        const SIZE_T span = 16u << 20, page = 64u << 10;
+        uint8_t *base = VirtualAlloc(NULL, span, MEM_RESERVE, PAGE_NOACCESS);
+        check(base != NULL, "arena: the span reserves", NULL);
+        if (base) {
+            uint8_t *a, *b;
+            HANDLE m;
+            check(win32_reserve_arena(base, span), "arena: registers", NULL);
+
+            /* Without the arena this fails: the span is already mapped. */
+            a = VirtualAlloc(base + page, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            check(a == base + page, "arena: a fixed request takes unclaimed pages",
+                  "refused, so the layout's fixed mappings would fail as before");
+            if (a) a[0] = 0x5A;
+            check(VirtualAlloc(base + page, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) == NULL,
+                  "arena: a claimed page is not handed out twice",
+                  "mapped over a live allocation");
+            check(VirtualAlloc(base, 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) == NULL,
+                  "arena: a request overlapping a claimed page fails", NULL);
+            check(a && a[0] == 0x5A, "arena: the live page kept its contents", NULL);
+
+            m = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)page, NULL);
+            b = m ? MapViewOfFileEx(m, FILE_MAP_ALL_ACCESS, 0, 0, page, base + 3 * page) : NULL;
+            check(b == base + 3 * page, "arena: a view maps at a fixed address inside it", NULL);
+            check(MapViewOfFileEx(m, FILE_MAP_ALL_ACCESS, 0, 0, page, base + page) == NULL,
+                  "arena: a view cannot replace a live page", NULL);
+
+            /* Released pages go back to the arena, not to the process. */
+            check(VirtualFree(a, page, MEM_RELEASE), "arena: a release succeeds", NULL);
+            check(VirtualAlloc(base + page, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) == base + page,
+                  "arena: a released page can be claimed again", NULL);
+            if (b) UnmapViewOfFile(b);
+            if (m) CloseHandle(m);
+            check(VirtualFree(base, span, MEM_RELEASE), "arena: the whole span releases", NULL);
+        }
+    }
+
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }
