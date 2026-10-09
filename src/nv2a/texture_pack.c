@@ -2,17 +2,28 @@
  * v1 ID: XRTEX01 NUL + five LE32 descriptor fields + tight pixels + BGRA palette.
  * Source identities and replacement resources are deliberately separate caches.
  */
+#if defined(_WIN32)
 #define COBJMACROS
+#endif
 #include "texture_pack.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
 #if defined(_WIN32)
 #include <windows.h>
 #include <wincodec.h>
 #include <bcrypt.h>
 #include <shlobj.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
+#else
+#include <errno.h>
+#include <strings.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#define _stricmp strcasecmp
+#endif
 
 #define MAX_ENTRIES 65536
 #define SOURCE_SLOTS 2048
@@ -36,12 +47,34 @@ static struct SourceState {
     int used, dumped;
 } g_sources[SOURCE_SLOTS];
 static unsigned g_source_next;
+#if defined(_WIN32)
 static IWICImagingFactory *g_wic;
 static BCRYPT_ALG_HANDLE g_sha;
-static int g_initialized, g_active, g_com, g_dump_limit=2000;
+static int g_com;
+#endif
+static int g_initialized, g_active, g_dump_limit=2000;
 static char g_dump[PATH_CAP];
 static uint64_t g_budget, g_resident, g_clock, g_hits, g_misses, g_hashed, g_dumps;
 static unsigned g_errors,g_loads;
+
+/* ---- Host services. Everything below this block is the same code on every host. ---- */
+static ULONGLONG now_ms(void);
+static int file_exists(const char *path);
+static void make_directories(const char *path);
+static int memory_readable(const void *data, uint64_t bytes);
+static int write_png(const char *path, const uint8_t *bgra, uint32_t w, uint32_t h);
+static uint8_t *read_png(const char *path, uint32_t *w, uint32_t *h, int *retry);
+typedef struct Sha Sha;
+#if defined(_WIN32)
+struct Sha { BCRYPT_HASH_HANDLE hash; };
+#else
+struct Sha { uint32_t state[8]; uint64_t bytes; uint8_t block[64]; size_t used; };
+#endif
+static int sha_start(Sha *sha);
+static int sha_add(Sha *sha, const void *data, size_t bytes);
+static int sha_finish(Sha *sha, uint8_t out[32]);
+static void host_init(void);
+static void host_shutdown(void);
 
 static void warn(const char *what, const char *path)
 {
@@ -156,11 +189,8 @@ static void initialize(void)
     if(g_count) qsort(g_entries,g_count,sizeof(*g_entries),entry_compare);
     g_active=g_count || g_dump[0];
     if(g_active) {
-        HRESULT hr=CoInitializeEx(NULL,COINIT_MULTITHREADED);
-        g_com=SUCCEEDED(hr);
-        if(FAILED(CoCreateInstance(&CLSID_WICImagingFactory,NULL,CLSCTX_INPROC_SERVER,
-                                  &IID_IWICImagingFactory,(void **)&g_wic))) warn("WIC unavailable","");
-        if(g_dump[0]) SHCreateDirectoryExA(NULL,g_dump,NULL);
+        host_init();
+        if(g_dump[0]) make_directories(g_dump);
         fprintf(stderr,"[TEXPACK] schema=1 entries=%zu cache=%ld MiB dump=%s\n",g_count,mb,g_dump);
     }
 }
@@ -168,17 +198,8 @@ int texture_pack_active(void) { initialize(); return g_active; }
 
 static int readable(const void *data,uint64_t bytes)
 {
-    MEMORY_BASIC_INFORMATION region;
-    uintptr_t begin=(uintptr_t)data,end=begin+(uintptr_t)bytes,at=begin,next;
-    if(!data || !bytes || bytes>64u*1024u*1024u || end<begin) return 0;
-    while(at<end) {
-        if(!VirtualQuery((const void *)at,&region,sizeof region) || region.State!=MEM_COMMIT ||
-           (region.Protect & (PAGE_NOACCESS|PAGE_GUARD))) return 0;
-        next=(uintptr_t)region.BaseAddress+region.RegionSize;
-        if(next<=at) return 0;
-        at=next;
-    }
-    return 1;
+    if(!data || !bytes || bytes>64u*1024u*1024u) return 0;
+    return memory_readable(data,bytes);
 }
 static int source_readable(const RecompTextureSource *s)
 {
@@ -187,11 +208,11 @@ static int source_readable(const RecompTextureSource *s)
 
 int texture_pack_hash(const RecompTextureSource *s,char out[65])
 {
-    BCRYPT_HASH_HANDLE hash=NULL;
+    Sha sha;
     uint8_t header[28]={'X','R','T','E','X','0','1',0},result[32];
     uint32_t fields[5]={s->format,s->width,s->height,s->palette_entries,s->row_texels};
     unsigned i,j;
-    NTSTATUS status;
+    int ok;
     if(!s->data || !s->width || !s->height || s->width>4096 || s->height>4096 ||
        s->row_texels<s->width || s->row_texels>16384 || !s->bytes || s->bytes>64u*1024u*1024u || s->palette_entries>256 ||
        (s->palette_entries && !s->palette)) return 0;
@@ -199,68 +220,19 @@ int texture_pack_hash(const RecompTextureSource *s,char out[65])
        (uint64_t)(s->rows-1)*s->stride+s->row_bytes>s->bytes)) return 0;
     /* A cached replacement bind does not read guest bytes. Validate on refresh. */
     if(!source_readable(s)) return 0;
-    if(!g_sha && BCryptOpenAlgorithmProvider(&g_sha,BCRYPT_SHA256_ALGORITHM,NULL,0)<0) return 0;
     for(i=0;i<5;i++) for(j=0;j<4;j++) header[8+i*4+j]=(uint8_t)(fields[i]>>(8*j));
-    if(BCryptCreateHash(g_sha,&hash,NULL,0,NULL,0,0)<0) return 0;
-    status=BCryptHashData(hash,header,sizeof header,0);
+    if(!sha_start(&sha)) return 0;
+    ok=sha_add(&sha,header,sizeof header);
     if(s->stride) {
-        if(!s->rows || s->row_bytes>s->stride) status=(NTSTATUS)0xc000000d;
-        for(i=0;status>=0 && i<s->rows;i++) status=BCryptHashData(hash,(PUCHAR)s->data+(size_t)i*s->stride,s->row_bytes,0);
+        for(i=0;ok && i<s->rows;i++) ok=sha_add(&sha,(const uint8_t *)s->data+(size_t)i*s->stride,s->row_bytes);
         g_hashed+=(uint64_t)s->row_bytes*s->rows;
-    } else { if(status>=0) status=BCryptHashData(hash,(PUCHAR)s->data,s->bytes,0); g_hashed+=s->bytes; }
-    if(status>=0 && s->palette_entries) status=BCryptHashData(hash,(PUCHAR)s->palette,s->palette_entries*4,0);
-    if(status>=0) status=BCryptFinishHash(hash,result,sizeof result,0);
-    BCryptDestroyHash(hash);
-    if(status<0) return 0;
+    } else { if(ok) ok=sha_add(&sha,s->data,s->bytes); g_hashed+=s->bytes; }
+    if(ok && s->palette_entries) ok=sha_add(&sha,s->palette,s->palette_entries*4);
+    if(!sha_finish(&sha,result) || !ok) return 0;
     for(i=0;i<32;i++) sprintf(out+i*2,"%02x",result[i]);
     return 1;
 }
 
-static int wide_path(const char *path,WCHAR out[PATH_CAP])
-{ return MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,out,PATH_CAP)>0; }
-static int write_png(const char *path,const uint8_t *bgra,uint32_t w,uint32_t h)
-{
-    IWICStream *stream=NULL; IWICBitmapEncoder *encoder=NULL; IWICBitmapFrameEncode *frame=NULL;
-    WICPixelFormatGUID format=GUID_WICPixelFormat32bppBGRA;
-    WCHAR wide[PATH_CAP]; HRESULT hr=E_FAIL;
-    if(!g_wic || !wide_path(path,wide)) return 0;
-    hr=IWICImagingFactory_CreateStream(g_wic,&stream);
-    if(SUCCEEDED(hr)) hr=IWICStream_InitializeFromFilename(stream,wide,GENERIC_WRITE);
-    if(SUCCEEDED(hr)) hr=IWICImagingFactory_CreateEncoder(g_wic,&GUID_ContainerFormatPng,NULL,&encoder);
-    if(SUCCEEDED(hr)) hr=IWICBitmapEncoder_Initialize(encoder,(IStream *)stream,WICBitmapEncoderNoCache);
-    if(SUCCEEDED(hr)) hr=IWICBitmapEncoder_CreateNewFrame(encoder,&frame,NULL);
-    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_Initialize(frame,NULL);
-    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_SetSize(frame,w,h);
-    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_SetPixelFormat(frame,&format);
-    if(SUCCEEDED(hr) && !IsEqualGUID(&format,&GUID_WICPixelFormat32bppBGRA)) hr=E_FAIL;
-    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_WritePixels(frame,h,w*4,w*h*4,(BYTE *)bgra);
-    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_Commit(frame);
-    if(SUCCEEDED(hr)) hr=IWICBitmapEncoder_Commit(encoder);
-    if(frame) IWICBitmapFrameEncode_Release(frame);
-    if(encoder) IWICBitmapEncoder_Release(encoder);
-    if(stream) IWICStream_Release(stream);
-    return SUCCEEDED(hr);
-}
-static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
-{
-    IWICBitmapDecoder *decoder=NULL; IWICBitmapFrameDecode *frame=NULL; IWICFormatConverter *converter=NULL;
-    WCHAR wide[PATH_CAP]; uint8_t *data=NULL; HRESULT hr=E_FAIL;
-    if(!g_wic || !wide_path(path,wide)) return NULL;
-    hr=IWICImagingFactory_CreateDecoderFromFilename(g_wic,wide,NULL,GENERIC_READ,WICDecodeMetadataCacheOnDemand,&decoder);
-    if(SUCCEEDED(hr)) hr=IWICBitmapDecoder_GetFrame(decoder,0,&frame);
-    if(SUCCEEDED(hr)) hr=IWICBitmapFrameDecode_GetSize(frame,w,h);
-    if(SUCCEEDED(hr) && (!*w || !*h || *w>16384 || *h>16384 || (uint64_t)*w**h*4>g_budget/4)) hr=E_INVALIDARG;
-    if(SUCCEEDED(hr)) hr=IWICImagingFactory_CreateFormatConverter(g_wic,&converter);
-    if(SUCCEEDED(hr)) hr=IWICFormatConverter_Initialize(converter,(IWICBitmapSource *)frame,&GUID_WICPixelFormat32bppBGRA,
-                                  WICBitmapDitherTypeNone,NULL,0,WICBitmapPaletteTypeCustom);
-    if(SUCCEEDED(hr)) { data=malloc((size_t)*w**h*4); if(!data) hr=E_OUTOFMEMORY; }
-    if(SUCCEEDED(hr)) hr=IWICFormatConverter_CopyPixels(converter,NULL,*w*4,*w**h*4,data);
-    if(converter) IWICFormatConverter_Release(converter);
-    if(frame) IWICBitmapFrameDecode_Release(frame);
-    if(decoder) IWICBitmapDecoder_Release(decoder);
-    if(FAILED(hr)) { free(data); data=NULL; *retry=(hr==E_OUTOFMEMORY); }
-    return data;
-}
 static void release_entry(IDirect3DDevice8 *dev,PackEntry *e)
 {
     unsigned stage;
@@ -415,7 +387,7 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
 {
     struct SourceState *state=NULL; char id[65]; PackEntry *entry;
     unsigned i, slot=source_slot(s);
-    ULONGLONG now=GetTickCount64();
+    ULONGLONG now=now_ms();
     if(!texture_pack_active() || !dev || stage>3) return 0;
     for(i=0;i<4;i++) {
         struct SourceState *c=&g_sources[(slot+i)&(SOURCE_SLOTS-1)];
@@ -440,7 +412,7 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
     if(!state->dumped && g_dump[0] && g_dumps<(uint64_t)g_dump_limit && sample && source_readable(s)) {
         state->dumped=1;
         char path[PATH_CAP]; snprintf(path,sizeof path,"%s/%s.png",g_dump,id);
-        if(GetFileAttributesA(path)==INVALID_FILE_ATTRIBUTES) {
+        if(!file_exists(path)) {
             uint32_t *pixels=malloc((size_t)s->width*s->height*4),x,y; int ok=1;
             if(pixels) {
                 for(y=0;y<s->height && ok;y++) for(x=0;x<s->width;x++) if(!sample(user,x,y,&pixels[(size_t)y*s->width+x])) { ok=0; break; }
@@ -481,16 +453,268 @@ void texture_pack_shutdown(IDirect3DDevice8 *dev)
     if(dev) for(i=0;i<g_count;i++) release_entry(dev,&g_entries[i]);
     free(g_entries); g_entries=NULL; g_count=g_capacity=0;
     memset(g_sources,0,sizeof g_sources);
+    host_shutdown();
+    g_initialized=g_active=0; g_dump[0]=0;
+    g_resident=g_hits=g_misses=g_dumps=g_hashed=g_clock=0; g_source_next=0; g_loads=0;
+}
+
+/* ---- Host services: Windows (WIC, BCrypt, VirtualQuery) ---- */
+#if defined(_WIN32)
+static ULONGLONG now_ms(void) { return GetTickCount64(); }
+static int file_exists(const char *path) { return GetFileAttributesA(path)!=INVALID_FILE_ATTRIBUTES; }
+static void make_directories(const char *path) { SHCreateDirectoryExA(NULL,path,NULL); }
+static int memory_readable(const void *data,uint64_t bytes)
+{
+    MEMORY_BASIC_INFORMATION region;
+    uintptr_t begin=(uintptr_t)data,end=begin+(uintptr_t)bytes,at=begin,next;
+    if(end<begin) return 0;
+    while(at<end) {
+        if(!VirtualQuery((const void *)at,&region,sizeof region) || region.State!=MEM_COMMIT ||
+           (region.Protect & (PAGE_NOACCESS|PAGE_GUARD))) return 0;
+        next=(uintptr_t)region.BaseAddress+region.RegionSize;
+        if(next<=at) return 0;
+        at=next;
+    }
+    return 1;
+}
+static int wide_path(const char *path,WCHAR out[PATH_CAP])
+{ return MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,out,PATH_CAP)>0; }
+static int write_png(const char *path,const uint8_t *bgra,uint32_t w,uint32_t h)
+{
+    IWICStream *stream=NULL; IWICBitmapEncoder *encoder=NULL; IWICBitmapFrameEncode *frame=NULL;
+    WICPixelFormatGUID format=GUID_WICPixelFormat32bppBGRA;
+    WCHAR wide[PATH_CAP]; HRESULT hr=E_FAIL;
+    if(!g_wic || !wide_path(path,wide)) return 0;
+    hr=IWICImagingFactory_CreateStream(g_wic,&stream);
+    if(SUCCEEDED(hr)) hr=IWICStream_InitializeFromFilename(stream,wide,GENERIC_WRITE);
+    if(SUCCEEDED(hr)) hr=IWICImagingFactory_CreateEncoder(g_wic,&GUID_ContainerFormatPng,NULL,&encoder);
+    if(SUCCEEDED(hr)) hr=IWICBitmapEncoder_Initialize(encoder,(IStream *)stream,WICBitmapEncoderNoCache);
+    if(SUCCEEDED(hr)) hr=IWICBitmapEncoder_CreateNewFrame(encoder,&frame,NULL);
+    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_Initialize(frame,NULL);
+    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_SetSize(frame,w,h);
+    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_SetPixelFormat(frame,&format);
+    if(SUCCEEDED(hr) && !IsEqualGUID(&format,&GUID_WICPixelFormat32bppBGRA)) hr=E_FAIL;
+    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_WritePixels(frame,h,w*4,w*h*4,(BYTE *)bgra);
+    if(SUCCEEDED(hr)) hr=IWICBitmapFrameEncode_Commit(frame);
+    if(SUCCEEDED(hr)) hr=IWICBitmapEncoder_Commit(encoder);
+    if(frame) IWICBitmapFrameEncode_Release(frame);
+    if(encoder) IWICBitmapEncoder_Release(encoder);
+    if(stream) IWICStream_Release(stream);
+    return SUCCEEDED(hr);
+}
+static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
+{
+    IWICBitmapDecoder *decoder=NULL; IWICBitmapFrameDecode *frame=NULL; IWICFormatConverter *converter=NULL;
+    WCHAR wide[PATH_CAP]; uint8_t *data=NULL; HRESULT hr=E_FAIL;
+    if(!g_wic || !wide_path(path,wide)) return NULL;
+    hr=IWICImagingFactory_CreateDecoderFromFilename(g_wic,wide,NULL,GENERIC_READ,WICDecodeMetadataCacheOnDemand,&decoder);
+    if(SUCCEEDED(hr)) hr=IWICBitmapDecoder_GetFrame(decoder,0,&frame);
+    if(SUCCEEDED(hr)) hr=IWICBitmapFrameDecode_GetSize(frame,w,h);
+    if(SUCCEEDED(hr) && (!*w || !*h || *w>16384 || *h>16384 || (uint64_t)*w**h*4>g_budget/4)) hr=E_INVALIDARG;
+    if(SUCCEEDED(hr)) hr=IWICImagingFactory_CreateFormatConverter(g_wic,&converter);
+    if(SUCCEEDED(hr)) hr=IWICFormatConverter_Initialize(converter,(IWICBitmapSource *)frame,&GUID_WICPixelFormat32bppBGRA,
+                                  WICBitmapDitherTypeNone,NULL,0,WICBitmapPaletteTypeCustom);
+    if(SUCCEEDED(hr)) { data=malloc((size_t)*w**h*4); if(!data) hr=E_OUTOFMEMORY; }
+    if(SUCCEEDED(hr)) hr=IWICFormatConverter_CopyPixels(converter,NULL,*w*4,*w**h*4,data);
+    if(converter) IWICFormatConverter_Release(converter);
+    if(frame) IWICBitmapFrameDecode_Release(frame);
+    if(decoder) IWICBitmapDecoder_Release(decoder);
+    if(FAILED(hr)) { free(data); data=NULL; *retry=(hr==E_OUTOFMEMORY); }
+    return data;
+}
+static int sha_start(Sha *sha)
+{
+    if(!g_sha && BCryptOpenAlgorithmProvider(&g_sha,BCRYPT_SHA256_ALGORITHM,NULL,0)<0) return 0;
+    return BCryptCreateHash(g_sha,&sha->hash,NULL,0,NULL,0,0)>=0;
+}
+static int sha_add(Sha *sha,const void *data,size_t bytes) { return BCryptHashData(sha->hash,(PUCHAR)data,(ULONG)bytes,0)>=0; }
+static int sha_finish(Sha *sha,uint8_t out[32])
+{
+    int ok=BCryptFinishHash(sha->hash,out,32,0)>=0;
+    BCryptDestroyHash(sha->hash);
+    return ok;
+}
+static void host_init(void)
+{
+    HRESULT hr=CoInitializeEx(NULL,COINIT_MULTITHREADED);
+    g_com=SUCCEEDED(hr);
+    if(FAILED(CoCreateInstance(&CLSID_WICImagingFactory,NULL,CLSCTX_INPROC_SERVER,
+                              &IID_IWICImagingFactory,(void **)&g_wic))) warn("WIC unavailable","");
+}
+static void host_shutdown(void)
+{
     if(g_wic) IWICImagingFactory_Release(g_wic); g_wic=NULL;
     if(g_sha) BCryptCloseAlgorithmProvider(g_sha,0); g_sha=NULL;
     if(g_com) CoUninitialize();
-    g_initialized=g_active=g_com=0; g_dump[0]=0;
-    g_resident=g_hits=g_misses=g_dumps=g_hashed=g_clock=0; g_source_next=0; g_loads=0;
+    g_com=0;
 }
+
+/* ---- Host services: macOS and Linux (stb PNG, a portable SHA-256, memory protection checks) ---- */
 #else
-int texture_pack_active(void) { return 0; }
-int texture_pack_hash(const RecompTextureSource *s,char out[65]) { (void)s; (void)out; return 0; }
-int texture_pack_bind(IDirect3DDevice8 *d,unsigned st,const RecompTextureSource *s,RecompTextureSample cb,void *u)
-{ (void)d;(void)st;(void)s;(void)cb;(void)u;return 0; }
-void texture_pack_shutdown(IDirect3DDevice8 *d) { (void)d; }
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wsign-compare"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#endif
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_PNG
+#define STBI_NO_LINEAR
+#define STBI_NO_HDR
+#include "stb/stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb/stb_image_write.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
+static ULONGLONG now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC,&t);
+    return (ULONGLONG)t.tv_sec*1000u+(ULONGLONG)t.tv_nsec/1000000u;
+}
+static int file_exists(const char *path) { return access(path,F_OK)==0; }
+static void make_directories(const char *path)
+{
+    char copy[PATH_CAP],*p;
+    if(snprintf(copy,sizeof copy,"%s",path)>=(int)sizeof copy) return;
+    for(p=copy+1;*p;p++) if(*p=='/') { *p=0; mkdir(copy,0777); *p='/'; }
+    mkdir(copy,0777);
+}
+/* Readable now and not a protected page. The runtime traps hardware registers with
+ * inaccessible pages, and reading one would raise the trap rather than fail. */
+static int memory_readable(const void *data,uint64_t bytes)
+{
+#if defined(__APPLE__)
+    mach_vm_address_t at=(mach_vm_address_t)(uintptr_t)data,end=at+bytes;
+    if(end<at) return 0;
+    while(at<end) {
+        mach_vm_address_t region=at; mach_vm_size_t size=0;
+        vm_region_basic_info_data_64_t info; mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object=MACH_PORT_NULL;
+        if(mach_vm_region(mach_task_self(),&region,&size,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&object)!=KERN_SUCCESS)
+            return 0;
+        if(region>at || !(info.protection & VM_PROT_READ) || !size) return 0;
+        at=region+size;
+    }
+    return 1;
+#else
+    uintptr_t begin=(uintptr_t)data,end=begin+(uintptr_t)bytes,at=begin;
+    FILE *maps;
+    char line[512];
+    if(end<begin) return 0;
+    maps=fopen("/proc/self/maps","r");
+    if(!maps) return 1;
+    while(at<end && fgets(line,sizeof line,maps)) {
+        unsigned long long low,high; char perms[8];
+        if(sscanf(line,"%llx-%llx %7s",&low,&high,perms)!=3) continue;
+        if(high<=at) continue;
+        if(low>at || perms[0]!='r') { fclose(maps); return 0; }
+        at=(uintptr_t)high;
+    }
+    fclose(maps);
+    return at>=end;
+#endif
+}
+static int write_png(const char *path,const uint8_t *bgra,uint32_t w,uint32_t h)
+{
+    size_t i,count=(size_t)w*h;
+    uint8_t *rgba=malloc(count*4);
+    int ok;
+    if(!rgba) return 0;
+    for(i=0;i<count;i++) {
+        rgba[i*4]=bgra[i*4+2]; rgba[i*4+1]=bgra[i*4+1]; rgba[i*4+2]=bgra[i*4]; rgba[i*4+3]=bgra[i*4+3];
+    }
+    ok=stbi_write_png(path,(int)w,(int)h,4,rgba,(int)(w*4));
+    free(rgba);
+    return ok;
+}
+/* BGRA, as the Windows decoder returns it. A missing or malformed file is permanent (retry 0). */
+static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
+{
+    int x=0,y=0,n=0;
+    uint8_t *data;
+    size_t i,count;
+    *retry=0;
+    if(!stbi_info(path,&x,&y,&n) || x<=0 || y<=0 || x>16384 || y>16384 || (uint64_t)x*y*4>g_budget/4) return NULL;
+    data=stbi_load(path,&x,&y,&n,4);
+    if(!data) return NULL;
+    *w=(uint32_t)x; *h=(uint32_t)y;
+    count=(size_t)x*y;
+    for(i=0;i<count;i++) { uint8_t t=data[i*4]; data[i*4]=data[i*4+2]; data[i*4+2]=t; }
+    return data;
+}
+
+static const uint32_t k_sha256[64]={
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#define ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static void sha_block(Sha *sha,const uint8_t *p)
+{
+    uint32_t w[64],a,b,c,d,e,f,g,h,t1,t2,i;
+    for(i=0;i<16;i++) w[i]=(uint32_t)p[i*4]<<24|(uint32_t)p[i*4+1]<<16|(uint32_t)p[i*4+2]<<8|p[i*4+3];
+    for(i=16;i<64;i++) {
+        uint32_t s0=ROR(w[i-15],7)^ROR(w[i-15],18)^(w[i-15]>>3),s1=ROR(w[i-2],17)^ROR(w[i-2],19)^(w[i-2]>>10);
+        w[i]=w[i-16]+s0+w[i-7]+s1;
+    }
+    a=sha->state[0]; b=sha->state[1]; c=sha->state[2]; d=sha->state[3];
+    e=sha->state[4]; f=sha->state[5]; g=sha->state[6]; h=sha->state[7];
+    for(i=0;i<64;i++) {
+        t1=h+(ROR(e,6)^ROR(e,11)^ROR(e,25))+((e&f)^(~e&g))+k_sha256[i]+w[i];
+        t2=(ROR(a,2)^ROR(a,13)^ROR(a,22))+((a&b)^(a&c)^(b&c));
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    sha->state[0]+=a; sha->state[1]+=b; sha->state[2]+=c; sha->state[3]+=d;
+    sha->state[4]+=e; sha->state[5]+=f; sha->state[6]+=g; sha->state[7]+=h;
+}
+static int sha_start(Sha *sha)
+{
+    static const uint32_t init[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    memcpy(sha->state,init,sizeof init); sha->bytes=0; sha->used=0;
+    return 1;
+}
+static int sha_add(Sha *sha,const void *data,size_t bytes)
+{
+    const uint8_t *p=data;
+    sha->bytes+=bytes;
+    while(bytes) {
+        size_t take=64-sha->used; if(take>bytes) take=bytes;
+        memcpy(sha->block+sha->used,p,take); sha->used+=take; p+=take; bytes-=take;
+        if(sha->used==64) { sha_block(sha,sha->block); sha->used=0; }
+    }
+    return 1;
+}
+static int sha_finish(Sha *sha,uint8_t out[32])
+{
+    uint64_t bits=sha->bytes*8; unsigned i;
+    uint8_t pad=0x80,zero=0,length[8];
+    sha_add(sha,&pad,1);
+    while(sha->used!=56) sha_add(sha,&zero,1);
+    for(i=0;i<8;i++) length[i]=(uint8_t)(bits>>(56-8*i));
+    sha_add(sha,length,8);
+    for(i=0;i<8;i++) { out[i*4]=(uint8_t)(sha->state[i]>>24); out[i*4+1]=(uint8_t)(sha->state[i]>>16); out[i*4+2]=(uint8_t)(sha->state[i]>>8); out[i*4+3]=(uint8_t)sha->state[i]; }
+    return 1;
+}
+static void host_init(void) {}
+static void host_shutdown(void) {}
 #endif

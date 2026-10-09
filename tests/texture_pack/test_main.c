@@ -1,6 +1,35 @@
-/* Real WIC/SHA and production pack loader, synthetic images and mock D3D8 resources. */
+/* The production pack loader with this host's real PNG codec and SHA-256 (WIC and BCrypt on
+ * Windows, stb and the portable one elsewhere), synthetic images and mock D3D8 resources. */
 #include "../../src/nv2a/texture_pack.c"
 #include <assert.h>
+#if defined(_WIN32)
+static int make_dir(const char *path) { return make_dir(path); }
+static void remove_file(const char *path) { remove_file(path); }
+static void remove_dir(const char *path) { remove_dir(path); }
+static void *no_access_page(void) { return VirtualAlloc(NULL,4096,MEM_RESERVE|MEM_COMMIT,PAGE_NOACCESS); }
+static void free_page(void *page) { assert(VirtualFree(page,0,MEM_RELEASE)); }
+static void temp_root(char *root,size_t size)
+{
+    char base[1024]; GetTempPathA(sizeof base,base);
+    snprintf(root,size,"%stexture-pack-fixture-%lu",base,GetCurrentProcessId());
+}
+#else
+static int make_dir(const char *path) { return mkdir(path,0777)==0; }
+static void remove_file(const char *path) { unlink(path); }
+static void remove_dir(const char *path) { rmdir(path); }
+static void *no_access_page(void)
+{
+    void *page=mmap(NULL,4096,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0);
+    return page==MAP_FAILED ? NULL : page;
+}
+static void free_page(void *page) { assert(munmap(page,4096)==0); }
+static void temp_root(char *root,size_t size)
+{
+    const char *base=getenv("TMPDIR");
+    snprintf(root,size,"%s/texture-pack-fixture-%ld",base && *base ? base : "/tmp",(long)getpid());
+}
+#define _putenv_s(name,value) setenv(name,value,1)
+#endif
 typedef struct MockTexture {
     IDirect3DTexture8 iface;
     unsigned refs, levels, uploads;
@@ -82,12 +111,12 @@ int main(void)
     changed[127]=raw[127]; assert(texture_pack_hash(&source,other) && !strcmp(id,other));
     source.bytes=1; assert(!texture_pack_hash(&source,other));
     {
-        void *blocked=VirtualAlloc(NULL,4096,MEM_RESERVE|MEM_COMMIT,PAGE_NOACCESS);
+        void *blocked=no_access_page();
         RecompTextureSource inaccessible={1,6,2,2,2,blocked,16,0,0,0,NULL,0};
         assert(blocked && !texture_pack_hash(&inaccessible,other));
         inaccessible.data=pixel; inaccessible.palette=blocked; inaccessible.palette_entries=1;
         assert(!texture_pack_hash(&inaccessible,other));
-        assert(VirtualFree(blocked,0,MEM_RELEASE));
+        free_page(blocked);
     }
     assert(!valid_name("../escape.png",1) && !valid_name("C:/escape.png",1) && !valid_name("a\\b.png",1));
     assert(valid_name("textures/clean.png",1));
@@ -103,13 +132,13 @@ int main(void)
         /* Previously all 128 page-aligned sources competed for the same 4 slots. */
         assert(unique>96);
     }
-    GetTempPathA(sizeof root,root);
-    snprintf(path,sizeof path,"%stexture-pack-fixture-%lu",root,GetCurrentProcessId());
-    snprintf(root,sizeof root,"%s",path); assert(CreateDirectoryA(root,NULL));
+    temp_root(root,sizeof root); assert(make_dir(root));
     _putenv_s("RECOMP_TEXTURE_DUMP_DIR",""); _putenv_s("RECOMP_TEXTURE_PACKS","");
     initialize();
+#if defined(_WIN32)
     assert(SUCCEEDED(CoInitializeEx(NULL,COINIT_MULTITHREADED)));
     assert(SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory,NULL,CLSCTX_INPROC_SERVER,&IID_IWICImagingFactory,(void **)&g_wic)));
+#endif
     snprintf(path,sizeof path,"%s/alpha.png",root); assert(write_png(path,pixel,2,2));
     source=(RecompTextureSource){1,6,2,2,2,pixel,16,0,0,0,NULL,0};
     snprintf(entry.path,sizeof entry.path,"%s",path);
@@ -172,14 +201,14 @@ int main(void)
         release_entry(&device,&entry);
         file=fopen(entry.path,"wb"); fwrite(dds,1,151,file); fclose(file);
         assert(!upload_dds(&device,&entry,&source));
-        DeleteFileA(entry.path);
+        remove_file(entry.path);
     }
-    snprintf(path,sizeof path,"%s/one",root); CreateDirectoryA(path,NULL);
+    snprintf(path,sizeof path,"%s/one",root); make_dir(path);
     snprintf(manifest,sizeof manifest,"%s/one/manifest.ini",root);
     file=fopen(manifest,"wb"); assert(file);
     fprintf(file,"[pack]\nschema=1\n[textures]\n%s=textures/first.png\n",id); fclose(file);
     read_pack(root,"one");
-    snprintf(path,sizeof path,"%s/two",root); CreateDirectoryA(path,NULL);
+    snprintf(path,sizeof path,"%s/two",root); make_dir(path);
     snprintf(manifest,sizeof manifest,"%s/two/manifest.ini",root);
     file=fopen(manifest,"wb"); fprintf(file,"[pack]\nschema=1\n[textures]\n%s=textures/second.png\n[pack]\npng_mips=channels\n",id); fclose(file);
     read_pack(root,"two"); qsort(g_entries,g_count,sizeof(*g_entries),entry_compare);
@@ -198,14 +227,17 @@ int main(void)
     assert(make_room(&device,64));
     for(i=0;i<4;i++) assert(!bound[i]);
     assert(!g_entries[0].texture && g_resident==0);
-    texture_pack_shutdown(&device); CoUninitialize();
+    texture_pack_shutdown(&device);
+#if defined(_WIN32)
+    CoUninitialize();
+#endif
     assert(creates==destroys);
-    snprintf(path,sizeof path,"%s/alpha.png",root); DeleteFileA(path);
+    snprintf(path,sizeof path,"%s/alpha.png",root); remove_file(path);
     for(i=0;i<2;i++) {
-        snprintf(path,sizeof path,"%s/%s/manifest.ini",root,i?"two":"one"); DeleteFileA(path);
-        snprintf(path,sizeof path,"%s/%s",root,i?"two":"one"); RemoveDirectoryA(path);
+        snprintf(path,sizeof path,"%s/%s/manifest.ini",root,i?"two":"one"); remove_file(path);
+        snprintf(path,sizeof path,"%s/%s",root,i?"two":"one"); remove_dir(path);
     }
-    RemoveDirectoryA(root);
+    remove_dir(root);
     printf("texture-pack fixture passed: hash, palette, stride, PNG alpha/mips, DDS bounds, precedence, eviction (%u resources)\n",creates);
     return 0;
 }
