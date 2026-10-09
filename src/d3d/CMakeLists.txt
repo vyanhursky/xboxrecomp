@@ -25,8 +25,23 @@ else()
     # loader and shaderc are installed, and the older OpenGL one otherwise.
     # Only the Vulkan device draws what the push-buffer executor asks for.
     find_package(Vulkan QUIET)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(SHADERC QUIET IMPORTED_TARGET shaderc)
+    find_package(PkgConfig QUIET)
+    # shaderc: found without pkg-config first, so a prefix that ships only the
+    # library and its header (a bundled runtime, a machine with no package
+    # manager) is enough. pkg-config remains the fallback.
+    find_library(SHADERC_LIBRARY NAMES shaderc_shared shaderc_shared.1 shaderc)
+    find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.h)
+    if(SHADERC_LIBRARY AND SHADERC_INCLUDE_DIR)
+        add_library(xbox_shaderc INTERFACE)
+        target_link_libraries(xbox_shaderc INTERFACE "${SHADERC_LIBRARY}")
+        target_include_directories(xbox_shaderc INTERFACE "${SHADERC_INCLUDE_DIR}")
+        set(SHADERC_FOUND TRUE)
+        set(SHADERC_VERSION "${SHADERC_LIBRARY}")
+        set(XBOX_SHADERC_TARGET xbox_shaderc)
+    elseif(PKG_CONFIG_FOUND)
+        pkg_check_modules(SHADERC QUIET IMPORTED_TARGET shaderc)
+        set(XBOX_SHADERC_TARGET PkgConfig::SHADERC)
+    endif()
     option(XBOXRECOMP_VULKAN "Build the Vulkan Direct3D 8 device" ON)
     if(XBOXRECOMP_VULKAN AND Vulkan_FOUND AND SHADERC_FOUND)
         add_library(xbox_d3d8 STATIC
@@ -34,7 +49,7 @@ else()
             d3d8_formats.c
             d3d8_combiners.c
         )
-        target_link_libraries(xbox_d3d8 PUBLIC platform Vulkan::Vulkan PkgConfig::SHADERC)
+        target_link_libraries(xbox_d3d8 PUBLIC platform Vulkan::Vulkan ${XBOX_SHADERC_TARGET})
         target_compile_definitions(xbox_d3d8 PUBLIC XBOXRECOMP_HAVE_VULKAN=1)
         message(STATUS "xbox_d3d8: Vulkan device (shaderc ${SHADERC_VERSION})")
     elseif(XBOXRECOMP_SDL3)
@@ -47,6 +62,7 @@ else()
             d3d8_nv2a_pending.c
         )
         find_package(SDL2 REQUIRED)
+        find_package(PkgConfig REQUIRED)
         pkg_check_modules(EPOXY REQUIRED epoxy)
         target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
         target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
