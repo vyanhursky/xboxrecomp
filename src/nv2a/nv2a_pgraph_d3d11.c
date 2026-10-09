@@ -275,6 +275,7 @@ void pgraph_d3d11_init(void)
 
 void pgraph_d3d11_shutdown(void)
 {
+    texture_pack_shutdown(xbox_GetD3DDevice());
     g_pg.initialized = 0;
     fprintf(stderr, "[PGRAPH-D3D11] Translator shut down (draws=%u, verts=%u)\n",
             g_pg.stats.draw_calls, g_pg.stats.vertices_submitted);
@@ -796,6 +797,24 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
  * when the loading screen, intro, title and header had used up the slots,
  * every new texture drew untextured, in its white vertex colour. */
 static int g_bind_stage;      /* the stage texture binds go to (0..3) */
+static int g_pack_bound[4];
+
+int pgraph_d3d11_try_texture_pack(const RecompTextureSource *source,
+                                RecompTextureSample sample, void *user)
+{
+    IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+    int bound = g_pg.initialized && dev && texture_pack_bind(dev, g_bind_stage, source, sample, user);
+    g_pack_bound[g_bind_stage] = bound;
+    if (bound) {
+        dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 1, 4);
+        dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 2, 2);
+        dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 3, 0);
+        dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 4, 4);
+        dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 5, 2);
+        dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 6, 0);
+    }
+    return bound;
+}
 #define READY_TEX_CACHE 256
 static struct {
     uint32_t addr, format, width, height;
@@ -930,6 +949,8 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
     uint32_t bytes, bpp;
     int compressed;
     int i;
+
+    g_pack_bound[g_bind_stage] = 0;
 
     if (!g_pg.initialized)
         return 0;
@@ -1105,6 +1126,10 @@ void pgraph_d3d11_set_texture_filter(uint32_t nv2a_filter)
         return;
     dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 16 /*MAGFILTER*/, dmag);
     dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 17 /*MINFILTER*/, dmin);
+    if (texture_pack_active()) {
+        DWORD mip = g_pack_bound[g_bind_stage] ? ((min == 3 || min == 4) ? 1 : (min >= 5 && min <= 7) ? 2 : 0) : 0;
+        dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 18 /*MIPFILTER*/, mip);
+    }
 }
 
 /* Which texture stage the next set_texture_ready / set_texture_address
@@ -1128,6 +1153,7 @@ void pgraph_d3d11_unbind_stage(int stage)
     if (!g_pg.initialized || !(dev = xbox_GetD3DDevice()) || stage < 0 || stage > 3)
         return;
     dev->lpVtbl->SetTexture(dev, (DWORD)stage, NULL);
+    g_pack_bound[stage] = 0;
 }
 
 /* The title's register combiners for the next draws (M4f), from the NV097

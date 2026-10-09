@@ -8,6 +8,7 @@
 add_library(xbox_nv2a STATIC
     nv2a_core.c
     nv2a_pgraph_d3d11.c
+    texture_pack.c
     nv2a_pb_replay.c
     nv2a_mmio_hook.c
     nv2a_pb_test.c
@@ -31,5 +32,5 @@ endif()
 
 target_link_libraries(xbox_nv2a PRIVATE platform)
 if(WIN32)
-    target_link_libraries(xbox_nv2a PRIVATE kernel32)
+    target_link_libraries(xbox_nv2a PRIVATE kernel32 windowscodecs ole32 bcrypt shell32)
 endif()

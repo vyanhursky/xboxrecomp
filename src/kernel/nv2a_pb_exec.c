@@ -2714,6 +2714,38 @@ static void surf_note_texture(uint32_t tex_addr, uint32_t w, uint32_t h, uint32_
     }
 }
 
+static int pack_sample(void *user, uint32_t x, uint32_t y, uint32_t *argb)
+{
+    return sample_tex((const Texture *)user, 0, x, y, argb);
+}
+
+static int try_texture_pack(const Texture *t, const uint8_t *mem)
+{
+    RecompTextureSource source={0};
+    uint32_t block=d3d8_format_dxt_block_bytes(t->color), bpp=d3d8_format_bpp(t->color)/8;
+    uint64_t bytes;
+    if (!texture_pack_active() || !t->valid || t->cube || surf_holds_texture(t->offset) ||
+        !t->width || !t->height || t->width>4096 || t->height>4096) return 0;
+    /* Static colour formats only. Video/YUV and depth formats retain their live path. */
+    if (!block && t->color!=0x06 && t->color!=0x07 && t->color!=0x0b && t->color!=0x12 && t->color!=0x1e) return 0;
+    source.address=t->offset; source.format=t->color; source.width=t->width; source.height=t->height;
+    source.row_texels=linear_row_texels(t); source.data=mem+t->offset;
+    if (block) bytes=(uint64_t)((t->width+3)/4)*((t->height+3)/4)*block;
+    else if (tex_size_from_format(t->color)) bytes=(uint64_t)t->width*t->height*bpp;
+    else {
+        source.stride=t->pitch; source.row_bytes=t->width*bpp; source.rows=t->height;
+        if (source.stride<source.row_bytes) return 0;
+        bytes=(uint64_t)(t->height-1)*t->pitch+source.row_bytes;
+    }
+    if (!bytes || bytes>64u*1024u*1024u) return 0;
+    source.bytes=(uint32_t)bytes;
+    if (t->color==0x0b) {
+        source.palette=mem+t->palette; source.palette_entries=t->palette_len;
+        if (!t->palette || !t->palette_len || t->palette_len>256) return 0;
+    }
+    return pgraph_d3d11_try_texture_pack(&source,pack_sample,(void *)t);
+}
+
 static void bind_texture_ready(const Texture *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -2730,6 +2762,8 @@ static void bind_texture_ready(const Texture *t)
     uint32_t i, n;
     int slot = -1;
     ULONGLONG now;
+
+    if (try_texture_pack(t,mem)) return;
 
     if (surf_trace_on())
         surf_note_texture(t->offset, w, h, t->color);

@@ -24,6 +24,7 @@
 #define NV2A_PGRAPH_D3D11_H
 
 #include <stdint.h>
+#include "texture_pack.h"
 #include "../kernel/nv2a_combiner.h"
 
 /* Initialize the PGRAPH→D3D11 translator. Call after D3D11 device is created. */
@@ -31,6 +32,8 @@ void pgraph_d3d11_init(void);
 
 /* Shut down and release resources. */
 void pgraph_d3d11_shutdown(void);
+int pgraph_d3d11_try_texture_pack(const RecompTextureSource *source,
+                                RecompTextureSample sample, void *user);
 
 /* Process an NV2A PGRAPH method call. Called from push buffer parser.
  * Returns 1 if handled, 0 if unhandled (caller should log/ignore). */
