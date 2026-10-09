@@ -48,7 +48,13 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
+    /* Quotient and remainder apart: count * 1000000 overflows once the
+     * counter passes 2^63 / 10^6. On POSIX hosts the counter is CLOCK_MONOTONIC
+     * in nanoseconds, so that was 2.6 hours of uptime -- after which this
+     * clock jumped back every 5.1 hours and the APU's frame deadline landed
+     * centuries away. */
+    return (int64_t)((count.QuadPart / freq.QuadPart) * 1000000LL
+                     + (count.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart);
 }
 #endif
 
