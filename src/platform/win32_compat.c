@@ -1422,26 +1422,156 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 void view_register(void *addr, size_t len);
 size_t view_take(const void *addr);
 
+/* ---- Reserved arena ----------------------------------------------------
+ *
+ * One PROT_NONE reservation the caller owns, whose pages fixed-address
+ * requests may take over (win32_reserve_arena in win32_compat.h).
+ *
+ * Linux hands out mmap addresses top-down, so the memory just above an
+ * OS-chosen base already belongs to libraries and earlier allocations. A
+ * request at base + 0x80000000 then meets someone else's mapping, and
+ * MAP_FIXED_NOREPLACE rightly refuses it. Reserving the whole guest window
+ * up front settles that, but only if a fixed request can replace our own
+ * placeholder -- which MAP_FIXED_NOREPLACE cannot tell from a stranger's
+ * mapping. So the pages still held as placeholder are tracked here: a request
+ * that lies wholly on them maps with MAP_FIXED, one that touches a live page
+ * fails as Win32 would, and a release puts the placeholder back instead of
+ * leaving a hole another allocator can take. Inert until registered. */
+enum { ARENA_OUTSIDE, ARENA_FREE, ARENA_LIVE, ARENA_MIXED };
+
+static pthread_mutex_t s_arena_lock = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t s_arena_lo, s_arena_hi;
+static size_t    s_arena_page;
+static uint8_t  *s_arena_live;          /* bitmap, one bit per page */
+
+BOOL win32_reserve_arena(void *base, size_t size)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t pages = size / page;
+    uint8_t *bits = (uint8_t *)calloc((pages + 7) / 8, 1);
+
+    if (!bits || ((uintptr_t)base | size) & (page - 1)) {
+        free(bits);
+        return FALSE;
+    }
+    pthread_mutex_lock(&s_arena_lock);
+    free(s_arena_live);
+    s_arena_live = bits;
+    s_arena_page = page;
+    s_arena_lo = (uintptr_t)base;
+    s_arena_hi = (uintptr_t)base + size;
+    pthread_mutex_unlock(&s_arena_lock);
+    return TRUE;
+}
+
+/* Caller holds s_arena_lock. */
+static int arena_state_locked(uintptr_t lo, size_t len)
+{
+    uintptr_t hi = lo + len;
+    size_t first, last, i, live = 0;
+
+    if (!s_arena_live || len == 0 || hi <= s_arena_lo || lo >= s_arena_hi)
+        return ARENA_OUTSIDE;
+    if (lo < s_arena_lo || hi > s_arena_hi)
+        return ARENA_MIXED;             /* straddles the edge */
+    first = (lo - s_arena_lo) / s_arena_page;
+    last  = (hi - s_arena_lo + s_arena_page - 1) / s_arena_page;
+    for (i = first; i < last; i++)
+        live += (s_arena_live[i >> 3] >> (i & 7)) & 1;
+    if (live == 0) return ARENA_FREE;
+    return live == last - first ? ARENA_LIVE : ARENA_MIXED;
+}
+
+static int arena_state(const void *addr, size_t len)
+{
+    int s;
+    pthread_mutex_lock(&s_arena_lock);
+    s = arena_state_locked((uintptr_t)addr, len);
+    pthread_mutex_unlock(&s_arena_lock);
+    return s;
+}
+
+static void arena_mark(const void *addr, size_t len, int live)
+{
+    uintptr_t lo = (uintptr_t)addr;
+    size_t first, last, i;
+
+    pthread_mutex_lock(&s_arena_lock);
+    if (arena_state_locked(lo, len) != ARENA_OUTSIDE && lo >= s_arena_lo
+            && lo + len <= s_arena_hi) {
+        first = (lo - s_arena_lo) / s_arena_page;
+        last  = (lo + len - s_arena_lo + s_arena_page - 1) / s_arena_page;
+        for (i = first; i < last; i++) {
+            if (live) s_arena_live[i >> 3] |= (uint8_t)(1u << (i & 7));
+            else      s_arena_live[i >> 3] &= (uint8_t)~(1u << (i & 7));
+        }
+    }
+    pthread_mutex_unlock(&s_arena_lock);
+}
+
+/* Returns 1 if the range was inside the arena and is placeholder again,
+ * 0 if it is not the arena's to take back. The whole arena released at once
+ * is the owner giving it up: unmap it and forget it. */
+static int arena_release(void *addr, size_t len, BOOL *ok)
+{
+    int s;
+    pthread_mutex_lock(&s_arena_lock);
+    s = arena_state_locked((uintptr_t)addr, len);
+    if (s == ARENA_OUTSIDE) {
+        pthread_mutex_unlock(&s_arena_lock);
+        return 0;
+    }
+    if ((uintptr_t)addr == s_arena_lo && (uintptr_t)addr + len == s_arena_hi) {
+        *ok = munmap(addr, len) == 0;
+        free(s_arena_live);
+        s_arena_live = NULL;
+        s_arena_lo = s_arena_hi = 0;
+        pthread_mutex_unlock(&s_arena_lock);
+        return 1;
+    }
+    pthread_mutex_unlock(&s_arena_lock);
+    if (s == ARENA_MIXED && ((uintptr_t)addr < s_arena_lo
+                             || (uintptr_t)addr + len > s_arena_hi)) {
+        *ok = FALSE;
+        return 1;
+    }
+    *ok = mmap(addr, len, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+               -1, 0) != MAP_FAILED;
+    if (*ok) arena_mark(addr, len, 0);
+    return 1;
+}
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    int arena = address ? arena_state(address, size) : ARENA_OUTSIDE;
 
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
-     * just adjust protection. */
-    if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
+     * just adjust protection. Arena placeholder is not such a region -- it
+     * takes the fresh-mapping path below, as unmapped memory would. */
+    if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address
+            && arena != ARENA_FREE && arena != ARENA_MIXED) {
         if (mprotect(address, size, prot) == 0)
             return address;
         /* fall through to a fresh mapping */
     }
 
+    if (arena == ARENA_LIVE || arena == ARENA_MIXED) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
+
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif
+    if (arena == ARENA_FREE)
+        flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
 
     void *p;
 #if defined(__APPLE__)
-    if (address) {
+    if (address && arena != ARENA_FREE) {
         p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
     } else
 #endif
@@ -1450,6 +1580,8 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+    if (arena == ARENA_FREE)
+        arena_mark(p, size, 1);
     /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
      * Win32 caller, and munmap cannot be called without one. */
     view_register(p, size);
@@ -1476,8 +1608,11 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
          * silent no-op: the caller believed the address was free, the next
          * allocation there failed, and nothing connected the two. */
         size_t len = view_take(address);
+        BOOL ok;
         if (size == 0) size = len;
         if (size == 0) return FALSE;
+        if (arena_release(address, size, &ok))
+            return ok;
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
@@ -1959,6 +2094,12 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
     int flags  = MAP_SHARED;
+    int arena  = baseAddr ? arena_state(baseAddr, len) : ARENA_OUTSIDE;
+
+    if (arena == ARENA_LIVE || arena == ARENA_MIXED) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
@@ -1966,7 +2107,10 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
      * addresses, so with a base the OS chose rather than one we picked, that
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
-    if (baseAddr) {
+    if (arena == ARENA_FREE) {
+        /* Our own placeholder: replacing it is the point. */
+        flags |= MAP_FIXED;
+    } else if (baseAddr) {
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
 #elif defined(__APPLE__)
@@ -1992,6 +2136,8 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
         SetLastError(ERROR_INVALID_ADDRESS);
         return NULL;
     }
+    if (arena == ARENA_FREE)
+        arena_mark(p, len, 1);
     view_register(p, len);
     return p;
 }
@@ -2004,7 +2150,10 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
     size_t len = view_take(baseAddr);
+    BOOL ok;
     if (len == 0) return FALSE;
+    if (arena_release((void *)baseAddr, len, &ok))
+        return ok;
     return munmap((void *)baseAddr, len) == 0;
 }
 
