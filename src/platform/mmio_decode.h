@@ -95,6 +95,52 @@ static inline void mmio_set_flags(mmio_ctx_t ctx, uint64_t result, int size,
         ctx->EFlags |= 0x0001u;                                   /* CF */
 }
 
+/* The arithmetic forms below also need OF: a signed compare (jl/jg) reads it,
+ * and a register ALU result can feed one directly. */
+static inline void mmio_set_arith_flags(mmio_ctx_t ctx, uint64_t a, uint64_t b,
+                                        uint64_t res, int size, int sub)
+{
+    uint64_t mask = (size < 8) ? ((1ULL << (size * 8)) - 1) : ~0ULL;
+    uint64_t sign = 1ULL << (size * 8 - 1);
+    int carry, ovf;
+
+    a &= mask; b &= mask; res &= mask;
+    carry = sub ? (a < b) : (res < a);
+    ovf   = sub ? (((a ^ b) & (a ^ res) & sign) != 0)
+                : ((~(a ^ b) & (a ^ res) & sign) != 0);
+    mmio_set_flags(ctx, res, size, carry);
+    if (ovf)
+        ctx->EFlags |= 0x0800u;                                   /* OF */
+}
+
+/* Write a register the way the CPU would for an operand of this size: a
+ * 32-bit result clears the upper half, 8 and 16 bits merge. */
+static inline void mmio_put_reg(mmio_ctx_t ctx, int reg, uint64_t v, int size)
+{
+    uint64_t *dst = mmio_ctx_reg(ctx, reg);
+    if (size == 1)      *dst = (*dst & ~0xFFULL)   | (v & 0xFF);
+    else if (size == 2) *dst = (*dst & ~0xFFFFULL) | (v & 0xFFFF);
+    else if (size == 4) *dst = v & 0xFFFFFFFFULL;
+    else                *dst = v;
+}
+
+/* One ALU operation by its group-1 index (the /n of 80/81/83; also bits 5:3 of
+ * the two-operand opcodes). Sets the flags; returns 0 for ADC/SBB, which need
+ * the incoming carry and are not something device code does to a register. */
+static inline int mmio_alu(mmio_ctx_t ctx, int n, uint64_t a, uint64_t b,
+                           int size, uint64_t *res)
+{
+    switch (n) {
+    case 0: *res = a + b; mmio_set_arith_flags(ctx, a, b, *res, size, 0); return 1;
+    case 1: *res = a | b; mmio_set_flags(ctx, *res, size, 0);           return 1;
+    case 4: *res = a & b; mmio_set_flags(ctx, *res, size, 0);           return 1;
+    case 5:
+    case 7: *res = a - b; mmio_set_arith_flags(ctx, a, b, *res, size, 1); return 1;
+    case 6: *res = a ^ b; mmio_set_flags(ctx, *res, size, 0);           return 1;
+    default: return 0;
+    }
+}
+
 /* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
 static inline int mmio_emulate(mmio_ctx_t ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
@@ -198,6 +244,63 @@ static inline int mmio_emulate(mmio_ctx_t ctx, uint32_t off, void *dev,
         wr(dev, off, rd(dev, off, size) & *mmio_ctx_reg(ctx, reg), size);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
+
+    /* ALU r, r/m: the register is the destination and the register read is
+     * the source -- the shape a compiler makes of `x & *reg` or `x - *reg`
+     * when it folds the load into the operation. GCC does; MSVC tended not
+     * to, which is why these first turned up on Linux. Only the 16/32/64-bit
+     * forms: an 8-bit register operand without REX can name AH..BH. */
+    case 0x03: case 0x0B: case 0x23: case 0x2B: case 0x33: case 0x3B: {
+        uint64_t m, r, res;
+        int n = (op[0] >> 3) & 7;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        m    = rd(dev, off, size);
+        r    = *mmio_ctx_reg(ctx, reg);
+        if (!mmio_alu(ctx, n, r, m, size, &res))
+            return 0;
+        if (n != 7)                                  /* CMP keeps the register */
+            mmio_put_reg(ctx, reg, res, size);
+        ctx->Rip += prefix + 1 + mlen;
+        return 1;
+    }
+
+    /* Group 1, r/m op imm: the register is the destination. CMP only reads. */
+    case 0x80: case 0x81: case 0x83: {
+        uint64_t m, imm, res;
+        int n = (op[1] >> 3) & 7, ilen;
+        if (op[0] == 0x80) size = 1;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        if (op[0] == 0x81 && size == 2) {
+            imm = *(const uint16_t *)(op + 1 + mlen); ilen = 2;
+        } else if (op[0] == 0x81) {
+            imm = (uint64_t)(int64_t)*(const int32_t *)(op + 1 + mlen); ilen = 4;
+        } else {
+            imm = (uint64_t)(int64_t)(int8_t)op[1 + mlen]; ilen = 1;
+        }
+        m = rd(dev, off, size);
+        if (!mmio_alu(ctx, n, m, imm, size, &res))
+            return 0;
+        if (n != 7)
+            wr(dev, off, res, size);
+        ctx->Rip += prefix + 1 + mlen + ilen;
+        return 1;
+    }
+
+    case 0xF6: case 0xF7: {                          /* TEST r/m, imm        */
+        uint64_t imm;
+        int ilen;
+        if (((op[1] >> 3) & 7) != 0)                 /* NOT/NEG/MUL/DIV      */
+            return 0;
+        if (op[0] == 0xF6) size = 1;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        if (size == 1)      { imm = op[1 + mlen]; ilen = 1; }
+        else if (size == 2) { imm = *(const uint16_t *)(op + 1 + mlen); ilen = 2; }
+        else { imm = (uint64_t)(int64_t)*(const int32_t *)(op + 1 + mlen); ilen = 4; }
+        mmio_set_flags(ctx, rd(dev, off, size) & imm, size, 0);
+        ctx->Rip += prefix + 1 + mlen + ilen;
+        return 1;
+    }
 
     case 0x0F:
         if (op[1] == 0xB6 || op[1] == 0xB7) {        /* MOVZX r32, r/m8|16   */
