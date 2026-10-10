@@ -67,6 +67,16 @@ void d3d8_vk_set_host(const D3D8VkHost *host)
         s_host = *host;
 }
 
+static D3D8VkOverlay s_overlay;
+static int            s_have_overlay;
+
+void d3d8_vk_set_overlay(const D3D8VkOverlay *overlay)
+{
+    s_have_overlay = overlay != NULL && overlay->active && overlay->draw;
+    if (overlay)
+        s_overlay = *overlay;
+}
+
 static unsigned s_render_scale = 1;
 static int      s_scaling, s_keep_aspect = 1, s_linear = 1, s_vsync;
 static unsigned s_aspect_num = 4, s_aspect_den = 3;
@@ -182,6 +192,13 @@ static struct {
     VkImage          swap_img[8];
     uint32_t         swap_n;
     VkExtent2D       swap_ext;
+    VkFormat         swap_fmt;
+    /* The overlay's pass and, per swap-chain image, what it draws into. */
+    VkRenderPass     ov_pass;
+    VkFormat         ov_fmt;
+    uint32_t         ov_gen;
+    VkImageView      ov_view[8];
+    VkFramebuffer    ov_fb[8];
 
     uint32_t lw, lh, scale, tw, th;         /* title size, scale, target size */
     VkFormat       depth_fmt;
@@ -1905,12 +1922,229 @@ static void trace_pacing(void)
     }
 }
 
+/* ── The host's overlay ────────────────────────────────────────────────── */
+
+/* What the overlay draws into, per swap-chain image. Called with the device
+ * idle (swapchain_make), so nothing here is still in use. The pass outlives a
+ * rebuild that keeps the format (overlay_format). */
+static void overlay_release(void)
+{
+    unsigned i;
+    for (i = 0; i < 8; i++) {
+        if (vk.ov_fb[i])   vkDestroyFramebuffer(vk.dev, vk.ov_fb[i], NULL);
+        if (vk.ov_view[i]) vkDestroyImageView(vk.dev, vk.ov_view[i], NULL);
+        vk.ov_fb[i] = VK_NULL_HANDLE;
+        vk.ov_view[i] = VK_NULL_HANDLE;
+    }
+}
+
+static void overlay_format(VkFormat format)
+{
+    if (vk.ov_pass && vk.ov_fmt != format) {
+        vkDestroyRenderPass(vk.dev, vk.ov_pass, NULL);
+        vk.ov_pass = VK_NULL_HANDLE;
+    }
+}
+
+/* The pass and the framebuffer for this image, made the first time they are
+ * wanted. Returns 0 when they cannot be made (the frame goes without). */
+static int overlay_prepare(uint32_t image)
+{
+    VkAttachmentDescription att;
+    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub;
+    VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    VkFramebufferCreateInfo fbci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+
+    if (!vk.ov_pass) {
+        memset(&att, 0, sizeof att);
+        att.format = vk.swap_fmt;
+        att.samples = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        memset(&sub, 0, sizeof sub);
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &ref;
+        rpci.attachmentCount = 1;
+        rpci.pAttachments = &att;
+        rpci.subpassCount = 1;
+        rpci.pSubpasses = &sub;
+        if (vkCreateRenderPass(vk.dev, &rpci, NULL, &vk.ov_pass) != VK_SUCCESS) {
+            vk.ov_pass = VK_NULL_HANDLE;
+            LOG("the overlay's render pass could not be made; the window shows the picture alone");
+            return 0;
+        }
+        vk.ov_fmt = vk.swap_fmt;
+        vk.ov_gen++;
+    }
+    if (vk.ov_fb[image])
+        return 1;
+    vi.image = vk.swap_img[image];
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = vk.swap_fmt;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(vk.dev, &vi, NULL, &vk.ov_view[image]) != VK_SUCCESS) {
+        vk.ov_view[image] = VK_NULL_HANDLE;
+        return 0;
+    }
+    fbci.renderPass = vk.ov_pass;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &vk.ov_view[image];
+    fbci.width = vk.swap_ext.width;
+    fbci.height = vk.swap_ext.height;
+    fbci.layers = 1;
+    if (vkCreateFramebuffer(vk.dev, &fbci, NULL, &vk.ov_fb[image]) != VK_SUCCESS) {
+        vk.ov_fb[image] = VK_NULL_HANDLE;
+        return 0;
+    }
+    return 1;
+}
+
+/* Draw the host's overlay on the window's image, which is in transfer-destination
+ * layout, and leave it ready to present. Returns 0 (image untouched) when there
+ * is nothing to draw. */
+static int overlay_draw(uint32_t image)
+{
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    D3D8VkOverlayFrame f;
+
+    if (!s_have_overlay || !s_overlay.active(s_overlay.user) || !overlay_prepare(image))
+        return 0;
+    image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    rp.renderPass = vk.ov_pass;
+    rp.framebuffer = vk.ov_fb[image];
+    rp.renderArea.extent = vk.swap_ext;
+    vkCmdBeginRenderPass(vk.cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    memset(&f, 0, sizeof f);
+    f.instance = vk.inst;
+    f.physical_device = vk.phys;
+    f.device = vk.dev;
+    f.queue = vk.queue;
+    f.queue_family = vk.qfam;
+    f.command_buffer = vk.cmd;
+    f.render_pass = vk.ov_pass;
+    f.image_count = vk.swap_n;
+    f.width = vk.swap_ext.width;
+    f.height = vk.swap_ext.height;
+    f.format = (int)vk.swap_fmt;
+    f.generation = vk.ov_gen;
+    s_overlay.draw(&f, s_overlay.user);
+    vkCmdEndRenderPass(vk.cmd);            /* leaves the image presentable */
+    return 1;
+}
+
+/* RECOMP_WINDOW_SHOT=<file.bmp>: write what the window shows, overlay and all,
+ * once, after the overlay has been drawn RECOMP_WINDOW_SHOT_FRAME times (20). For checking a menu on a
+ * machine where nobody can take a screenshot. Returns 1 when this frame's
+ * commands carry the copy. */
+static Ring     s_shot_ring;
+static int      s_shot_pending, s_shot_done;
+static unsigned s_shot_frames;
+
+static int shot_record(uint32_t image)
+{
+    static const char *path;
+    static int looked, after = 20;
+    VkBufferImageCopy c;
+    VkDeviceSize bytes = (VkDeviceSize)vk.swap_ext.width * vk.swap_ext.height * 4;
+
+    if (!looked) {
+        looked = 1;
+        path = getenv("RECOMP_WINDOW_SHOT");
+        if (path && !*path)
+            path = NULL;
+        if (getenv("RECOMP_WINDOW_SHOT_FRAME") && atoi(getenv("RECOMP_WINDOW_SHOT_FRAME")) > 0)
+            after = atoi(getenv("RECOMP_WINDOW_SHOT_FRAME"));
+    }
+    if (!path || s_shot_done || (int)++s_shot_frames < after)
+        return 0;
+    if (s_shot_ring.size < bytes) {
+        if (s_shot_ring.buf) {
+            vkDestroyBuffer(vk.dev, s_shot_ring.buf, NULL);
+            vkFreeMemory(vk.dev, s_shot_ring.mem, NULL);
+        }
+        if (!ring_make(&s_shot_ring, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            s_shot_done = 1;
+            return 0;
+        }
+    }
+    image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    memset(&c, 0, sizeof c);
+    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    c.imageSubresource.layerCount = 1;
+    c.imageExtent.width = vk.swap_ext.width;
+    c.imageExtent.height = vk.swap_ext.height;
+    c.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(vk.cmd, vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           s_shot_ring.buf, 1, &c);
+    image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    s_shot_pending = 1;
+    return 1;
+}
+
+/* After the frame has finished: the copy is in the buffer. A 32-bit BMP,
+ * top-down, which every image tool reads. */
+static void shot_write(void)
+{
+    const char *path = getenv("RECOMP_WINDOW_SHOT");
+    uint32_t w = vk.swap_ext.width, h = vk.swap_ext.height, x, y;
+    uint32_t pixel_bytes = w * h * 4, head[13];
+    uint8_t magic[2] = { 'B', 'M' };
+    int swap = vk.swap_fmt == VK_FORMAT_R8G8B8A8_UNORM;
+    FILE *f;
+
+    s_shot_pending = 0;
+    s_shot_done = 1;
+    f = path ? fopen(path, "wb") : NULL;
+    if (!f) {
+        LOG("RECOMP_WINDOW_SHOT: cannot write %s", path ? path : "(nothing)");
+        return;
+    }
+    head[0] = 14 + 40 + pixel_bytes;            /* file size */
+    head[1] = 0;
+    head[2] = 14 + 40;                          /* pixel data offset */
+    head[3] = 40;                               /* BITMAPINFOHEADER */
+    head[4] = w;
+    head[5] = (uint32_t)-(int32_t)h;            /* negative: top-down */
+    head[6] = 1 | (32u << 16);                  /* planes, bits per pixel */
+    head[7] = 0;                                /* BI_RGB */
+    head[8] = pixel_bytes;
+    head[9] = head[10] = 2835;
+    head[11] = head[12] = 0;
+    fwrite(magic, 1, 2, f);
+    fwrite(head, 4, 13, f);
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = s_shot_ring.map + (size_t)y * w * 4;
+        if (!swap) {
+            fwrite(row, 4, w, f);
+        } else {
+            for (x = 0; x < w; x++) {
+                uint8_t px[4] = { row[x * 4 + 2], row[x * 4 + 1], row[x * 4], row[x * 4 + 3] };
+                fwrite(px, 1, 4, f);
+            }
+        }
+    }
+    fclose(f);
+    LOG("window picture written to %s (%ux%u)", path, w, h);
+}
+
 static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const RECT *dst,
                                      HWND wnd, void *dirty)
 {
     uint32_t image = 0;
     VkResult r;
-    int have = 0;
+    int have = 0, shot = 0;
 
     (void)s; (void)src; (void)dst; (void)wnd; (void)dirty;
     if (!vk.ready)
@@ -1978,13 +2212,18 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        s_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-        image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        if (overlay_draw(image))
+            shot = shot_record(image);
+        else
+            image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         if (!ramped)
             image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
     frame_submit_wait(have ? vk.acquired : VK_NULL_HANDLE);
+    if (shot && s_shot_pending)
+        shot_write();
     if (have) {
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         pi.swapchainCount = 1;
@@ -2333,6 +2572,7 @@ static void swapchain_make(void)
     if (!vk.surface)
         return;
     VKC(vkDeviceWaitIdle(vk.dev));
+    overlay_release();
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.phys, vk.surface, &caps) != VK_SUCCESS)
         return;
     vkGetPhysicalDeviceSurfaceFormatsKHR(vk.phys, vk.surface, &nf, fmts);
@@ -2349,6 +2589,7 @@ static void swapchain_make(void)
             break;
         }
     }
+    overlay_format(ci.imageFormat);
     ci.imageExtent = caps.currentExtent;
     if (caps.currentExtent.width == 0xFFFFFFFFu) {
         if (s_have_host && s_host.drawable_size)
@@ -2363,6 +2604,8 @@ static void swapchain_make(void)
         ci.minImageCount = caps.maxImageCount;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (getenv("RECOMP_WINDOW_SHOT") && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2384,6 +2627,7 @@ static void swapchain_make(void)
         vk.swap_n = 8;
         vkGetSwapchainImagesKHR(vk.dev, vk.swap, &vk.swap_n, vk.swap_img);
         vk.swap_ext = ci.imageExtent;
+        vk.swap_fmt = ci.imageFormat;
         LOG("swap chain %ux%u, %u images, present mode %d", ci.imageExtent.width,
             ci.imageExtent.height, vk.swap_n, (int)ci.presentMode);
     }

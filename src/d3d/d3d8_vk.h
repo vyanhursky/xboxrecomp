@@ -34,6 +34,44 @@ typedef struct D3D8VkHost {
 
 void d3d8_vk_set_host(const D3D8VkHost *host);
 
+/* A host program's drawing on top of the picture, in window pixels, after the
+ * title's target has been scaled into the window: a menu, an on-screen display.
+ * The Vulkan counterpart of d3d8_present_set_overlay.
+ *
+ * Each frame the backend asks `active`; when it says yes, the backend begins a
+ * render pass on the window's image (colour attachment, the picture already in
+ * it, kept), calls `draw` on the thread that presents with the frame's command
+ * buffer recording inside that pass, and ends it. `draw` records draw commands
+ * and nothing else it must not submit that buffer. Handles are Vulkan's, as
+ * plain pointers so this header does not need vulkan.h.
+ *
+ * `generation` changes whenever `render_pass` or the image count was replaced
+ * (a swap chain with another format); a host that built pipelines against the
+ * pass makes them again. The picture a harness captures is the title's target,
+ * so nothing drawn here is ever in a capture. */
+typedef struct D3D8VkOverlayFrame {
+    void    *instance;          /* VkInstance */
+    void    *physical_device;   /* VkPhysicalDevice */
+    void    *device;            /* VkDevice */
+    void    *queue;             /* VkQueue, the one that submits the frame */
+    uint32_t queue_family;
+    void    *command_buffer;    /* VkCommandBuffer, inside the pass */
+    void    *render_pass;       /* VkRenderPass the draw is compatible with */
+    uint32_t image_count;       /* swap chain images */
+    uint32_t width, height;     /* window pixels */
+    int      format;            /* VkFormat of the window's image */
+    uint32_t generation;
+} D3D8VkOverlayFrame;
+
+typedef struct D3D8VkOverlay {
+    int  (*active)(void *user);
+    void (*draw)(const D3D8VkOverlayFrame *frame, void *user);
+    void *user;
+} D3D8VkOverlay;
+
+/* NULL removes it. Safe to call before the device exists. */
+void d3d8_vk_set_overlay(const D3D8VkOverlay *overlay);
+
 #ifdef __cplusplus
 }
 #endif
