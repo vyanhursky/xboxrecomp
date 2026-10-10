@@ -32,6 +32,29 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 
 static int failures;
+static int case_sensitive = 1;      /* set in main: macOS volumes usually are not */
+
+/* Same file, or for one not created yet, the same directory and name. On a
+ * case-insensitive volume the title's own spelling already names the file, so
+ * the translator rightly leaves it; there only the identity is checked. */
+static int same_target(const char *got, const char *want)
+{
+    struct stat a, b;
+    char gd[640], wd[640];
+    const char *gs, *ws;
+
+    if (stat(want, &b) == 0)
+        return stat(got, &a) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+    gs = strrchr(got, '/');
+    ws = strrchr(want, '/');
+    if (!gs || !ws || strcmp(gs, ws) != 0)
+        return 0;
+    snprintf(gd, sizeof gd, "%.*s", (int)(gs - got), got);
+    snprintf(wd, sizeof wd, "%.*s", (int)(ws - want), want);
+    if (stat(wd, &b) != 0)
+        return strcmp(gd, wd) == 0;
+    return stat(gd, &a) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
 
 static void touch(const char *path)
 {
@@ -45,7 +68,7 @@ static void expect(const char *xbox, const char *want)
     if (!xbox_translate_path(xbox, got, sizeof got)) {
         printf("FAIL: %s did not translate\n", xbox);
         failures++;
-    } else if (strcmp(got, want) != 0) {
+    } else if (case_sensitive ? strcmp(got, want) != 0 : !same_target(got, want)) {
         printf("FAIL: %s\n  got  %s\n  want %s\n", xbox, got, want);
         failures++;
     }
@@ -74,6 +97,12 @@ int main(void)
     snprintf(p, sizeof p, "%s/Assets/Tint.XSH", game); touch(p);
 
     xbox_path_init(game, save);
+    {
+        struct stat st;
+        snprintf(p, sizeof p, "%s/GCONFIG.XML", game);
+        case_sensitive = stat(p, &st) != 0;
+        printf("kernel_path_posix: %s file system\n", case_sensitive ? "case-sensitive" : "case-insensitive");
+    }
 
     /* 1. Existing files and directories, whatever case was asked for. */
     snprintf(want, sizeof want, "%s/gconfig.xml", game);
