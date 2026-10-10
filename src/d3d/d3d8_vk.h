@@ -30,6 +30,9 @@ typedef struct D3D8VkHost {
     /* The window's size in pixels, asked whenever the swap chain is built. */
     void (*drawable_size)(int *width, int *height, void *user);
     void *user;
+    /* The refresh rate of the display the window is on, in whole Hz (0 when
+     * unknown), asked whenever the swap chain is built. Optional. */
+    unsigned (*refresh_hz)(void *user);
 } D3D8VkHost;
 
 void d3d8_vk_set_host(const D3D8VkHost *host);
