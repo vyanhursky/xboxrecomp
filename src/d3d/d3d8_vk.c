@@ -2302,14 +2302,28 @@ static void swapchain_make(void)
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     /* The title's own timer paces frames, so the display should not as well
-     * unless asked: waiting on both halves the frame rate when they beat. */
+     * unless asked: waiting on both halves the frame rate when they beat.
+     * Asked, it still only does on a display refreshing at a multiple of 60
+     * -- the Direct3D 11 backend's rule (d3d8_present_interval_for). The
+     * Steam Deck OLED's panel runs at 90 Hz and FIFO there held the title to
+     * about 40 frames a second. An unknown rate (0) does not sync either, as
+     * on Windows: SDL's X11 driver under Xwayland reports none. */
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    if (!s_vsync)
-        for (i = 0; i < nm; i++)
-            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR || modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
-                ci.presentMode = modes[i];
-                break;
-            }
+    {
+        unsigned hz = (s_have_host && s_host.refresh_hz) ? s_host.refresh_hz(s_host.user) : 0;
+        unsigned k = (hz + 30) / 60, nearest = k * 60;
+        unsigned off = hz > nearest ? hz - nearest : nearest - hz;
+        int sync = s_vsync && k >= 1 && k <= 4 && off <= 1;
+        static unsigned told;
+        if (s_vsync && !sync && told++ < 4)
+            LOG("display refreshes at %u Hz, not a multiple of 60: vsync not used", hz);
+        if (!sync)
+            for (i = 0; i < nm; i++)
+                if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR || modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+                    ci.presentMode = modes[i];
+                    break;
+                }
+    }
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = old;
     if (vkCreateSwapchainKHR(vk.dev, &ci, NULL, &vk.swap) != VK_SUCCESS) {
