@@ -1185,3 +1185,9 @@ static int sha_finish(Sha *sha,uint8_t out[32])
 static void host_init(void) {}
 static void host_shutdown(void) {}
 #endif
+
+void texture_pack_stats(uint64_t *resident_bytes, uint64_t *budget_bytes)
+{
+    if (resident_bytes) *resident_bytes = texture_pack_active() ? g_resident : 0;
+    if (budget_bytes) *budget_bytes = texture_pack_active() ? g_budget : 0;
+}

@@ -17,4 +17,6 @@ int texture_pack_hash(const RecompTextureSource *source, char out[65]);
 int texture_pack_bind(IDirect3DDevice8 *device, unsigned stage,
                       const RecompTextureSource *source, RecompTextureSample sample, void *user);
 void texture_pack_shutdown(IDirect3DDevice8 *device);
+/* Replacements resident now and the budget they share (cache_mb), in bytes; 0 without a pack. */
+void texture_pack_stats(uint64_t *resident_bytes, uint64_t *budget_bytes);
 #endif

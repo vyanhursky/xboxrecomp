@@ -8,6 +8,7 @@ if(WIN32)
         d3d8_formats.c
         d3d8_gamma.c
         d3d8_present.c
+        d3d8_readback.c
         d3d8_resources.c
         d3d8_shaders.c
         d3d8_states.c

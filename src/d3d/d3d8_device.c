@@ -17,6 +17,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_present.h"
+#include "d3d8_readback.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -508,6 +509,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     if (ref <= 0) {
         /* Cleanup subsystems first */
         up_ring_shutdown();
+        d3d8_readback_reset();
         d3d8_gamma_shutdown();
         d3d8_present_shutdown();
         d3d8_vsh_shutdown();

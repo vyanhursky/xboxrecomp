@@ -145,6 +145,14 @@ typedef struct {
     uint32_t methods_handled;
     uint32_t methods_ignored;
     uint32_t clears;
+    /* The texture cache (appended; earlier fields unchanged). Running totals: textures
+     * uploaded, new or changed in place, their bytes, and evictions from a full cache.
+     * Now: the entries the cache holds and their bytes. */
+    uint32_t textures_uploaded;
+    uint32_t texture_evictions;
+    uint64_t texture_upload_bytes;
+    uint32_t textures_cached;
+    uint64_t texture_cache_bytes;
 } PgraphD3D11Stats;
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);

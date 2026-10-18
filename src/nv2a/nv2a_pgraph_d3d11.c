@@ -824,6 +824,7 @@ static struct {
     uint64_t sig;
     ULONGLONG checked_ms;
     ULONGLONG used_ms;                  /* last bound, for eviction */
+    uint32_t bytes;                     /* the level's size, for the cache's statistics */
 } s_ready_tex[READY_TEX_CACHE];
 static int s_ready_tex_count;
 
@@ -988,6 +989,8 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
                     && ready_tex_fill(tex, data, width, height, nv2a_format)) {
                 static uint32_t refreshed;
                 s_ready_tex[i].sig = sig;
+                g_pg.stats.textures_uploaded++;
+                g_pg.stats.texture_upload_bytes += bytes;
                 if (refreshed++ < 4 || refreshed % 1000 == 0)
                     fprintf(stderr, "[PGRAPH-D3D11] texture 0x%08X %ux%u fmt 0x%02X"
                                     " changed in place; uploaded again (#%u)\n",
@@ -1033,8 +1036,12 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
                     }
                 }
             }
-            if (s_ready_tex[slot].tex)
+            if (s_ready_tex[slot].tex) {
                 s_ready_tex[slot].tex->lpVtbl->Release(s_ready_tex[slot].tex);
+                g_pg.stats.texture_evictions++;
+                g_pg.stats.textures_cached--;
+                g_pg.stats.texture_cache_bytes -= s_ready_tex[slot].bytes;
+            }
             s_ready_tex[slot].tex = NULL;
             {
                 static unsigned evicted;
@@ -1061,6 +1068,11 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
         s_ready_tex[slot].sig    = ready_tex_sig(data, bytes);
         s_ready_tex[slot].checked_ms = GetTickCount64();
         s_ready_tex[slot].used_ms = s_ready_tex[slot].checked_ms;
+        s_ready_tex[slot].bytes  = bytes;
+        g_pg.stats.textures_uploaded++;
+        g_pg.stats.texture_upload_bytes += bytes;
+        g_pg.stats.textures_cached++;
+        g_pg.stats.texture_cache_bytes += bytes;
         if (slot == s_ready_tex_count)
             s_ready_tex_count++;
         /* Which of the three shapes it took, because "uploaded" on its own
