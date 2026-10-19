@@ -567,8 +567,14 @@ void xbox_PinToGuestCore(void)
     }
     while (init != 2)
         YieldProcessor();
-    if (!spread)
+    if (!spread) {
+        extern volatile uint32_t g_icall_trace[16];
+        extern volatile uint32_t g_icall_trace_idx;
         guest_turn_join();
+        /* What a hitch probe reports about this thread (win32_compat.c). */
+        guest_turn_note_caller(&g_xbox_kernel_caller);
+        guest_turn_note_icall_ring(g_icall_trace, &g_icall_trace_idx);
+    }
 #endif
 }
 
@@ -579,6 +585,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
     xbox_PinToGuestCore();
+#if !defined(_WIN32)
+    guest_turn_note_start((const void *)fn, ctx1);
+#endif
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -2816,6 +2825,15 @@ int kernel_nv2a_swm_busy(void)
         fifo_used = 1;
     return g_swm_head != g_swm_tail || nv2a_rd(NV2A_PGRAPH_INTR) != 0
         || g_gpu_servicing || (fifo_used && !(fifo & 1u));
+}
+
+/* For the hitch probe (xbox_nv2a_probe_json). */
+void kernel_nv2a_swm_state(int *queued, uint32_t *intr, int *servicing, uint32_t *fifo)
+{
+    *queued = (int)(g_swm_head - g_swm_tail);
+    *intr = nv2a_rd(NV2A_PGRAPH_INTR);
+    *servicing = (int)g_gpu_servicing;
+    *fifo = nv2a_rd(0x00400720u);              /* NV_PGRAPH_FIFO */
 }
 
 /* Raise the GPU interrupt if the line is up. Returns 1 if it did.

@@ -75,6 +75,13 @@ typedef struct D3D8VkOverlay {
 /* NULL removes it. Safe to call before the device exists. */
 void d3d8_vk_set_overlay(const D3D8VkOverlay *overlay);
 
+/* A folder to keep compiled shaders and the driver's pipeline cache in between
+ * runs (d3d8_vk_cache.h), made if missing. Without one, or with NULL or "",
+ * every run compiles its shaders afresh, as before. Call before the device is
+ * created. RECOMP_SHADER_CACHE, when set, overrides it: a folder, or 0 / off
+ * for none. */
+void d3d8_vk_set_cache_dir(const char *dir);
+
 #ifdef __cplusplus
 }
 #endif

@@ -21,6 +21,9 @@
  * The shaders are the ones the Direct3D 11 backend uses: the same HLSL text,
  * from the same generators, compiled to SPIR-V at run time by shaderc. So a
  * change to how a combiner or a vertex program is translated is made once.
+ * With a cache folder set (d3d8_vk_set_cache_dir), the SPIR-V and the driver's
+ * pipeline cache are kept there between runs (d3d8_vk_cache.h), so a shader
+ * met in an earlier run is not compiled again.
  *
  * The picture is drawn into an off-screen target `render scale` times the
  * title's 640x480 and copied to the window at present, scaled and letterboxed.
@@ -35,6 +38,7 @@
 #include "d3d8_vk.h"
 #include "d3d8_present.h"  /* d3d8_canvas_width */
 #include "d3d8_readback.h"
+#include "d3d8_vk_cache.h"
 #include "win32_compat.h"   /* GetTickCount64 */
 
 #include <vulkan/vulkan.h>
@@ -78,6 +82,19 @@ void d3d8_vk_set_overlay(const D3D8VkOverlay *overlay)
     if (overlay)
         s_overlay = *overlay;
 }
+
+/* The shader cache's folder (d3d8_vk.h). RECOMP_SHADER_CACHE overrides it: a
+ * folder, or 0 / off for none. */
+static char s_cache_dir[1024];
+void d3d8_vk_set_cache_dir(const char *dir)
+{
+    snprintf(s_cache_dir, sizeof s_cache_dir, "%s", dir ? dir : "");
+}
+
+/* Bump when the SPIR-V for the same HLSL text would change: the shaderc
+ * options in resources_make, the binding bases, the entry point. The text
+ * itself (the translators' output) is in the key already. */
+#define SHADER_CACHE_VERSION 1u
 
 static unsigned s_render_scale = 1;
 static int      s_scaling, s_keep_aspect = 1, s_linear = 1, s_vsync;
@@ -186,6 +203,10 @@ typedef struct { uint32_t hash, used; int points, failed; uint32_t shader; uint6
 typedef struct { int used; NV2ACombinerState st; uint32_t shader; } CombEntry;
 #define COMB_SLOTS 256
 #define MAX_SHADERS 1024
+/* Each HLSL text made into a module this run, by two hashes of it and its
+ * stage: the same text gets the same module. Twice MAX_SHADERS, never full. */
+typedef struct { uint64_t key, check; uint32_t id; } ShaderSeen;
+#define SEEN_SLOTS (2 * MAX_SHADERS)
 
 static struct {
     int ready;
@@ -250,8 +271,18 @@ static struct {
 
     shaderc_compiler_t        sc;
     shaderc_compile_options_t sc_opts;
+    VkPipelineCache pcache;
+    VkcDevice       pcache_dev;
+    uint32_t        pcache_new;     /* pipelines made since the cache was last written */
+    uint64_t        pcache_hash;    /* of the data last read or written: unchanged is not written */
+    ULONGLONG       pcache_last_new;
+    /* What shaders and pipelines cost: counts and microseconds. */
+    uint32_t spv_hits, spv_misses, spv_reused, pipes_made;
+    uint64_t spv_load_us, spv_compile_us, pipes_us;
+    uint32_t perf_printed;
     VkShaderModule shaders[MAX_SHADERS];
     uint32_t       shader_n;
+    ShaderSeen     seen[SEEN_SLOTS];
     uint32_t       vs_fixed, ps_tex, ps_notex;
 
     PipeEntry pipes[PIPE_SLOTS];
@@ -645,16 +676,70 @@ static const char s_ps_notex[] =
     "    float4 result = input.color0;\n"
     PS_FIXED_TAIL;
 
-/* Compile HLSL to a shader module. Returns its id (1-based), 0 on failure. */
+static uint64_t usec_now(void)
+{
+    LARGE_INTEGER q, f;
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    return (uint64_t)((double)q.QuadPart * 1e6 / (double)f.QuadPart);
+}
+
+/* The module already made from this text this run, or the slot to note it in.
+ * Different programs (a vertex program's hash, a combiner state) often
+ * translate to the same text; they share one module, and so their pipelines. */
+static ShaderSeen *shader_seen(const char *hlsl, size_t len, int vertex)
+{
+    uint8_t st = (uint8_t)(vertex ? 1 : 0);
+    uint64_t key = vkc_hash64(hlsl, len, vkc_hash64(&st, 1, VKC_HASH_SEED));
+    uint64_t check = vkc_hash64(hlsl, len, 0x9e3779b97f4a7c15ull ^ st);
+    uint32_t i;
+
+    for (i = 0; i < SEEN_SLOTS; i++) {
+        ShaderSeen *e = &vk.seen[(key + i) % SEEN_SLOTS];
+        if (!e->id) {
+            e->key = key;
+            e->check = check;
+            return e;
+        }
+        if (e->key == key && e->check == check)
+            return e;
+    }
+    return NULL;
+}
+
+/* Compile HLSL to a shader module, or take the SPIR-V an earlier run made from
+ * the same text. Returns its id (1-based), 0 on failure. */
 static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
 {
     shaderc_compilation_result_t res;
     VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    uint32_t id = 0;
+    uint32_t id = 0, *cached;
+    size_t len = strlen(hlsl), bytes;
+    uint64_t t0 = usec_now();
+    ShaderSeen *seen = shader_seen(hlsl, len, vertex);
 
+    if (seen && seen->id) {
+        vk.spv_reused++;
+        return seen->id;
+    }
     if (vk.shader_n >= MAX_SHADERS)
         return 0;
-    res = shaderc_compile_into_spv(vk.sc, hlsl, strlen(hlsl),
+    cached = vkc_spirv_load(hlsl, len, vertex, &bytes);
+    if (cached) {
+        ci.codeSize = bytes;
+        ci.pCode = cached;
+        if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS)
+            id = ++vk.shader_n;
+        free(cached);
+        if (id) {
+            vk.spv_hits++;
+            vk.spv_load_us += usec_now() - t0;
+            if (seen)
+                seen->id = id;
+            return id;
+        }
+    }
+    res = shaderc_compile_into_spv(vk.sc, hlsl, len,
                                    vertex ? shaderc_vertex_shader : shaderc_fragment_shader,
                                    name, "main", vk.sc_opts);
     if (shaderc_result_get_compilation_status(res) != shaderc_compilation_status_success) {
@@ -664,10 +749,16 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
     } else {
         ci.codeSize = shaderc_result_get_length(res);
         ci.pCode = (const uint32_t *)shaderc_result_get_bytes(res);
-        if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS)
+        if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS) {
             id = ++vk.shader_n;
+            vkc_spirv_store(hlsl, len, vertex, ci.pCode, ci.codeSize);
+            if (seen)
+                seen->id = id;
+        }
     }
     shaderc_result_release(res);
+    vk.spv_misses++;
+    vk.spv_compile_us += usec_now() - t0;
     return id;
 }
 
@@ -809,6 +900,7 @@ static VkPipeline pipeline_make(const PipeKey *k)
     };
     VkPipeline pipe = VK_NULL_HANDLE;
     uint32_t n = 0, a;
+    uint64_t t0;
 
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -887,12 +979,17 @@ static VkPipeline pipeline_make(const PipeKey *k)
     ci.pDynamicState = &dy;
     ci.layout = vk.pl;
     ci.renderPass = vk.pass;
-    if (vkCreateGraphicsPipelines(vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe) != VK_SUCCESS) {
+    t0 = usec_now();
+    if (vkCreateGraphicsPipelines(vk.dev, vk.pcache, 1, &ci, NULL, &pipe) != VK_SUCCESS) {
         static int told;
         if (told++ < 6)
             LOG("pipeline creation failed (vs %u ps %u)", k->vs, k->ps);
         return VK_NULL_HANDLE;
     }
+    vk.pipes_us += usec_now() - t0;
+    vk.pipes_made++;
+    vk.pcache_new++;
+    vk.pcache_last_new = GetTickCount64();
     return pipe;
 }
 
@@ -915,6 +1012,116 @@ static VkPipeline pipeline_get(const PipeKey *k)
             return e->pipe;
     }
     return VK_NULL_HANDLE;
+}
+
+/* ── The cache on disk ─────────────────────────────────────────────────── */
+
+/* The folder and seed, and the pipeline cache with what an earlier run saved
+ * in it. With no folder the pipeline cache still exists, for this run only. */
+static void cache_open(void)
+{
+    VkPipelineCacheCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    VkPhysicalDeviceProperties props;
+    const char *env = getenv("RECOMP_SHADER_CACHE");
+    const char *dir = env ? env : s_cache_dir;
+    unsigned spv = 0, rev = 0;
+    uint64_t seed;
+    void *data = NULL;
+    size_t size = 0;
+    static const char tag[] = "d3d8_vk spirv: hlsl, io mapping, offsets, auto locations, "
+                              "b0 t8 s16, performance, main";
+
+    if (!strcmp(dir, "0") || !strcmp(dir, "off"))
+        dir = "";
+    shaderc_get_spv_version(&spv, &rev);
+    seed = vkc_hash64(tag, sizeof tag, VKC_HASH_SEED);
+    seed = vkc_hash64(&spv, sizeof spv, vkc_hash64(&rev, sizeof rev, seed));
+    seed ^= SHADER_CACHE_VERSION;
+    if (*dir && !vkc_open(dir, seed))
+        LOG("the shader cache folder %s cannot be used; shaders are compiled every run", dir);
+
+    vkGetPhysicalDeviceProperties(vk.phys, &props);
+    memset(&vk.pcache_dev, 0, sizeof vk.pcache_dev);
+    vk.pcache_dev.vendor_id = props.vendorID;
+    vk.pcache_dev.device_id = props.deviceID;
+    vk.pcache_dev.driver_version = props.driverVersion;
+    memcpy(vk.pcache_dev.uuid, props.pipelineCacheUUID, 16);
+    data = vkc_pipeline_load(&vk.pcache_dev, &size);
+    vk.pcache_hash = data ? vkc_hash64(data, size, VKC_HASH_SEED) : 0;
+    ci.initialDataSize = size;
+    ci.pInitialData = data;
+    if (vkCreatePipelineCache(vk.dev, &ci, NULL, &vk.pcache) != VK_SUCCESS) {
+        ci.initialDataSize = 0;
+        ci.pInitialData = NULL;
+        if (vkCreatePipelineCache(vk.dev, &ci, NULL, &vk.pcache) != VK_SUCCESS)
+            vk.pcache = VK_NULL_HANDLE;
+        size = 0;
+    }
+    free(data);
+    if (vkc_enabled())
+        LOG("shader cache in %s (pipeline cache %s, %zu bytes)", dir,
+            size ? "loaded" : "empty", size);
+}
+
+/* Write the pipeline cache when it has grown. Returns 1 when written. */
+static int cache_save(const char *why)
+{
+    size_t size = 0;
+    void *data;
+    uint64_t t0 = usec_now(), h;
+    int ok = 0;
+
+    if (!vk.pcache || !vk.pcache_new || !vkc_enabled())
+        return 0;
+    vk.pcache_new = 0;
+    if (vkGetPipelineCacheData(vk.dev, vk.pcache, &size, NULL) != VK_SUCCESS || !size)
+        return 0;
+    data = malloc(size);
+    if (!data)
+        return 0;
+    if (vkGetPipelineCacheData(vk.dev, vk.pcache, &size, data) != VK_SUCCESS) {
+        free(data);
+        return 0;
+    }
+    h = vkc_hash64(data, size, VKC_HASH_SEED);
+    if (h == vk.pcache_hash) {
+        free(data);
+        return 0;
+    }
+    ok = vkc_pipeline_store(&vk.pcache_dev, data, size);
+    if (ok)
+        vk.pcache_hash = h;
+    free(data);
+    LOG("pipeline cache %s (%s): %zu bytes in %.1f ms", ok ? "written" : "not written", why, size,
+        (double)(usec_now() - t0) / 1000.0);
+    return ok;
+}
+
+static void cache_save_at_exit(void)
+{
+    if (vk.ready)
+        cache_save("exit");
+}
+
+/* At present: once no pipeline has been made for a few seconds, the ones made
+ * before are written, so a run that is killed keeps them too. */
+static void cache_tick(ULONGLONG now)
+{
+    if (vk.pcache_new && now - vk.pcache_last_new >= 3000)
+        cache_save("idle");
+}
+
+/* The cost of shaders and pipelines so far, when it changed. */
+static void cache_perf_line(void)
+{
+    uint32_t n = vk.spv_hits + vk.spv_misses + vk.spv_reused + vk.pipes_made;
+    if (n == vk.perf_printed)
+        return;
+    vk.perf_printed = n;
+    fprintf(stderr, "  [VKCACHE] shaders: %u from cache (%.1f ms), %u compiled (%.1f ms), %u reused; "
+                    "pipelines: %u made (%.1f ms)\n",
+            vk.spv_hits, (double)vk.spv_load_us / 1000.0, vk.spv_misses,
+            (double)vk.spv_compile_us / 1000.0, vk.spv_reused, vk.pipes_made, (double)vk.pipes_us / 1000.0);
 }
 
 /* ── Texture formats ───────────────────────────────────────────────────── */
@@ -2061,7 +2268,7 @@ static int gamma_make(void)
     ci.pDynamicState = &dy;
     ci.layout = vk.gamma_pl;
     ci.renderPass = vk.gamma_pass;
-    if (vkCreateGraphicsPipelines(vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &vk.gamma_pipe) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(vk.dev, vk.pcache, 1, &ci, NULL, &vk.gamma_pipe) != VK_SUCCESS) {
         vk.gamma_pipe = VK_NULL_HANDLE;
         LOG("the gamma pass could not be built; the window shows the picture without the ramp");
         return 0;
@@ -2401,6 +2608,8 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
                         (double)g_acquire_ticks * 1000.0 / (double)qf.QuadPart / frames,
                         (double)g_present_ticks * 1000.0 / (double)qf.QuadPart / frames);
             g_fence_wait_ticks = g_acquire_ticks = g_present_ticks = 0;
+            cache_perf_line();
+            cache_tick(now);
             fflush(stderr);
             frames = 0;
             last = now;
@@ -3182,6 +3391,7 @@ static int resources_make(void)
     shaderc_compile_options_set_binding_base(vk.sc_opts, shaderc_uniform_kind_texture, 8);
     shaderc_compile_options_set_binding_base(vk.sc_opts, shaderc_uniform_kind_sampler, 16);
     shaderc_compile_options_set_optimization_level(vk.sc_opts, shaderc_optimization_level_performance);
+    cache_open();
     vk.vs_fixed = shader_make(s_vs_fixed, 1, "vs_fixed");
     vk.ps_tex = shader_make(s_ps_tex, 0, "ps_tex");
     vk.ps_notex = shader_make(s_ps_notex, 0, "ps_notex");
@@ -3222,6 +3432,11 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     vk.rs[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
     vk.rs[D3DRS_COLORWRITEENABLE] = 0xF;
     vk.ready = 1;
+    {
+        static int registered;
+        if (!registered++)
+            atexit(cache_save_at_exit);
+    }
     if (vk.surface)
         swapchain_make();
     LOG("ready: %ux%u target (%ux%u at scale %u), depth format %s", vk.tw, vk.th, vk.lw, vk.lh,

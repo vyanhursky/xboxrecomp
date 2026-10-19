@@ -613,6 +613,20 @@ void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks);
 /* The longest a thread that was due to run at once (woken, or time-critical)
  * has waited for the guest CPU since this was last asked. */
 long guest_turn_longest_wait_ms(void);
+/* For guest_turn_probe(): the calling thread's g_xbox_kernel_caller, the guest
+ * routine it runs (host entry and context), and the runtime's ring of recent
+ * indirect-call targets (16 entries, idx the next to write). */
+void guest_turn_note_caller(const volatile uint32_t *slot);
+void guest_turn_note_start(const void *entry, uint32_t ctx);
+void guest_turn_note_icall_ring(const volatile uint32_t *ring, const volatile uint32_t *idx);
+/* A hitch probe: writes the holder of the guest CPU (its state, how long, the
+ * guest call site, recent indirect calls, native stack) to holder and every
+ * thread's native stack to all, each one JSON object; returns the number of
+ * threads seen, 0 where unsupported (only Darwin has the token). Any thread
+ * except a guest one; costs a millisecond or two. */
+int guest_turn_probe(char *holder, size_t holder_size, char *all, size_t all_size);
+/* Something else for every probe to report, under `key`: fn writes one JSON value. */
+void guest_turn_note_extra(const char *key, int (*fn)(char *out, size_t size));
 /* Around host work that may wait and changes nothing the title can see (a log
  * line written while the log is busy): give the guest CPU up, then take it back
  * with what the first returned. */
