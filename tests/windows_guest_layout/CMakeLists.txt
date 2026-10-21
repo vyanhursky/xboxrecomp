@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(windows_guest_layout_test C)
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../../src/platform platform)
+add_executable(windows_guest_layout_test test_main.c)
+target_include_directories(windows_guest_layout_test PRIVATE ../../src/kernel)
+target_link_libraries(windows_guest_layout_test PRIVATE platform)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # win32_compat's floating-point helpers call feclearexcept in libm.
+    target_link_libraries(windows_guest_layout_test PRIVATE m)
+endif()
+enable_testing()
+add_test(NAME windows_guest_layout_test COMMAND windows_guest_layout_test)

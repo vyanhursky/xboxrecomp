@@ -155,6 +155,11 @@ static size_t xbox_TiledApertureSize(void)
     return g_memory_size < max ? g_memory_size : max;
 }
 
+#ifdef _WIN32
+#include "windows_guest_layout.h"
+static XboxWindowsLayout g_windows_layout;
+#endif
+
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
@@ -2574,6 +2579,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * addresses upward until we find a free region.
      */
     {
+#ifdef _WIN32
+        size_t tiled_size = xbox_TiledApertureSize();
+        if (tiled_size > XBOX_CONTIG_SIZE) tiled_size = XBOX_CONTIG_SIZE;
+        g_contig_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+                            PAGE_READWRITE, 0, (DWORD)XBOX_CONTIG_SIZE, NULL);
+        if (!g_contig_mapping ||
+            !xbox_windows_layout_create(&g_windows_layout, g_mapping_handle,
+                                        g_contig_mapping, g_memory_size, tiled_size)) {
+            DWORD error = GetLastError();
+            if (g_contig_mapping) CloseHandle(g_contig_mapping);
+            g_contig_mapping = NULL;
+            CloseHandle(g_mapping_handle);
+            g_mapping_handle = NULL;
+            fprintf(stderr, "xbox_MemoryLayoutInit: could not place the complete "
+                            "Windows guest layout (error %lu); no devices started\n", error);
+            return FALSE;
+        }
+        g_memory_base = g_windows_layout.base;
+        memcpy(g_mirror_views, g_windows_layout.mirrors, sizeof g_mirror_views);
+        g_contig_memory = g_windows_layout.contig;
+        g_tiled_view = g_windows_layout.tiled;
+        g_nv2a_memory = g_windows_layout.nv2a;
+        g_mcpx_memory = g_windows_layout.mcpx;
+        g_flash_memory = g_windows_layout.flash;
+#else
         static const uintptr_t try_bases[] = {
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
@@ -2602,7 +2632,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * touch of the kernel page faults. Larger map sizes push the span
          * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
-#ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
 #if defined(__linux__)
         /* Linux places mappings top-down, so whatever sits just above an
@@ -2633,7 +2662,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 g_span_size = 0;
             }
         }
-#endif
 
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
@@ -2655,6 +2683,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 break;
             }
         }
+#endif
     }
 
     if (!g_memory_base) {
@@ -3104,6 +3133,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Reserved before the kernel page below, which lives inside it.
      */
     {
+#ifndef _WIN32
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
@@ -3119,6 +3149,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE
             );
+#endif
         if (g_contig_memory) {
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
@@ -3149,6 +3180,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * emulating NV2A. Nothing has needed that yet.
      */
     {
+#ifndef _WIN32
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
         g_nv2a_memory = VirtualAlloc(
             (LPVOID)nv2a_native,
@@ -3156,6 +3188,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
+#endif
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
@@ -3194,6 +3227,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * emulating the device.
      */
     {
+#ifndef _WIN32
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
         g_mcpx_memory = VirtualAlloc(
             (LPVOID)mcpx_native,
@@ -3201,6 +3235,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
+#endif
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
             /* AC'97 codec ready.
@@ -3284,6 +3319,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Flash ROM aperture -- see XBOX_FLASH_BASE for why. */
     {
+#ifndef _WIN32
         uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
 
         g_flash_memory = VirtualAlloc(
@@ -3292,6 +3328,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
+#endif
         if (g_flash_memory) {
             fprintf(stderr, "  Flash ROM aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, not a real BIOS image)\n",
@@ -3301,10 +3338,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "(error %lu); a title reading flash will fault\n",
                     XBOX_FLASH_BASE, GetLastError());
         }
-    }
-
-    if (g_nv2a_memory) {
-        xbox_Nv2aAckStart();
     }
 
     /*
@@ -3379,6 +3412,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
 
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+#ifdef _WIN32
+            /* Already placed, or skipped where a hardware aperture wins. */
+            if (g_mirror_views[m]) mirrors_ok++;
+#else
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
@@ -3408,6 +3445,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
                         m + 1, (void *)mirror_base, GetLastError());
             }
+#endif
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
                 mirrors_ok, XBOX_NUM_MIRRORS,
@@ -3457,6 +3495,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
+#ifndef _WIN32
         g_tiled_view = g_contig_mapping
             ? MapViewOfFileEx(
                 g_contig_mapping,
@@ -3465,6 +3504,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 tiled_size,
                 (LPVOID)tiled_native)
             : NULL;
+#endif
         if (g_tiled_view) {
             /* Prove the alias rather than assert it. Everything the title
              * renders goes through this window and is read back through the
@@ -3504,6 +3544,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    if (g_nv2a_memory) xbox_Nv2aAckStart();
     xbox_WatchInit();
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
@@ -3547,16 +3588,24 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_tick_thread);
         g_tick_thread = NULL;
     }
-    if (g_kernel_memory) {
-        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
-        g_kernel_memory = NULL;
-    }
     if (g_nv2a_ack_thread) {
         InterlockedExchange(&g_nv2a_ack_stop, 1);
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
     }
+    /* The normal kernel page is a pointer inside the physical view, not an
+     * independently owned allocation. Stop all writers before releasing it. */
+    if (g_kernel_memory && !g_contig_memory)
+        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
+    g_kernel_memory = NULL;
+#ifdef _WIN32
+    xbox_windows_layout_release(&g_windows_layout);
+    g_memory_base = g_contig_memory = g_tiled_view = NULL;
+    g_nv2a_memory = g_mcpx_memory = g_flash_memory = NULL;
+    g_memory_size = 0;
+    memset(g_mirror_views, 0, sizeof g_mirror_views);
+#else
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
         g_nv2a_memory = NULL;
@@ -3594,6 +3643,12 @@ void xbox_MemoryLayoutShutdown(void)
     if (g_flash_memory) {
         VirtualFree(g_flash_memory, 0, MEM_RELEASE);
         g_flash_memory = NULL;
+    }
+#endif
+    g_mcpx_regs = NULL;
+    if (g_contig_mapping) {
+        CloseHandle(g_contig_mapping);
+        g_contig_mapping = NULL;
     }
 
     /* Close file mapping handle */
