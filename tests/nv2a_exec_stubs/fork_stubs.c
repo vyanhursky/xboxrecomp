@@ -54,6 +54,9 @@ int pgraph_d3d11_replace_texture_ready(uint32_t guest_addr, const void *data, ui
 int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data, uint32_t width,
                                    uint32_t height, uint32_t nv2a_format)
 { (void)guest_addr; (void)data; (void)width; (void)height; (void)nv2a_format; return 0; }
+int pgraph_d3d11_set_texture_ready_mips(uint32_t guest_addr, const void *data, uint32_t width,
+                                        uint32_t height, uint32_t nv2a_format, uint32_t levels)
+{ (void)guest_addr; (void)data; (void)width; (void)height; (void)nv2a_format; (void)levels; return 0; }
 void pgraph_d3d11_set_combiner_state(const Nv2aCombiner *state) { (void)state; }
 void pgraph_d3d11_set_placement(float kx, float bx) { (void)kx; (void)bx; }
 void pgraph_d3d11_set_point_mode(int on, float size) { (void)on; (void)size; }

@@ -243,7 +243,10 @@ static void d3d8_gpu_trace(int phase)
 
 static HRESULT d3d8_present(void)
 {
-    HRESULT hr = d3d8_gamma_begin(g_device_state.default_rtv);
+    /* With MSAA the title's samples are averaged into the single-sample target
+     * first; the gamma pass and the blit work on that. */
+    ID3D11RenderTargetView *target = d3d8_present_resolve(g_device_state.default_rtv);
+    HRESULT hr = d3d8_gamma_begin(target);
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Gamma presentation failed: 0x%08lX\n", hr);
         return hr;
@@ -283,7 +286,7 @@ static HRESULT d3d8_present(void)
         d3d8_present_trace_display(g_device_state.swap_chain);
         d3d8_gpu_trace(0);
     }
-    d3d8_gamma_end(g_device_state.default_rtv);
+    d3d8_gamma_end(target);
     return hr;
 }
 
@@ -557,7 +560,7 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
     depth_desc.MipLevels = 1;
     depth_desc.ArraySize = 1;
     depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    depth_desc.SampleDesc.Count = 1;
+    depth_desc.SampleDesc.Count = d3d8_present_scaling() ? d3d8_present_msaa() : 1;  /* as the target */
     depth_desc.SampleDesc.Quality = 0;
     depth_desc.Usage = D3D11_USAGE_DEFAULT;
     depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -765,6 +768,7 @@ static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuff
 
     if (d3d8_present_scaling() && d3d8_present_game_texture()) {
         /* What the title drew, whatever the window's size. */
+        d3d8_present_resolve(NULL);
         back_buffer = d3d8_present_game_texture();
         ID3D11Texture2D_AddRef(back_buffer);
         hr = S_OK;
