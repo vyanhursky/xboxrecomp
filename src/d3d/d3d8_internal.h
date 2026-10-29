@@ -67,6 +67,11 @@ void d3d8_present_trace_display(void *swap_chain);  /* the same: time on screen 
 void d3d8_present_note_block(double ms);            /* how long the last Present call took */
 HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);
 ID3D11Texture2D *d3d8_present_game_texture(void);
+/* MSAA ([display] msaa): the target's sample count (1: off), and the resolve of
+ * the multisampled target into the game texture. Returns the view to use for
+ * the gamma pass: `drawn` without MSAA, the game texture's own with it. */
+UINT d3d8_present_msaa(void);
+ID3D11RenderTargetView *d3d8_present_resolve(ID3D11RenderTargetView *drawn);
 HRESULT d3d8_present_blit(void);
 void d3d8_present_shutdown(void);
 

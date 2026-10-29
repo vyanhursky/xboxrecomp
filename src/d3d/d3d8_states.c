@@ -256,6 +256,15 @@ static D3D11_TEXTURE_ADDRESS_MODE d3d8_to_d3d11_address(DWORD mode)
     }
 }
 
+/* [display] anisotropy (d3d8_set_texture_anisotropy): 1 off, else 2-16. */
+static volatile LONG g_anisotropy = 1;
+
+void d3d8_set_texture_anisotropy(unsigned max)
+{
+    LONG v = max < 2 ? 1 : max > D3D11_REQ_MAXANISOTROPY ? D3D11_REQ_MAXANISOTROPY : (LONG)max;
+    InterlockedExchange(&g_anisotropy, v);
+}
+
 static D3D11_FILTER d3d8_to_d3d11_filter(DWORD mag, DWORD min, DWORD mip)
 {
     /* Simplified filter mapping */
@@ -304,8 +313,21 @@ void d3d8_states_apply_sampler(DWORD stage)
     sd.AddressV = d3d8_to_d3d11_address(tss[D3DTSS_ADDRESSV] ? tss[D3DTSS_ADDRESSV] : D3DTADDRESS_WRAP);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
     sd.MaxAnisotropy = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
+    /* The player's anisotropic filtering, for a texture the title minifies
+     * linearly; a nearest one is a cut-out and stays exactly as asked. */
+    {
+        LONG aniso = g_anisotropy;
+        DWORD min = tss[D3DTSS_MINFILTER];
+        if (aniso > 1 && (min == D3DTEXF_LINEAR || min == D3DTEXF_ANISOTROPIC)) {
+            sd.Filter = D3D11_FILTER_ANISOTROPIC;
+            if ((LONG)sd.MaxAnisotropy < aniso)
+                sd.MaxAnisotropy = (UINT)aniso;
+        }
+    }
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    /* MIPFILTER NONE samples level 0 only, as the Vulkan device does; D3D11
+     * has no "no mip" filter, so the LOD range says it. */
+    sd.MaxLOD = tss[D3DTSS_MIPFILTER] == D3DTEXF_NONE ? 0.0f : D3D11_FLOAT32_MAX;
 
     hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_sampler_states[stage]);
     if (SUCCEEDED(hr)) {

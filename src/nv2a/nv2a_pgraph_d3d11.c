@@ -852,6 +852,7 @@ void pgraph_d3d11_wide_end(void)
 #define READY_TEX_CACHE 256
 static struct {
     uint32_t addr, format, width, height;
+    uint32_t levels;                    /* mip levels uploaded (1: level 0 only) */
     IDirect3DTexture8 *tex;
     /* What the bytes looked like at the last upload, and when that was last
      * checked. See ready_tex_sig. */
@@ -903,6 +904,41 @@ static uint32_t ready_tex_bytes(uint32_t fmt, uint32_t w, uint32_t h,
     return *bpp ? w * h * *bpp : 0;
 }
 
+/* The title's own mip levels ([display] texture_mips, pgraph_d3d11_set_guest_mips).
+ *
+ * A swizzled or DXT texture stores its smaller levels right after level 0, each
+ * in the same layout as level 0 (the executor's tex_face_stride walks the same
+ * chain). Only level 0 used to be uploaded, so a floor or a crowd texture seen at
+ * a distance sampled its full-size level and shimmered; the console filtered
+ * between the levels the artists shipped. With this on, those levels are
+ * uploaded too and the title's mip filter is honoured, which is also what the
+ * anisotropic filtering option ([display] anisotropy) needs to do any good. */
+static int s_guest_mips;
+static int g_mips_bound[4];
+
+void pgraph_d3d11_set_guest_mips(int on) { s_guest_mips = on ? 1 : 0; }
+
+static uint32_t ready_level_bytes(uint32_t fmt, uint32_t w, uint32_t h, uint32_t level)
+{
+    int compressed;
+    uint32_t bpp;
+    uint32_t lw = (w >> level) ? (w >> level) : 1, lh = (h >> level) ? (h >> level) : 1;
+    return ready_tex_bytes(fmt, lw, lh, &compressed, &bpp);
+}
+
+/* Bytes of the whole chain, or 0 when a level has no known size. */
+static uint32_t ready_chain_bytes(uint32_t fmt, uint32_t w, uint32_t h, uint32_t levels)
+{
+    uint32_t level, total = 0;
+    for (level = 0; level < levels; level++) {
+        uint32_t b = ready_level_bytes(fmt, w, h, level);
+        if (!b)
+            return 0;
+        total += b;
+    }
+    return total;
+}
+
 /* Copy the title's bytes into the host texture. Three shapes of texture, and
  * the D3D8 layer already knows which is which, so ask it rather than keeping a
  * second table here:
@@ -915,8 +951,27 @@ static uint32_t ready_tex_bytes(uint32_t fmt, uint32_t w, uint32_t h,
  * Only the compressed ones used to upload. Everything else bound nothing, so
  * a menu drawing its background from a swizzled surface and its text from a
  * DXT atlas showed half of itself. Returns 0 if the texture was not filled. */
+static int ready_tex_fill_level(IDirect3DTexture8 *tex, UINT level, const void *data,
+                                uint32_t width, uint32_t height, uint32_t nv2a_format);
+
 static int ready_tex_fill(IDirect3DTexture8 *tex, const void *data,
-                          uint32_t width, uint32_t height, uint32_t nv2a_format)
+                          uint32_t width, uint32_t height, uint32_t nv2a_format,
+                          uint32_t levels)
+{
+    const uint8_t *at = (const uint8_t *)data;
+    uint32_t level;
+    for (level = 0; level < levels; level++) {
+        uint32_t lw = (width >> level) ? (width >> level) : 1;
+        uint32_t lh = (height >> level) ? (height >> level) : 1;
+        if (!ready_tex_fill_level(tex, level, at, lw, lh, nv2a_format))
+            return level > 0;   /* level 0 is what matters; a short chain still draws */
+        at += ready_level_bytes(nv2a_format, width, height, level);
+    }
+    return 1;
+}
+
+static int ready_tex_fill_level(IDirect3DTexture8 *tex, UINT level, const void *data,
+                                uint32_t width, uint32_t height, uint32_t nv2a_format)
 {
     D3DLOCKED_RECT lr;
     int compressed;
@@ -926,7 +981,7 @@ static int ready_tex_fill(IDirect3DTexture8 *tex, const void *data,
     const uint8_t *rows = (const uint8_t *)data;
 
     memset(&lr, 0, sizeof(lr));
-    if (FAILED(tex->lpVtbl->LockRect(tex, 0, &lr, NULL, 0)) || !lr.pBits)
+    if (FAILED(tex->lpVtbl->LockRect(tex, level, &lr, NULL, 0)) || !lr.pBits)
         return 0;
     /* A swizzled format goes in as it is: the D3D8 layer unswizzles what a
      * title writes into a locked swizzled texture when it uploads it
@@ -942,11 +997,37 @@ static int ready_tex_fill(IDirect3DTexture8 *tex, const void *data,
             memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch,
                    rows + (size_t)y * row, row);
     }
-    tex->lpVtbl->UnlockRect(tex, 0);
+    tex->lpVtbl->UnlockRect(tex, level);
     return 1;
 }
 
 static int s_ready_tex_force;           /* next hit refills now (replace) */
+
+static int ready_bind(uint32_t guest_addr, const void *data, uint32_t width,
+                      uint32_t height, uint32_t nv2a_format, uint32_t levels);
+
+int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
+                                   uint32_t width, uint32_t height,
+                                   uint32_t nv2a_format)
+{
+    return ready_bind(guest_addr, data, width, height, nv2a_format, 1);
+}
+
+int pgraph_d3d11_set_texture_ready_mips(uint32_t guest_addr, const void *data,
+                                        uint32_t width, uint32_t height,
+                                        uint32_t nv2a_format, uint32_t levels)
+{
+    uint32_t full = 1, dim;
+    for (dim = width > height ? width : height; dim > 1; dim >>= 1)
+        full++;
+    if (!s_guest_mips || levels < 2)
+        levels = 1;
+    if (levels > full)
+        levels = full;
+    if (levels > 1 && !ready_chain_bytes(nv2a_format, width, height, levels))
+        levels = 1;
+    return ready_bind(guest_addr, data, width, height, nv2a_format, levels);
+}
 
 int pgraph_d3d11_replace_texture_ready(uint32_t guest_addr, const void *data,
                                        uint32_t width, uint32_t height,
@@ -959,9 +1040,8 @@ int pgraph_d3d11_replace_texture_ready(uint32_t guest_addr, const void *data,
     return bound;
 }
 
-int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
-                                   uint32_t width, uint32_t height,
-                                   uint32_t nv2a_format)
+static int ready_bind(uint32_t guest_addr, const void *data, uint32_t width,
+                      uint32_t height, uint32_t nv2a_format, uint32_t levels)
 {
     IDirect3DDevice8 *dev;
     IDirect3DTexture8 *tex = NULL;
@@ -970,6 +1050,7 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
     int i;
 
     g_pack_bound[g_bind_stage] = 0;
+    g_mips_bound[g_bind_stage] = 0;
 
     if (!g_pg.initialized)
         return 0;
@@ -986,7 +1067,8 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
         if (s_ready_tex[i].addr == guest_addr
                 && s_ready_tex[i].format == nv2a_format
                 && s_ready_tex[i].width == width
-                && s_ready_tex[i].height == height) {
+                && s_ready_tex[i].height == height
+                && s_ready_tex[i].levels == levels) {
             tex = s_ready_tex[i].tex;
             s_ready_tex[i].used_ms = GetTickCount64();
             break;
@@ -1004,7 +1086,7 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
             bytes = ready_tex_bytes(nv2a_format, width, height, &compressed, &bpp);
             sig = ready_tex_sig(data, bytes);
             if ((s_ready_tex_force || sig != s_ready_tex[i].sig)
-                    && ready_tex_fill(tex, data, width, height, nv2a_format)) {
+                    && ready_tex_fill(tex, data, width, height, nv2a_format, levels)) {
                 static uint32_t refreshed;
                 s_ready_tex[i].sig = sig;
                 g_pg.stats.textures_uploaded++;
@@ -1068,12 +1150,12 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
                             s_ready_tex[slot].addr, evicted);
             }
         }
-        if (FAILED(dev->lpVtbl->CreateTexture(dev, width, height, 1, 0,
+        if (FAILED(dev->lpVtbl->CreateTexture(dev, width, height, levels, 0,
                                               nv2a_format, 0, &tex)) || !tex) {
             dev->lpVtbl->SetTexture(dev, g_bind_stage, NULL);
             return 0;
         }
-        if (!ready_tex_fill(tex, data, width, height, nv2a_format)) {
+        if (!ready_tex_fill(tex, data, width, height, nv2a_format, levels)) {
             tex->lpVtbl->Release(tex);
             dev->lpVtbl->SetTexture(dev, g_bind_stage, NULL);
             return 0;
@@ -1082,15 +1164,16 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
         s_ready_tex[slot].format = nv2a_format;
         s_ready_tex[slot].width  = width;
         s_ready_tex[slot].height = height;
+        s_ready_tex[slot].levels = levels;
         s_ready_tex[slot].tex    = tex;
         s_ready_tex[slot].sig    = ready_tex_sig(data, bytes);
         s_ready_tex[slot].checked_ms = GetTickCount64();
         s_ready_tex[slot].used_ms = s_ready_tex[slot].checked_ms;
-        s_ready_tex[slot].bytes  = bytes;
+        s_ready_tex[slot].bytes  = levels > 1 ? ready_chain_bytes(nv2a_format, width, height, levels) : bytes;
         g_pg.stats.textures_uploaded++;
         g_pg.stats.texture_upload_bytes += bytes;
         g_pg.stats.textures_cached++;
-        g_pg.stats.texture_cache_bytes += bytes;
+        g_pg.stats.texture_cache_bytes += s_ready_tex[slot].bytes;
         if (slot == s_ready_tex_count)
             s_ready_tex_count++;
         /* Which of the three shapes it took, because "uploaded" on its own
@@ -1110,6 +1193,7 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
         }
     }
 
+    g_mips_bound[g_bind_stage] = levels > 1;
     dev->lpVtbl->SetTexture(dev, g_bind_stage, (IDirect3DBaseTexture8 *)tex);
     dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 1  /*COLOROP*/,   4 /*MODULATE*/);
     dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 2  /*COLORARG1*/, 2 /*TEXTURE*/);
@@ -1144,8 +1228,11 @@ void pgraph_d3d11_set_texture_address(uint32_t nv2a_u, uint32_t nv2a_v)
  * bits 24-27 (1 one texel, 2 and 4 filter). Everything used to be drawn
  * linear, and a sprite the title wants unfiltered -- a cut-out whose
  * transparent texels hold a key colour -- picked that colour up along its
- * edge: green rims on the creator's photographs. Mip levels are not uploaded,
- * so the mip half of the setting is left out. 0 (never set) keeps linear. */
+ * edge: green rims on the creator's photographs. The mip half applies to a
+ * texture bound with a mip chain (an HD pack's, or the title's own with
+ * [display] texture_mips): 3 and 4 pick the nearest level, 5 and 6 blend two;
+ * everything else, and every texture without a chain, samples level 0.
+ * 0 (never set) keeps linear. */
 void pgraph_d3d11_set_texture_filter(uint32_t nv2a_filter)
 {
     IDirect3DDevice8 *dev;
@@ -1156,8 +1243,12 @@ void pgraph_d3d11_set_texture_filter(uint32_t nv2a_filter)
         return;
     dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 16 /*MAGFILTER*/, dmag);
     dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 17 /*MINFILTER*/, dmin);
-    if (texture_pack_active()) {
-        DWORD mip = g_pack_bound[g_bind_stage] ? ((min == 3 || min == 4) ? 1 : (min >= 5 && min <= 7) ? 2 : 0) : 0;
+    if (texture_pack_active() || s_guest_mips) {
+        DWORD mip = 0;
+        if (g_pack_bound[g_bind_stage])
+            mip = (min == 3 || min == 4) ? 1 : (min >= 5 && min <= 7) ? 2 : 0;
+        else if (g_mips_bound[g_bind_stage])
+            mip = (min == 3 || min == 4) ? 1 : (min == 5 || min == 6) ? 2 : 0;
         dev->lpVtbl->SetTextureStageState(dev, g_bind_stage, 18 /*MIPFILTER*/, mip);
     }
 }
@@ -1184,6 +1275,7 @@ void pgraph_d3d11_unbind_stage(int stage)
         return;
     dev->lpVtbl->SetTexture(dev, (DWORD)stage, NULL);
     g_pack_bound[stage] = 0;
+    g_mips_bound[stage] = 0;
 }
 
 /* The title's register combiners for the next draws (M4f), from the NV097
