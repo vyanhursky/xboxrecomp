@@ -568,6 +568,15 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  * device rule matches reach it: partition images and unrecognised paths
  * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
+/* Optional: a project sets this to serve a file of the game volume from
+ * somewhere else, such as a mod's rebuilt copy of an archive. `relative` is the
+ * part of the guest path below the game root, as the title wrote it (either
+ * separator, any case). Return TRUE after writing a complete host path to
+ * host_path (size characters) to open that file instead; FALSE keeps the normal
+ * translation. Called on the calling guest thread for every path that lands in
+ * the game folder; save-area paths never reach it.
+ * NULL by default. */
+extern BOOL (*g_xbox_game_file_redirect)(const char *relative, xbox_host_char *host_path, DWORD size);
 /* Tell the script-anchor clocks a path was opened (kernel_script_anchor.c). */
 void xbox_AnchorNoteOpen(const char *xbox_path);
 
