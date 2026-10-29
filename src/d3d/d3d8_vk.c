@@ -3477,6 +3477,7 @@ static int device_make(void)
             want.samplerAnisotropy = VK_TRUE;
             vk.max_anisotropy = props.limits.maxSamplerAnisotropy;
         }
+        LOG("anisotropic filtering: up to %.0fx", (double)vk.max_anisotropy);
         dci.pEnabledFeatures = &want;
     }
     dci.queueCreateInfoCount = 1;
