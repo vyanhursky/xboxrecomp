@@ -917,6 +917,10 @@ int     xbox_DispatchGateOn(void);
 int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery */
 void    xbox_DispatchGateEnter(void);
 void    xbox_DispatchGateLeave(void);
+/* Optional work: try the active dispatch exclusion without waiting, changing
+ * IRQL, or draining DPCs. A successful try must be paired with Leave. */
+int     xbox_DispatchExclusionTryEnter(void);
+void    xbox_DispatchExclusionLeave(void);
 void    xbox_IrqlLeaveInterrupt(int saved);
 /* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
 int     xbox_IrqlThisThreadBlocksDpcs(void);
