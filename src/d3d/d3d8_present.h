@@ -115,6 +115,27 @@ static inline unsigned d3d8_present_interval_for(unsigned hz)
 /* 1 = smooth (bilinear), 0 = sharp (nearest). */
 void d3d8_present_set_linear_filter(int linear);
 
+/* How the title's picture is scaled to the window: 0 sharp (nearest), 1 smooth
+ * (bilinear), 2 smooth with area-averaged downscaling. Mode 2 differs from 1
+ * only when the picture is larger than the window (a render scale above the
+ * window's size): bilinear then reads four texels of a footprint that covers
+ * more, and the extra resolution aliases instead of averaging out; mode 2
+ * halves the picture with exact 2x2 averages first, then scales the rest of
+ * the way bilinearly. set_linear_filter(1) is mode 1. */
+void d3d8_present_set_filter_mode(int mode);
+
+/* Anisotropic filtering for textures the title filters linearly when
+ * minifying: 1 is the title's own filtering (none), 2-16 the most samples a
+ * texel footprint may take along its long axis. Nearest-filtered textures
+ * (cut-outs keyed on a colour) are left alone. Applies from the next draw;
+ * clamped to what the device supports. */
+void d3d8_set_texture_anisotropy(unsigned max);
+
+/* Multisample anti-aliasing for the title's target: 1 (off), 2, 4 or 8
+ * samples, lowered to what the device supports. Read when the target is made,
+ * so call it before the device starts; later calls apply at the next start. */
+void d3d8_set_msaa(unsigned samples);
+
 /* A host program's drawing on top of the picture, in window pixels, after the
  * title's target has been scaled into the window: a menu, an on-screen display.
  * It runs on the thread that presents, on the immediate context (the pointers are Direct3D 11 interfaces; plain

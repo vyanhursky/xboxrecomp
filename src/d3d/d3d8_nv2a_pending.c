@@ -65,4 +65,7 @@ void d3d8_present_set_aspect(int keep, unsigned num, unsigned den)
 { (void)keep; (void)num; (void)den; }
 void d3d8_present_set_vsync(int vsync)                  { (void)vsync; }
 void d3d8_present_set_linear_filter(int linear)         { (void)linear; }
+void d3d8_present_set_filter_mode(int mode)             { (void)mode; }
+void d3d8_set_texture_anisotropy(unsigned max)          { (void)max; }
+void d3d8_set_msaa(unsigned samples)                    { (void)samples; }
 void d3d8_gamma_set(const void *ramp)                   { (void)ramp; }

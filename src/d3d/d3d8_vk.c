@@ -116,6 +116,21 @@ void d3d8_present_set_aspect(int keep, unsigned num, unsigned den)
 }
 void d3d8_present_set_vsync(int vsync)             { s_vsync = vsync; }
 void d3d8_present_set_linear_filter(int linear)    { s_linear = linear; }
+void d3d8_present_set_filter_mode(int mode)        { s_linear = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+
+/* [display] msaa: the samples asked for, read once when the target is made. */
+static unsigned s_msaa_want = 1;
+void d3d8_set_msaa(unsigned samples)               { s_msaa_want = samples; }
+
+/* [display] anisotropy: an index into the sampler cache, 0 (off) .. 4 (16x). */
+static volatile int s_aniso_level;
+void d3d8_set_texture_anisotropy(unsigned max)
+{
+    int level = 0;
+    while (level < 4 && (2u << level) <= max)
+        level++;
+    s_aniso_level = level;
+}
 /* The title's own 60 Hz timer paces the frames here; the display never does. */
 int  d3d8_present_display_paced(void)              { return 0; }
 /* The title's gamma ramp, applied to what the window shows (gamma_pass below).
@@ -254,6 +269,13 @@ static struct {
     VkImage        color, depth;
     VkDeviceMemory color_mem, depth_mem;
     VkImageView    color_view, depth_view;
+    /* MSAA ([display] msaa, d3d8_set_msaa): the title draws into color_ms and a
+     * depth buffer with as many samples, and each render pass resolves color_ms
+     * into color, which is what everything after the draws reads. */
+    VkSampleCountFlagBits samples;
+    VkImage        color_ms;
+    VkDeviceMemory color_ms_mem;
+    VkImageView    color_ms_view;
     VkRenderPass   pass;
     VkFramebuffer  fb;
 
@@ -282,7 +304,8 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout      pl;
     VkDescriptorPool      dpool;
-    VkSampler             samplers[4][4][2][2][3];
+    VkSampler             samplers[4][4][2][2][3][5];  /* ... x anisotropy 1, 2, 4, 8, 16 */
+    float                 max_anisotropy;              /* 0: the device has no anisotropic filtering */
     VkImage        dummy;
     VkDeviceMemory dummy_mem;
     VkImageView    dummy_view;
@@ -423,9 +446,20 @@ static void ring_invalidate(const Ring *r)
     vkInvalidateMappedMemoryRanges(vk.dev, 1, &range);
 }
 
+static int image_make_samples(uint32_t w, uint32_t h, uint32_t levels, VkSampleCountFlagBits samples,
+                              VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                              VkImage *img, VkDeviceMemory *mem, VkImageView *view);
+
 static int image_make_levels(uint32_t w, uint32_t h, uint32_t levels, VkFormat fmt, VkImageUsageFlags usage,
                              VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
                              VkImageView *view)
+{
+    return image_make_samples(w, h, levels, VK_SAMPLE_COUNT_1_BIT, fmt, usage, aspect, img, mem, view);
+}
+
+static int image_make_samples(uint32_t w, uint32_t h, uint32_t levels, VkSampleCountFlagBits samples,
+                              VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                              VkImage *img, VkDeviceMemory *mem, VkImageView *view)
 {
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
@@ -436,7 +470,7 @@ static int image_make_levels(uint32_t w, uint32_t h, uint32_t levels, VkFormat f
     ii.format = fmt;
     ii.extent.width = w; ii.extent.height = h; ii.extent.depth = 1;
     ii.mipLevels = levels; ii.arrayLayers = 1;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.samples = samples;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage;
     if (vkCreateImage(vk.dev, &ii, NULL, img) != VK_SUCCESS)
@@ -1061,7 +1095,7 @@ static VkPipeline pipeline_make(const PipeKey *k)
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rs.lineWidth = 1.0f;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = vk.samples ? vk.samples : VK_SAMPLE_COUNT_1_BIT;
 
     ds.depthTestEnable = k->ztest;
     ds.depthWriteEnable = k->ztest && k->zwrite;
@@ -1801,10 +1835,17 @@ static VkSampler sampler_get(DWORD au, DWORD av, DWORD mag, DWORD min, DWORD mip
     uint32_t g = (mag == 1) ? 0 : 1, n = (min == 1) ? 0 : 1;
     /* D3DTEXF: 0 none, 1 point, 2 linear. Only a texture with a mip chain has more than level 0. */
     uint32_t m = (mip == 1 || mip == 2) ? mip : 0;
-    VkSampler *s = &vk.samplers[u][v][g][n][m];
+    /* Anisotropy only for a linearly minified texture (see d3d8_set_texture_anisotropy). */
+    uint32_t a = (n && vk.max_anisotropy >= 2.0f) ? (uint32_t)s_aniso_level : 0;
+    VkSampler *s = &vk.samplers[u][v][g][n][m][a];
 
     if (!*s) {
         VkSamplerCreateInfo ci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        if (a) {
+            float want = (float)(1u << a);
+            ci.anisotropyEnable = VK_TRUE;
+            ci.maxAnisotropy = want < vk.max_anisotropy ? want : vk.max_anisotropy;
+        }
         ci.magFilter = g ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         ci.minFilter = n ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         ci.mipmapMode = m == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
@@ -2220,6 +2261,63 @@ static void present_rect(uint32_t ww, uint32_t wh, VkOffset3D dst[2])
     dst[1].x = dst[0].x + (int32_t)w;
     dst[1].y = dst[0].y + (int32_t)h;
     dst[1].z = 1;
+}
+
+/* [display] filter "smooth (high quality)" (d3d8_present_set_filter_mode 2):
+ * a picture larger than the window is halved with exact 2x2 averages (a linear
+ * blit at 2:1 lands between four texels) until one more halving would go below
+ * the window, and only the last step, under 2:1, is a plain bilinear blit. A
+ * render scale of 4 on an 800-line Steam Deck screen goes 1920 -> 960 lines
+ * this way, then 960 -> 800, instead of skipping three lines in five. */
+#define HALF_MAX 4
+static struct {
+    VkImage        img[HALF_MAX];
+    VkDeviceMemory mem[HALF_MAX];
+    VkImageView    view[HALF_MAX];
+    uint32_t       src_w, src_h;    /* the picture size these were made for */
+} s_half;
+
+static VkImage present_halve(VkImage from, uint32_t *w, uint32_t *h, uint32_t dw, uint32_t dh)
+{
+    uint32_t sw = *w, sh = *h, k;
+
+    if (sw != s_half.src_w || sh != s_half.src_h) {
+        for (k = 0; k < HALF_MAX; k++)
+            retire(s_half.img[k], s_half.mem[k], s_half.view[k]);
+        memset(&s_half, 0, sizeof s_half);
+        s_half.src_w = sw;
+        s_half.src_h = sh;
+    }
+    for (k = 0; k < HALF_MAX && dw && dh && sw / 2 >= dw && sh / 2 >= dh; k++) {
+        VkImageBlit b;
+        uint32_t nw = sw / 2, nh = sh / 2;
+        if (!s_half.img[k]
+                && !image_make(nw, nh, VK_FORMAT_R8G8B8A8_UNORM,
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, &s_half.img[k], &s_half.mem[k], &s_half.view[k]))
+            break;
+        image_layout(vk.cmd, s_half.img[k], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        memset(&b, 0, sizeof b);
+        b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+        b.srcOffsets[1].x = (int32_t)(nw * 2);      /* an odd last column or row is dropped */
+        b.srcOffsets[1].y = (int32_t)(nh * 2);
+        b.srcOffsets[1].z = 1;
+        b.dstOffsets[1].x = (int32_t)nw;
+        b.dstOffsets[1].y = (int32_t)nh;
+        b.dstOffsets[1].z = 1;
+        vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s_half.img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        image_layout(vk.cmd, s_half.img[k], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        from = s_half.img[k];
+        sw = nw;
+        sh = nh;
+    }
+    *w = sw;
+    *h = sh;
+    return from;
 }
 
 /* The Direct3D 11 backend's gamma shader: each channel through the ramp. */
@@ -2793,6 +2891,14 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         blit.srcOffsets[1].y = (int32_t)vk.th;
         blit.srcOffsets[1].z = 1;
         present_rect(vk.swap_ext.width, vk.swap_ext.height, blit.dstOffsets);
+        if (s_linear == 2) {
+            uint32_t sw = vk.tw, sh = vk.th;
+            from = present_halve(from, &sw, &sh,
+                                 (uint32_t)(blit.dstOffsets[1].x - blit.dstOffsets[0].x),
+                                 (uint32_t)(blit.dstOffsets[1].y - blit.dstOffsets[0].y));
+            blit.srcOffsets[1].x = (int32_t)sw;
+            blit.srcOffsets[1].y = (int32_t)sh;
+        }
         vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        s_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
@@ -3360,6 +3466,20 @@ static int device_make(void)
     qci.queueFamilyIndex = vk.qfam;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
+    {
+        /* Anisotropic filtering is an optional feature ([display] anisotropy);
+         * every desktop GPU and MoltenVK has it. */
+        static VkPhysicalDeviceFeatures want;
+        VkPhysicalDeviceFeatures have;
+        memset(&want, 0, sizeof want);
+        vkGetPhysicalDeviceFeatures(vk.phys, &have);
+        if (have.samplerAnisotropy) {
+            want.samplerAnisotropy = VK_TRUE;
+            vk.max_anisotropy = props.limits.maxSamplerAnisotropy;
+        }
+        LOG("anisotropic filtering: up to %.0fx", (double)vk.max_anisotropy);
+        dci.pEnabledFeatures = &want;
+    }
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = n_dev;
@@ -3419,9 +3539,10 @@ static int resources_make(void)
     VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkAttachmentDescription att[2];
+    VkAttachmentDescription att[3];
     VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkAttachmentReference dref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference rref = { 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkSubpassDescription sub;
     VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
     VkFramebufferCreateInfo fbci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
@@ -3432,7 +3553,7 @@ static int resources_make(void)
     VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     VkFormatProperties fp;
     VkCommandBuffer cbs[2];
-    VkImageView views[2];
+    VkImageView views[3];
     VkImageAspectFlags daspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -3464,12 +3585,36 @@ static int resources_make(void)
             return 0;
     }
 
+    {
+        /* The most samples up to the ones asked for that colour, depth and
+         * stencil attachments all support; 1 (off) when none do. */
+        VkPhysicalDeviceProperties p;
+        VkSampleCountFlags ok;
+        unsigned n = s_msaa_want > 8 ? 8 : s_msaa_want;
+        vkGetPhysicalDeviceProperties(vk.phys, &p);
+        ok = p.limits.framebufferColorSampleCounts & p.limits.framebufferDepthSampleCounts
+           & p.limits.framebufferStencilSampleCounts;
+        vk.samples = VK_SAMPLE_COUNT_1_BIT;
+        for (; n >= 2; n >>= 1)
+            if (ok & n) {
+                vk.samples = (VkSampleCountFlagBits)n;
+                break;
+            }
+        if (s_msaa_want > 1)
+            LOG("MSAA: %ux asked, %ux used", s_msaa_want, (unsigned)vk.samples);
+    }
     if (!image_make(vk.tw, vk.th, VK_FORMAT_R8G8B8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                     | VK_IMAGE_USAGE_SAMPLED_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, &vk.color, &vk.color_mem, &vk.color_view)
-            || !image_make(vk.tw, vk.th, vk.depth_fmt, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                           daspect, &vk.depth, &vk.depth_mem, &vk.depth_view)
+            || !image_make_samples(vk.tw, vk.th, 1, vk.samples, vk.depth_fmt,
+                                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                   daspect, &vk.depth, &vk.depth_mem, &vk.depth_view)
+            || (vk.samples > VK_SAMPLE_COUNT_1_BIT
+                && !image_make_samples(vk.tw, vk.th, 1, vk.samples, VK_FORMAT_R8G8B8A8_UNORM,
+                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                       VK_IMAGE_ASPECT_COLOR_BIT, &vk.color_ms, &vk.color_ms_mem,
+                                       &vk.color_ms_view))
             || !image_make(1, 1, VK_FORMAT_R8G8B8A8_UNORM,
                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, &vk.dummy, &vk.dummy_mem, &vk.dummy_view))
@@ -3487,21 +3632,32 @@ static int resources_make(void)
     }
     att[0].initialLayout = att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     att[1].initialLayout = att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    att[0].samples = att[1].samples = vk.samples;
+    /* With MSAA the single-sample target is the resolve: written whole at the
+     * end of each pass, never loaded. */
+    att[2] = att[0];
+    att[2].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     memset(&sub, 0, sizeof sub);
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1;
     sub.pColorAttachments = &cref;
     sub.pDepthStencilAttachment = &dref;
-    rpci.attachmentCount = 2;
+    if (vk.samples > VK_SAMPLE_COUNT_1_BIT)
+        sub.pResolveAttachments = &rref;
+    rpci.attachmentCount = vk.samples > VK_SAMPLE_COUNT_1_BIT ? 3 : 2;
     rpci.pAttachments = att;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &sub;
     if (vkCreateRenderPass(vk.dev, &rpci, NULL, &vk.pass) != VK_SUCCESS)
         return 0;
-    views[0] = vk.color_view;
+    views[0] = vk.samples > VK_SAMPLE_COUNT_1_BIT ? vk.color_ms_view : vk.color_view;
     views[1] = vk.depth_view;
+    views[2] = vk.color_view;
     fbci.renderPass = vk.pass;
-    fbci.attachmentCount = 2;
+    fbci.attachmentCount = rpci.attachmentCount;
     fbci.pAttachments = views;
     fbci.width = vk.tw;
     fbci.height = vk.th;
@@ -3584,6 +3740,13 @@ static int resources_make(void)
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         image_layout(vk.cmd, vk.depth, daspect, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        if (vk.color_ms) {
+            image_layout(vk.cmd, vk.color_ms, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vkCmdClearColorImage(vk.cmd, vk.color_ms, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+            image_layout(vk.cmd, vk.color_ms, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
         image_layout(vk.cmd, vk.dummy, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdClearColorImage(vk.cmd, vk.dummy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);

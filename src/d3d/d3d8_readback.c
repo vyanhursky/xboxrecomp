@@ -82,6 +82,7 @@ int d3d8_readback_begin(uint64_t tag)
         return 0;
 
     if (d3d8_present_scaling() && d3d8_present_game_texture()) {
+        d3d8_present_resolve(NULL);             /* MSAA: what has been drawn so far */
         src = d3d8_present_game_texture();
         ID3D11Texture2D_AddRef(src);
     } else if (!d3d8_GetSwapChain()

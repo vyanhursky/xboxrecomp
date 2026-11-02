@@ -4141,8 +4141,12 @@ static void bind_texture_ready(const Texture *t)
     }
     if (t->color != NV097_TEXFMT_SZ_I8_A8R8G8B8 || !t->palette
             || !w || !h || w > 4096 || h > 4096) {
-        pgraph_d3d11_set_texture_ready(t->offset, mem + t->offset,
-                                       linear_row_texels(t), h, t->color);
+        if (tex_size_from_format(t->color) && !t->cube && t->levels > 1)
+            pgraph_d3d11_set_texture_ready_mips(t->offset, mem + t->offset,
+                                                w, h, t->color, t->levels);
+        else
+            pgraph_d3d11_set_texture_ready(t->offset, mem + t->offset,
+                                           linear_row_texels(t), h, t->color);
         return;
     }
 
