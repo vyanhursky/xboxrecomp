@@ -976,6 +976,7 @@ static ULONG __stdcall sf_Release(IDirect3DSurface8 *self)
         if (sf->rtv) ID3D11RenderTargetView_Release(sf->rtv);
         if (sf->dsv) ID3D11DepthStencilView_Release(sf->dsv);
         if (sf->d3d11_texture) ID3D11Texture2D_Release(sf->d3d11_texture);
+        if (sf->shadow_parent) sf->shadow_parent->lpVtbl->Release(sf->shadow_parent);
         free(sf);
     }
     return (ULONG)ref;
@@ -1021,11 +1022,21 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
     if (!pLockedRect) return E_INVALIDARG;
     if (sf->locked) return E_FAIL;
 
-    /* P8 surfaces: the palette indices live in the parent texture's
-     * sys_mem, not in the D3D11 texture. Expose them directly (
-     * only the full level is addressable this way). */
+    /* P8 and decoded DXT surfaces retain the guest bytes in CPU storage. */
     if (sf->palettized) {
-        if (pRect &&
+        size_t offset = 0;
+        UINT block_bytes = d3d8_format_dxt_block_bytes(sf->format);
+        if (pRect && block_bytes) {
+            if (pRect->left < 0 || pRect->top < 0 ||
+                pRect->right <= pRect->left || pRect->bottom <= pRect->top ||
+                (UINT)pRect->right > sf->width || (UINT)pRect->bottom > sf->height ||
+                (pRect->left & 3) || (pRect->top & 3) ||
+                ((pRect->right & 3) && (UINT)pRect->right != sf->width) ||
+                ((pRect->bottom & 3) && (UINT)pRect->bottom != sf->height))
+                return E_INVALIDARG;
+            offset = (size_t)(pRect->top / 4) * sf->palette_pitch
+                + (pRect->left / 4) * block_bytes;
+        } else if (pRect &&
             (pRect->left != 0 || pRect->top != 0 ||
              (UINT)pRect->right != sf->width ||
              (UINT)pRect->bottom != sf->height)) {
@@ -1034,7 +1045,7 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
         sf->locked = TRUE;
         sf->lock_readonly = (Flags & D3DLOCK_READONLY) != 0;
         pLockedRect->Pitch = (INT)sf->palette_pitch;
-        pLockedRect->pBits = (void *)sf->palette_sys;
+        pLockedRect->pBits = (void *)(sf->palette_sys + offset);
         return S_OK;
     }
 
@@ -1120,7 +1131,7 @@ static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *self)
 
     if (!sf->locked) return E_FAIL;
 
-    /* P8 surface: re-upload the raw indices through the surface's palette. */
+    /* Re-upload the guest representation through its format conversion. */
     if (sf->palettized) {
         if (!sf->lock_readonly && sf->d3d11_texture && sf->palette_sys) {
             D3D11_TEXTURE2D_DESC td;
@@ -1254,11 +1265,10 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
             (ID3D11Resource *)texture, &rtvd, &sf->rtv);
     }
 
-    /* P8 surfaces expose the raw palette indices through LockRect. The
-     * index data is not in the D3D11 texture (it was palette-expanded to
-     * BGRA at upload), so attach a pointer to the parent's raw sys_mem
-     * region. Only the texture/cube/volume creators pass raw_level_data. */
-    if (d3d8_format_is_palettized(fmt) && raw_level_data) {
+    /* Converted surfaces expose raw guest bytes, rather than host BGRA.
+     * Only texture/cube/volume creators supply that CPU shadow storage. */
+    if (raw_level_data && (d3d8_format_is_palettized(fmt)
+            || (d3d8_format_dxt_block_bytes(fmt) && td.Format == DXGI_FORMAT_B8G8R8A8_UNORM))) {
         sf->palettized = TRUE;
         sf->palette_sys = raw_level_data;
         sf->palette_pitch = d3d8_row_pitch(fmt, width);
@@ -1290,10 +1300,16 @@ static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *self, UINT Level
                                      tex->d3d8_format,
                                      D3DPOOL_DEFAULT, tex->usage,
                                      D3DMULTISAMPLE_NONE,
-                                     d3d8_format_is_palettized(tex->d3d8_format)
+                                     (d3d8_format_is_palettized(tex->d3d8_format)
+                                         || (d3d8_format_dxt_block_bytes(tex->d3d8_format)
+                                             && tex->dxgi_format == DXGI_FORMAT_B8G8R8A8_UNORM))
                                          ? tex->sys_mem + tex_level_offset(tex, Level)
                                          : NULL,
                                      tex->palette);
+    if (*ppSurface && ((D3D8Surface *)*ppSurface)->palettized) {
+        ((D3D8Surface *)*ppSurface)->shadow_parent = self;
+        self->lpVtbl->AddRef(self);
+    }
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
@@ -1329,6 +1345,26 @@ static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
     UINT upload_pitch = src_row_pitch;
 
     if (!ctx || !d3d11_texture) return;
+
+    /* D3D11 rejects a BC base level whose dimensions are not block-aligned.
+     * Such textures use BGRA at their exact guest size; keep compressed CPU
+     * locks and decode every uploaded mip, including its 1x1/2x2 tail. */
+    if (d3d8_format_dxt_block_bytes(fmt)) {
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Texture2D_GetDesc(d3d11_texture, &td);
+        if (td.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+            UINT x, y;
+            uint32_t *pixels = (uint32_t *)malloc((size_t)w * h * 4);
+            if (!pixels) return;
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++)
+                    d3d8_dxt_decode_texel(src_data, fmt, x, y, w, &pixels[(size_t)y * w + x]);
+            ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)d3d11_texture,
+                subresource, NULL, pixels, w * 4, w * h * 4);
+            free(pixels);
+            return;
+        }
+    }
 
     /* Step 1: unswizzle swizzled formats into linear storage. */
     if (!d3d8_format_is_compressed(fmt) && d3d8_format_is_swizzled(fmt)) {
@@ -1399,6 +1435,9 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
 
     tex->d3d8_format = Format;
     tex->dxgi_format = d3d8_to_dxgi_format(Format);
+    if (d3d8_format_dxt_block_bytes(Format) && ((Width & 3) || (Height & 3))
+            && !(Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))
+        tex->dxgi_format = DXGI_FORMAT_B8G8R8A8_UNORM;
     tex->width = Width;
     tex->height = Height;
     tex->usage = Usage;
