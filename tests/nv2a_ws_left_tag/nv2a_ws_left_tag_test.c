@@ -135,8 +135,17 @@ static void hud_strips(uint32_t left, uint32_t right, uint32_t centred, uint32_t
     expected[0] = right;
     box(448, 464, 338.5f, 370.4f);              /* P4 digit */
     box(460, 488, 340.6f, 356.1f);              /* P4 suffix */
+    expected[0] = left;
+    box(48.5f, 183.5f, 314.0f, 330.0f);         /* P3 struggle meter: text above the HUD */
+    box(41, 297, 331.0f, 395.0f);               /* its frame */
+    box(138.4f, 159.9f, 335.0f, 345.0f);        /* its fill bar */
+    expected[0] = right;
+    box(465.5f, 590.5f, 314.0f, 330.0f);        /* P4 struggle meter: text */
+    box(343, 599, 331.0f, 395.0f);              /* its frame */
+    box(467.6f, 475.4f, 335.0f, 345.0f);        /* its fill bar */
     expected[0] = centred;
     box(146, 268, 330.0f, 346.0f);              /* the pause panel's lowest piece */
+    box(190.5f, 223.5f, 300.0f, 316.0f);        /* a pause panel piece above it */
     nv2a_ws_hud_heartbeat(0);
 }
 
@@ -238,8 +247,8 @@ int main(void)
     box(48, 68, 106.5f, 142.4f);
     box(48, 68, 338.5f, 370.4f);
 
-    CHECK(draws == 63);
+    CHECK(draws == 77);
     if (!s_fail)
-        printf("nv2a-ws-left-tag: 63 draws checked\n");
+        printf("nv2a-ws-left-tag: 77 draws checked\n");
     return s_fail;
 }

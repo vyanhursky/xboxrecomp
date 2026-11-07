@@ -1140,6 +1140,19 @@ static int ws_hud_meter(float y0, float y1)
     return y0 >= 118.0f && y0 <= 150.0f && y1 <= 190.0f && (h <= 18.0f || h >= 60.0f);
 }
 
+/* The same meter for a bottom fighter (3-4 in the match), mirrored about its HUD: the text above
+ * it (y 314..330, 16 tall), the frame (y 331..395, 64 tall) and the fill bar (y 335..345,
+ * 10 tall), measured at 16:9 for fighters 3 and 4. Each is matched by where it starts and its
+ * height: the pause panel's lowest one-sided piece (y 330..346, 16 tall) lies between them and
+ * stays centred. */
+static int ws_hud_meter_bottom(float y0, float y1)
+{
+    float h = y1 - y0;
+    return (h >= 60.0f && y0 >= 320.0f && y0 <= 340.0f)                      /* frame */
+        || (h <= 12.0f && y0 >= 330.0f && y0 <= 340.0f && y1 <= 350.0f)     /* fill bar */
+        || (h <= 18.0f && y0 >= 308.0f && y1 >= 326.0f && y1 <= 332.0f);    /* text */
+}
+
 static int ws_tag_band(float y, float t)
 {
     return t > 0.0f && s_ws_k < 1.0f && y >= t - 256.0f && y < t + 768.0f;
@@ -1264,14 +1277,16 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
          * stretches like the full-screen ones instead of stopping at the 4:3 edges. */
         cls = 4;
     } else if (cls && (uint32_t)(s_gpu.flips - s_ws_hud_flip) <= 30u
-               && (y1 <= 146.0f || ws_hud_meter(y0, y1) || (s_ws_hud_bottom && y0 >= 336.0f))) {
+               && (y1 <= 146.0f || ws_hud_meter(y0, y1)
+                   || (s_ws_hud_bottom && (y0 >= 336.0f || ws_hud_meter_bottom(y0, y1))))) {
         /* Only the HUD's own strips: the top one, and the bottom one with 3-4
          * fighters. Tutorial prompts and other centred text stay whole. The
          * limits take in the whole combo call-out, whose digit, suffix and
          * text are separate batches (the digit pops out to y 142.4 at the top
          * and 338.5 at the bottom). The pause panel's lowest one-sided piece
          * starts at y 330, so it stays centred. The struggle meter goes with
-         * the top strip (ws_hud_meter). */
+         * the top strip (ws_hud_meter), and a bottom fighter's with the
+         * bottom one (ws_hud_meter_bottom). */
         if (x1 <= 300.0f)
             cls = 2;
         else if (x0 >= 340.0f)
