@@ -5,7 +5,8 @@
  * triangle untagged stays centred; at 4:3, or with the tag off, a triangle in
  * the band is left alone. The independent centre tag extends a full-width
  * clip horizontally, preserving narrower masks and vertical clipping. The
- * fight HUD's strips go through the same path.
+ * fight HUD's strips go through the same path. Over a 4:3 picture that gets the
+ * side fill, a left-tagged triangle stays in the 4:3 box instead.
  * Guest memory is a synthetic buffer; no game data. */
 #include <stddef.h>
 #include <stdint.h>
@@ -56,6 +57,18 @@ static int s_fail;
 
 extern void nv2a_ws_configure(float k, float reach);
 extern void nv2a_ws_hud_heartbeat(int bottom_rows);
+extern void nv2a_ws_set_side_fill(int on);
+extern void nv2a_ws_test_frame_picture(void);
+static void flip(void) { m(0x012C, 0); }        /* NV097_FLIP_INCREMENT_WRITE: the frame ends */
+/* n frames like the last: with the side fill (a centred 4:3 picture) or without. */
+static void frames(int n, int picture)
+{
+    while (n-- > 0) {
+        if (picture)
+            nv2a_ws_test_frame_picture();
+        flip();
+    }
+}
 static uint32_t clip[4], expected[4], draws;
 static float expect_y0, expect_h = 50.0f;
 void pgraph_d3d11_set_surface_clip(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -160,6 +173,28 @@ int main(void)
     expect_y0 = 2514.0f;
     triangle(2514.0f);
 
+    /* A frame that centred a 4:3 picture and got the side fill (a menu background with no
+     * [wide] art): the next frame's tagged triangle stays in the 4:3 box, under the fill's
+     * sides no more. A frame without it (3D, [wide] art, or the fill off) anchors left again. */
+    nv2a_ws_set_side_fill(1);
+    frames(7, 1);                               /* not yet: a screen change's few frames */
+    expected[0] = 0; expected[2] = 480;
+    expect_y0 = 300.0f;
+    triangle(8192.0f + 300.0f);
+    frames(1, 1);                               /* eight in a row: a 4:3 menu screen */
+    expected[0] = 80; expected[2] = 480;
+    triangle(8192.0f + 300.0f);
+    frames(3, 0);                               /* a few frames with its [wide] art missing: no change */
+    frames(1, 1);
+    triangle(8192.0f + 300.0f);
+    frames(8, 0);                               /* a 3D or [wide] screen: the left edge again */
+    expected[0] = 0; expected[2] = 480;
+    triangle(8192.0f + 300.0f);
+    nv2a_ws_set_side_fill(0);
+    frames(8, 1);                               /* the fill off: no fill, the left edge */
+    triangle(8192.0f + 300.0f);
+    expected[0] = 80;                           /* centred, as the tests below expect */
+
     /* Tag off: a triangle in the band is drawn where it is. */
     nv2a_ws_set_left_tag(0.0f);
     expect_y0 = 8192.0f + 300.0f;
@@ -226,8 +261,8 @@ int main(void)
     box(48, 68, 106.5f, 142.4f);
     box(48, 68, 338.5f, 370.4f);
 
-    CHECK(draws == 43);
+    CHECK(draws == 48);
     if (!s_fail)
-        printf("nv2a-ws-left-tag: 43 draws checked\n");
+        printf("nv2a-ws-left-tag: 48 draws checked\n");
     return s_fail;
 }

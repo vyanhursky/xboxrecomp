@@ -1079,6 +1079,9 @@ static volatile float s_ws_extend_tag;   /* > 0: centred 2D allowed into the can
 static int s_ws_batch_tagged;            /* 1 left, 2 centred with extended horizontal clip */
 static int s_ws_frame_3d, s_ws_frame_pic;  /* this frame drew 3D / centred a full-screen picture */
 static int s_ws_frame_wide;                /* this frame drew [wide] side slabs (ws_wide_sides) */
+static int s_ws_fill_last, s_ws_fill_run;  /* the last frame got the side fill; for how many frames */
+static int s_ws_fill_steady;               /* ... and so for WS_FILL_STEADY frames or more */
+#define WS_FILL_STEADY 8                   /* a screen change has a frame or five without its [wide] art */
 static int s_ws_last_cls;                  /* the last placed batch: its class and extent */
 static float s_ws_x0, s_ws_x1, s_ws_y0, s_ws_y1, s_ws_u0, s_ws_u1, s_ws_v0, s_ws_v1;  /* u, v in texels */
 static int fetch_texcoord(uint32_t index, float out[2]);
@@ -1138,12 +1141,22 @@ static int ws_tag_band(float y, float t)
  * present, a frame later at most. */
 static void ws_end_frame(void)
 {
-    if (s_ws_k < 1.0f && s_ws_side_fill && s_ws_frame_pic && !s_ws_frame_3d && !s_ws_frame_wide) {
+    int fill = s_ws_k < 1.0f && s_ws_side_fill && s_ws_frame_pic && !s_ws_frame_3d && !s_ws_frame_wide;
+    s_ws_fill_run = fill == s_ws_fill_last ? s_ws_fill_run + 1 : 1;
+    s_ws_fill_last = fill;
+    if (s_ws_fill_run >= WS_FILL_STEADY)
+        s_ws_fill_steady = fill;
+    if (fill) {
         extern void d3d8_RequestSideFill(void);
         d3d8_RequestSideFill();
     }
     s_ws_frame_3d = s_ws_frame_pic = s_ws_frame_wide = 0;
 }
+
+#ifdef NV2A_HOST_CLIP_TEST
+/* Fixtures: this frame centred a full-screen picture (as a 4:3 menu background does). */
+void nv2a_ws_test_frame_picture(void) { s_ws_frame_pic = 1; }
+#endif
 
 static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4], float uv[2])
 {
@@ -1222,7 +1235,21 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
         if (p[1] > y1) y1 = p[1];
     }
     if (cls && s_ws_batch_tagged == 1) {
-        cls = 2;                           /* nv2a_ws_set_left_tag: already moved back up */
+        /* nv2a_ws_set_left_tag: already moved back up. At the left edge, except over a 4:3
+         * picture whose sides get the side fill (a menu background with no [wide] art): the
+         * fill is drawn over the side areas at present and would cover the element there, so
+         * it stays in the 4:3 box with the picture, where the title put it. The frames before
+         * decide, once they agree for WS_FILL_STEADY frames, so a screen keeps one placement. */
+        cls = s_ws_fill_steady ? 1 : 2;
+        {
+            static int trace = -1, last = -1;
+            if (trace < 0)
+                trace = getenv("RECOMP_WS_WIDE_TRACE") != NULL;
+            if (trace && cls != last)
+                fprintf(stderr, "[WS] left tag: %s (flip %u)%c", cls == 1 ? "in the 4:3 box, over a side-filled picture"
+                                                                  : "at the left edge", s_gpu.flips, 10);
+            last = cls;
+        }
     } else if (cls && s_ws_batch_tagged == 2) {
         cls = 1;                           /* explicit centre placement, before HUD heuristics */
     } else if (cls && x0 <= 8.0f && x1 >= 632.0f && s_gpu.texs[0].valid && pgraph_d3d11_stage0_stretch()) {
