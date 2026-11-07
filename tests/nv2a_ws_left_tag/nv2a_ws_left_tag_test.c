@@ -110,8 +110,20 @@ static void hud_strips(uint32_t left, uint32_t right, uint32_t centred, uint32_t
     expected[0] = right;
     box(448, 464, 110.0f, 142.4f);              /* P2 digit */
     box(462, 594, 124.5f, 140.5f);              /* P2 text */
+    expected[0] = left;
+    box(41, 297, 122.0f, 186.0f);               /* P1 struggle meter: frame */
+    box(52, 183, 137.0f, 147.0f);               /* its fill bar */
+    box(46.5f, 218.5f, 146.5f, 162.5f);         /* its text ("TAP ANY BUTTON") */
+    expected[0] = right;
+    box(343, 599, 121.0f, 185.0f);              /* P2 struggle meter: frame */
+    box(455, 588, 136.0f, 146.0f);              /* its fill bar */
     expected[0] = centred;
     box(48, 68, 150.0f, 170.0f);                /* below the top strip */
+    box(235.5f, 248.5f, 162.5f, 180.5f);        /* the pause panel's highest one-sided piece */
+    box(125.5f, 233.5f, 196.5f, 211.5f);        /* a pause panel label */
+    box(66, 199, 145.0f, 171.0f);               /* match summary rows, just after a fight */
+    box(455, 554, 124.0f, 147.0f);
+    box(435, 569, 141.0f, 164.0f);
     box(240, 400, 120.0f, 136.0f);              /* across the middle */
     box(48, 68, 338.5f, 370.4f);                /* no bottom strip with two fighters */
 
@@ -226,8 +238,8 @@ int main(void)
     box(48, 68, 106.5f, 142.4f);
     box(48, 68, 338.5f, 370.4f);
 
-    CHECK(draws == 43);
+    CHECK(draws == 63);
     if (!s_fail)
-        printf("nv2a-ws-left-tag: 43 draws checked\n");
+        printf("nv2a-ws-left-tag: 63 draws checked\n");
     return s_fail;
 }

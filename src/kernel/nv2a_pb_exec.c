@@ -1127,6 +1127,19 @@ void nv2a_ws_set_extend_tag(float y_offset)
     s_ws_extend_tag = y_offset > 0.0f ? y_offset : 0.0f;
 }
 
+/* Def Jam's struggle meter under a top fighter's limb health ("TAP ANY BUTTON" in a
+ * submission): a frame (y 121..186), a fill bar (y 136..147) and its text (y 146.5..162.5),
+ * measured at 16:9 for both top fighters. It starts inside the HUD's top strip and reaches
+ * below it, so it belongs with the strip: a one-sided batch that starts at y 118..150, ends by
+ * y 190 and is 18 tall or less or 60 or more. The pause panel's pieces start at y 161.5 or
+ * lower down; the match summary's rows that start this high, drawn just after a fight, are
+ * 23-26 tall. */
+static int ws_hud_meter(float y0, float y1)
+{
+    float h = y1 - y0;
+    return y0 >= 118.0f && y0 <= 150.0f && y1 <= 190.0f && (h <= 18.0f || h >= 60.0f);
+}
+
 static int ws_tag_band(float y, float t)
 {
     return t > 0.0f && s_ws_k < 1.0f && y >= t - 256.0f && y < t + 768.0f;
@@ -1251,13 +1264,14 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
          * stretches like the full-screen ones instead of stopping at the 4:3 edges. */
         cls = 4;
     } else if (cls && (uint32_t)(s_gpu.flips - s_ws_hud_flip) <= 30u
-               && (y1 <= 146.0f || (s_ws_hud_bottom && y0 >= 336.0f))) {
+               && (y1 <= 146.0f || ws_hud_meter(y0, y1) || (s_ws_hud_bottom && y0 >= 336.0f))) {
         /* Only the HUD's own strips: the top one, and the bottom one with 3-4
          * fighters. Tutorial prompts and other centred text stay whole. The
          * limits take in the whole combo call-out, whose digit, suffix and
          * text are separate batches (the digit pops out to y 142.4 at the top
          * and 338.5 at the bottom). The pause panel's lowest one-sided piece
-         * starts at y 330, so it stays centred. */
+         * starts at y 330, so it stays centred. The struggle meter goes with
+         * the top strip (ws_hud_meter). */
         if (x1 <= 300.0f)
             cls = 2;
         else if (x0 >= 340.0f)
