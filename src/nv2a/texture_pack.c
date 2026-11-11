@@ -612,7 +612,11 @@ static int memory_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureS
         struct MemorySource *m=&g_memory[i];
         if(!m->owner || m->address!=s->address || m->format!=s->format ||
            m->width!=s->width || m->height!=s->height || s->row_texels!=s->width || s->palette_entries) continue;
-        if(!m->entry.texture && commit_prepared(dev,&m->entry,m->pixels)!=1) return 0;
+        if(!m->entry.texture) {
+            if(commit_prepared(dev,&m->entry,m->pixels)!=1) return 0;
+            if(g_trace) fprintf(stderr,"[TEXPACK] owned HD owner=%08X source=%08X %ux%u -> %ux%u uploaded\n",
+                m->owner,m->address,m->width,m->height,m->pixels->w,m->pixels->h);
+        }
         m->entry.used=++g_clock;
         return SUCCEEDED(dev->lpVtbl->SetTexture(dev,stage,(IDirect3DBaseTexture8 *)m->entry.texture));
     }
