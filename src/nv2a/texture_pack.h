@@ -12,6 +12,15 @@ typedef struct RecompTextureSource {
     uint32_t palette_entries;
 } RecompTextureSource;
 typedef int (*RecompTextureSample)(void *user, uint32_t x, uint32_t y, uint32_t *argb);
+/* Render-thread-only, address-scoped host textures. Register copies the BGRA
+ * pixels and builds independent-channel mips; 1x–8x, at most 2048px. Owner must
+ * clear before freeing/reusing its guest source. Clear retires GPU objects until
+ * the next bind/shutdown, and does not affect ordinary content-addressed packs.
+ * At most 32 sources / 256 MiB of host pixels, sharing the pack GPU cache budget.
+ * Returns 0 on invalid input, duplicate address or budget/allocation failure. */
+int texture_pack_memory_register(uint32_t owner,uint32_t address,uint32_t format,
+        uint32_t native_width,uint32_t native_height,const uint8_t *bgra,uint32_t width,uint32_t height);
+void texture_pack_memory_clear(uint32_t owner);
 int texture_pack_active(void);
 int texture_pack_hash(const RecompTextureSource *source, char out[65]);
 int texture_pack_bind(IDirect3DDevice8 *device, unsigned stage,

@@ -465,6 +465,40 @@ int main(void)
     texture_pack_set_wide_replay_filter(replay_source, NULL);
     texture_pack_shutdown(&device);
     assert(!g_wide_replay_filter && !g_wide_replay_user);
+    {
+        uint8_t hd[8*8*4];unsigned n;
+        RecompTextureSource live={0};
+        _putenv_s("RECOMP_TEXTURE_PACKS","");_putenv_s("RECOMP_TEXTURE_DUMP_DIR","");
+        for(n=0;n<64;n++){hd[n*4]=10;hd[n*4+1]=20;hd[n*4+2]=30;hd[n*4+3]=(uint8_t)(n&1?219:133);}
+        assert(!texture_pack_active());
+        assert(!texture_pack_memory_register(0,123,6,4,4,hd,8,8));
+        assert(!texture_pack_memory_register(1,123,6,4,4,hd,9,8));
+        assert(texture_pack_memory_register(1,123,6,4,4,hd,8,8));
+        assert(!texture_pack_memory_register(2,123,6,4,4,hd,8,8));
+        assert(texture_pack_active());
+        live.address=124;live.format=6;live.width=live.height=live.row_texels=4;
+        assert(!texture_pack_bind(&device,0,&live,NULL,NULL)); /* Identical content, different source. */
+        live.address=123;live.format=0x12;
+        assert(!texture_pack_bind(&device,0,&live,NULL,NULL));
+        live.format=6;
+        assert(texture_pack_bind(&device,0,&live,NULL,NULL));
+        texture=(MockTexture *)bound[0];assert(texture->width==8 && texture->height==8);
+        assert(!memcmp(texture->mips[0],hd,sizeof hd));
+        assert(texture->mips[1][0]==10 && texture->mips[1][3]==176);
+        texture_pack_memory_clear(2);assert(texture_pack_bind(&device,0,&live,NULL,NULL));
+        texture_pack_memory_clear(1);assert(!texture_pack_bind(&device,0,&live,NULL,NULL));
+        assert(!g_memory_bytes && !g_memory_count && !bound[0]);
+        /* Repeated unload/reuse before another draw cannot exhaust the 32 slots. */
+        for(n=0;n<64;n++) {
+            assert(texture_pack_memory_register(1,123,6,4,4,hd,8,8));
+            texture_pack_memory_clear(1);
+        }
+        assert(texture_pack_memory_register(3,123,6,4,4,hd,8,8));
+        assert(texture_pack_bind(&device,0,&live,NULL,NULL));
+        texture_pack_shutdown(&device);
+        assert(!g_memory_count && !g_memory_bytes && !bound[0]);
+    }
+
 #if defined(_WIN32)
     CoUninitialize();
 #endif

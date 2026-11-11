@@ -51,6 +51,17 @@ typedef struct PackEntry {
 } PackEntry;
 static PackEntry *g_entries;
 static size_t g_count, g_capacity;
+#define MEMORY_SOURCES 32
+#define MEMORY_BUDGET (256u*1024u*1024u)
+struct Prepared;
+static struct MemorySource {
+    uint32_t owner, address, format, width, height;
+    struct Prepared *pixels;
+    PackEntry entry;
+    int retired;
+} g_memory[MEMORY_SOURCES];
+static uint64_t g_memory_bytes;
+static unsigned g_memory_count,g_memory_retired;
 /* The [wide] anchors, built after the entries are sorted: each names a run of slab entries. */
 #define WIDE_MAX_SLABS 16
 typedef struct WideAnchor { char id[65]; unsigned order; size_t first, count; PackEntry *inner; } WideAnchor;
@@ -323,7 +334,7 @@ static void initialize(void)
         fprintf(stderr,"[TEXPACK] schema=1 entries=%zu wide=%zu stretch=%zu cache=%ld MiB dump=%s\n",g_count,g_wide_count,g_stretch_count,mb,g_dump);
     }
 }
-int texture_pack_active(void) { initialize(); return g_active; }
+int texture_pack_active(void) { initialize(); return g_active || g_memory_count || g_memory_retired; }
 
 static int readable(const void *data,uint64_t bytes)
 {
@@ -436,6 +447,12 @@ static int make_room(IDirect3DDevice8 *dev,uint64_t need)
             for(stage=0;stage<4;stage++) if(bound[stage]==(IDirect3DBaseTexture8 *)g_entries[i].texture) in_use=1;
             if(g_entries[i].texture && !in_use && (!old || g_entries[i].used<old->used)) old=&g_entries[i];
         }
+        for(i=0;i<MEMORY_SOURCES;i++) {
+            PackEntry *e=&g_memory[i].entry;
+            int in_use=0;
+            for(stage=0;stage<4;stage++) if(bound[stage]==(IDirect3DBaseTexture8 *)e->texture) in_use=1;
+            if(e->texture && !in_use && (!old || e->used<old->used)) old=e;
+        }
         if(!old) return 0;
         release_entry(dev,old); g_win.evictions++;
     }
@@ -461,30 +478,10 @@ static void prepared_free(Prepared *p)
     for(i=0;i<16;i++) free(p->level[i]);
     free(p);
 }
-/* Decode, pad to the guest's row length and build the mips. Returns NULL for a replacement that
- * is rejected (*retry 0) or that failed for a reason that can clear (*retry 1). */
-static Prepared *prepare_png(const char *path,uint32_t src_w,uint32_t src_h,uint32_t row_texels,int channel_mips,int *retry)
+static Prepared *prepare_memory(uint8_t *data,uint32_t w,uint32_t h,int channel_mips,int *retry)
 {
-    uint32_t w=0,h=0,physical_w,levels=1,dim,y,x,level;
-    uint8_t *data,*padded=NULL;
+    uint32_t levels=1,dim,y,x,level;
     Prepared *out;
-    RecompTextureSource shape={0};
-    shape.width=src_w; shape.height=src_h;
-    *retry=0;
-    data=read_png(path,&w,&h,retry);
-    if(!data) return NULL;
-    if(!valid_scale(w,h,&shape)) { free(data); return NULL; }
-    physical_w=row_texels*(w/src_w);
-    if(physical_w<w || physical_w>16384 || (uint64_t)physical_w*h*4>g_budget/4) { free(data); return NULL; }
-    if(physical_w!=w) {
-        padded=malloc((size_t)physical_w*h*4);
-        if(!padded) { free(data); *retry=1; return NULL; }
-        for(y=0;y<h;y++) {
-            memcpy(padded+(size_t)y*physical_w*4,data+(size_t)y*w*4,w*4);
-            for(x=w;x<physical_w;x++) memcpy(padded+((size_t)y*physical_w+x)*4,data+((size_t)y*w+w-1)*4,4);
-        }
-        free(data); data=padded; w=physical_w;
-    }
     for(dim=w>h?w:h;dim>1;dim>>=1) levels++;
     out=calloc(1,sizeof *out);
     if(!out) { free(data); *retry=1; return NULL; }
@@ -518,6 +515,31 @@ static Prepared *prepare_png(const char *path,uint32_t src_w,uint32_t src_h,uint
     }
     return out;
 }
+/* Decode, pad to the guest's row length and build the mips. Returns NULL for a replacement that
+ * is rejected (*retry 0) or that failed for a reason that can clear (*retry 1). */
+static Prepared *prepare_png(const char *path,uint32_t src_w,uint32_t src_h,uint32_t row_texels,int channel_mips,int *retry)
+{
+    uint32_t w=0,h=0,physical_w,y,x;
+    uint8_t *data,*padded=NULL;
+    RecompTextureSource shape={0};
+    shape.width=src_w; shape.height=src_h;
+    *retry=0;
+    data=read_png(path,&w,&h,retry);
+    if(!data) return NULL;
+    if(!valid_scale(w,h,&shape)) { free(data); return NULL; }
+    physical_w=row_texels*(w/src_w);
+    if(physical_w<w || physical_w>16384 || (uint64_t)physical_w*h*4>g_budget/4) { free(data); return NULL; }
+    if(physical_w!=w) {
+        padded=malloc((size_t)physical_w*h*4);
+        if(!padded) { free(data); *retry=1; return NULL; }
+        for(y=0;y<h;y++) {
+            memcpy(padded+(size_t)y*physical_w*4,data+(size_t)y*w*4,w*4);
+            for(x=w;x<physical_w;x++) memcpy(padded+((size_t)y*physical_w+x)*4,data+((size_t)y*w+w-1)*4,4);
+        }
+        free(data); data=padded; w=physical_w;
+    }
+    return prepare_memory(data,w,h,channel_mips,retry);
+}
 /* Create the texture and copy the chain in. D3D calls: the render thread only. 1 done, -1 retry later. */
 static int commit_prepared(IDirect3DDevice8 *dev,PackEntry *e,const Prepared *p)
 {
@@ -538,6 +560,63 @@ static int commit_prepared(IDirect3DDevice8 *dev,PackEntry *e,const Prepared *p)
     e->texture=texture; e->bytes=p->memory; e->levels=p->levels; g_resident+=p->memory; return 1;
 fail:
     texture->lpVtbl->Release(texture); return -1;
+}
+/* Owned, address-scoped replacements for applications that build textures at runtime.
+ * All calls, like bind/shutdown, belong to the render thread. No guest allocation
+ * is enlarged; bytes are copied and alpha is treated as independent material data. */
+void texture_pack_memory_clear(uint32_t owner)
+{
+    unsigned i;
+    for(i=0;i<MEMORY_SOURCES;i++) if(g_memory[i].owner && (!owner || g_memory[i].owner==owner)) {
+        struct MemorySource *m=&g_memory[i];
+        g_memory_bytes-=m->pixels->memory/2;
+        prepared_free(m->pixels);m->pixels=NULL;m->owner=0;
+        if(!m->retired) {m->retired=1;++g_memory_retired;}
+        --g_memory_count;
+    }
+}
+int texture_pack_memory_register(uint32_t owner,uint32_t address,uint32_t format,
+        uint32_t native_w,uint32_t native_h,const uint8_t *bgra,uint32_t w,uint32_t h)
+{
+    unsigned i;struct MemorySource *m=NULL;int retry=0;
+    RecompTextureSource shape={0};Prepared *p;uint8_t *copy;
+    initialize();shape.width=native_w;shape.height=native_h;
+    if(!owner || !address || !bgra || !native_w || !native_h || w>2048 || h>2048 ||
+       (format!=0x06 && format!=0x12) || !valid_scale(w,h,&shape)) return 0;
+    for(i=0;i<MEMORY_SOURCES;i++) {
+        if(g_memory[i].owner && g_memory[i].address==address) return 0;
+        if(!g_memory[i].owner && !m) m=&g_memory[i];
+    }
+    if(!m) return 0;
+    copy=malloc((size_t)w*h*4);if(!copy) return 0;
+    memcpy(copy,bgra,(size_t)w*h*4);
+    p=prepare_memory(copy,w,h,1,&retry);if(!p) return 0;
+    if(g_memory_bytes+p->memory/2>MEMORY_BUDGET) {prepared_free(p);return 0;}
+    m->owner=owner;m->address=address;m->format=format;m->width=native_w;m->height=native_h;m->pixels=p;
+    g_memory_bytes+=p->memory/2;++g_memory_count;
+    return 1;
+}
+static void memory_reap(IDirect3DDevice8 *dev)
+{
+    unsigned i;
+    for(i=0;i<MEMORY_SOURCES;i++) if(g_memory[i].retired) {
+        release_entry(dev,&g_memory[i].entry);--g_memory_retired;
+        if(g_memory[i].owner) g_memory[i].retired=0;
+        else memset(&g_memory[i],0,sizeof g_memory[i]);
+    }
+}
+static int memory_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSource *s)
+{
+    unsigned i;
+    for(i=0;i<MEMORY_SOURCES;i++) {
+        struct MemorySource *m=&g_memory[i];
+        if(!m->owner || m->address!=s->address || m->format!=s->format ||
+           m->width!=s->width || m->height!=s->height || s->row_texels!=s->width || s->palette_entries) continue;
+        if(!m->entry.texture && commit_prepared(dev,&m->entry,m->pixels)!=1) return 0;
+        m->entry.used=++g_clock;
+        return SUCCEEDED(dev->lpVtbl->SetTexture(dev,stage,(IDirect3DBaseTexture8 *)m->entry.texture));
+    }
+    return 0;
 }
 static int upload_png(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSource *source)
 {
@@ -813,8 +892,12 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
     uint64_t quick=0; int have_quick=0;
     unsigned i, slot=source_slot(s);
     ULONGLONG now=now_ms();
-    if(!texture_pack_active() || !dev || stage>3) return 0;
+    initialize();
+    if(!dev || stage>3) return 0;
+    memory_reap(dev);
     g_stage_id[stage][0]=0;
+    if(memory_bind(dev,stage,s)) return 1;
+    if(!g_active) return 0;
     if(!g_win.start) g_win.start=now;
     if(now-g_win.start>=2000) {
         if(g_win.loads || g_win.evictions)
@@ -972,9 +1055,15 @@ void texture_pack_shutdown(IDirect3DDevice8 *dev)
     if(g_active) fprintf(stderr,"[TEXPACK] hits=%llu misses=%llu dumps=%llu hashed=%llu resident=%llu\n",
         (unsigned long long)g_hits,(unsigned long long)g_misses,(unsigned long long)g_dumps,(unsigned long long)g_hashed,(unsigned long long)g_resident);
     workers_stop();
+    texture_pack_memory_clear(0);
+    if(dev) memory_reap(dev);
+    else memset(g_memory,0,sizeof g_memory);
+    g_memory_retired=0;
     g_wide_replay_filter=NULL; g_wide_replay_user=NULL;
     if(dev) for(i=0;i<g_count;i++) release_entry(dev,&g_entries[i]);
     free(g_entries); g_entries=NULL; g_count=g_capacity=0;
+    free(g_wide);g_wide=NULL;g_wide_count=0;
+    free(g_stretch);g_stretch=NULL;g_stretch_count=0;
     memset(g_sources,0,sizeof g_sources);
     host_shutdown();
     g_initialized=g_active=0; g_dump[0]=0;
