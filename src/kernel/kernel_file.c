@@ -727,19 +727,32 @@ typedef struct {
     HANDLE file_handle;
     HANDLE find_handle;
     BOOL   first_done;
+    unsigned long long last_used;   /* s_dir_clock when the search last answered */
     WIN32_FIND_DATAW find_data;
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+static unsigned long long s_dir_clock;
 
+/* A title can stop a search part-way and never close the directory handle
+ * (Def Jam's save-time profile scan stops at the second profile on every
+ * save; a real console has handles to spare). Each such search holds a slot
+ * for the life of the process, so a long session used them all and every later
+ * listing failed with STATUS_INSUFFICIENT_RESOURCES: the title saw no saved
+ * profiles and offered to create a new one. A full table therefore gives up
+ * the search that has gone longest without an answer. The title still owns
+ * that handle; if it ever does ask again it starts from the first entry, as
+ * any new search would. */
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
+    int oldest = 0;
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
         if (s_dir_contexts[i].file_handle == FileHandle && s_dir_contexts[i].find_handle != NULL) {
+            s_dir_contexts[i].last_used = ++s_dir_clock;
             LeaveCriticalSection(&s_dir_cs);
             return &s_dir_contexts[i];
         }
@@ -749,12 +762,22 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
         if (s_dir_contexts[i].find_handle == NULL) {
             s_dir_contexts[i].file_handle = FileHandle;
             s_dir_contexts[i].first_done = FALSE;
+            s_dir_contexts[i].last_used = ++s_dir_clock;
             LeaveCriticalSection(&s_dir_cs);
             return &s_dir_contexts[i];
         }
+        if (s_dir_contexts[i].last_used < s_dir_contexts[oldest].last_used)
+            oldest = i;
     }
+    /* Full: every slot is a live search. Reuse the least recently answered. */
+    if (s_dir_contexts[oldest].find_handle != INVALID_HANDLE_VALUE)
+        FindClose(s_dir_contexts[oldest].find_handle);
+    s_dir_contexts[oldest].find_handle = NULL;
+    s_dir_contexts[oldest].file_handle = FileHandle;
+    s_dir_contexts[oldest].first_done = FALSE;
+    s_dir_contexts[oldest].last_used = ++s_dir_clock;
     LeaveCriticalSection(&s_dir_cs);
-    return NULL;
+    return &s_dir_contexts[oldest];
 }
 
 /* A closed directory handle takes its enumeration with it. Host handle values
@@ -798,8 +821,10 @@ static NTSTATUS query_directory(
     }
 
     ctx = find_or_create_dir_context(FileHandle, TRUE);
-    if (!ctx)
+    if (!ctx) {
+        IoStatusBlock->Status = STATUS_INSUFFICIENT_RESOURCES;
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     if (RestartScan || !ctx->first_done) {
         if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE) {
@@ -1651,11 +1676,13 @@ typedef struct {
     HANDLE handle;
     char **names;
     int    count, next;
+    unsigned long long last_used;   /* s_dir_clock when the search last answered */
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+static unsigned long long s_dir_clock;
 
 static void dir_context_clear(DIR_CONTEXT *ctx)
 {
@@ -1716,9 +1743,18 @@ static NTSTATUS query_directory(
         int cap = 0;
 
         if (!ctx) {
-            for (int i = 0; i < MAX_DIR_CONTEXTS; i++)
+            int oldest = 0;
+            for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
                 if (s_dir_contexts[i].handle == NULL) { ctx = &s_dir_contexts[i]; break; }
-            if (!ctx) { LeaveCriticalSection(&s_dir_cs); return STATUS_INSUFFICIENT_RESOURCES; }
+                if (s_dir_contexts[i].last_used < s_dir_contexts[oldest].last_used)
+                    oldest = i;
+            }
+            /* A title can stop a search part-way and never close the handle
+             * (Def Jam's save-time profile scan does so on every save). A full
+             * table gives up the search that has gone longest without an
+             * answer, rather than failing every later listing with
+             * STATUS_INSUFFICIENT_RESOURCES so the title sees no saved games. */
+            if (!ctx) ctx = &s_dir_contexts[oldest];
         }
         dir_context_clear(ctx);
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
@@ -1757,6 +1793,7 @@ static NTSTATUS query_directory(
         ctx->handle = FileHandle;
     }
 
+    ctx->last_used = ++s_dir_clock;
     if (ctx->next >= ctx->count) {
         dir_context_clear(ctx);
         LeaveCriticalSection(&s_dir_cs);

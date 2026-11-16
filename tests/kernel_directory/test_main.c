@@ -128,8 +128,32 @@ int main(void) {
     h=guest_open();
     if(ok) ok=active_searches()==0 && invoke(h,"Save*",0,1) && g_eax==0;
     if(h!=INVALID_HANDLE_VALUE) guest_close(h);
+    /* A title may stop a search part-way and never close the handle: Def Jam's
+     * save-time profile scan does so on every save. The searches must not pile
+     * up until the table is full and every later listing fails with
+     * STATUS_INSUFFICIENT_RESOURCES (the title then sees no saved profiles). */
+    {
+        enum { ABANDONED = MAX_DIR_CONTEXTS * 4 };
+        HANDLE leaked[ABANDONED];
+        unsigned opened = 0;
+        for(unsigned round=0; ok && round<ABANDONED; round++) {
+            leaked[opened]=guest_open();
+            if(leaked[opened]==INVALID_HANDLE_VALUE) {ok=0;break;}
+            opened++;
+            ok=invoke(leaked[round],"Save*",0,1) && g_eax==0;
+            if(!ok) fprintf(stderr,"FAIL abandoned search %u of %u: status=%08X\n",
+                            round,(unsigned)ABANDONED,g_eax);
+        }
+        if(ok && active_searches()>MAX_DIR_CONTEXTS) ok=0;
+        /* A newly opened directory still lists from its first entry. */
+        if(ok) { h=guest_open(); ok=h!=INVALID_HANDLE_VALUE && invoke(h,"Save*",0,1)
+                 && g_eax==0 && e->FileNameLength==8 && !memcmp(e->FileName,"SaveSlot",8);
+                 if(h!=INVALID_HANDLE_VALUE) guest_close(h); }
+        for(unsigned i=0;i<opened;i++) guest_close(leaked[i]);
+        if(ok) ok=active_searches()==0;
+    }
     RemoveDirectoryA(child); RemoveDirectoryA(path); VirtualFree(mem,0,MEM_RELEASE);
     if(!ok) return 1;
-    puts("PASS: directory ABI/filter/restart/status, guest/direct close, 144 slot-reuse cycles and fresh searches"); return 0;
+    puts("PASS: directory ABI/filter/restart/status, guest/direct close, 144 slot-reuse cycles, abandoned searches and fresh searches"); return 0;
 }
 

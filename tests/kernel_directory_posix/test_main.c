@@ -95,6 +95,29 @@ static void independent_searches(void)
     check(ok,"ordinary file close");
     check(xbox_NtClose(NULL)==STATUS_INVALID_HANDLE,"null close retains invalid-handle status");
 }
+/* A title can stop a search part-way and never close the handle (Def Jam's
+ * save-time profile scan does on every save). Past the search table's size the
+ * listing must keep answering, not fail with STATUS_INSUFFICIENT_RESOURCES. */
+static void abandoned_searches(void)
+{
+    enum { ABANDONED = 150 };
+    HANDLE leaked[ABANDONED]; int opened=0, fresh=0;
+    for (int i=0;i<ABANDONED;i++) {
+        char path[32]; HANDLE h=NULL;
+        snprintf(path,sizeof path,"z:\\dir%d",i%8);
+        if (open_guest(path,XBOX_FILE_DIRECTORY_FILE,&h)!=STATUS_SUCCESS || !h) break;
+        leaked[opened++]=h;
+        fresh += query(h,i%8,0);
+    }
+    printf("abandoned searches: opened=%d answered=%d/%d\n",opened,fresh,(int)ABANDONED);
+    check(opened==ABANDONED && fresh==ABANDONED,
+          "searches never closed do not exhaust the search table");
+    for (int i=0;i<opened;i++) if (xbox_NtClose(leaked[i])!=STATUS_SUCCESS) failures++;
+    HANDLE h=NULL;
+    int ok=open_guest("z:\\dir3",XBOX_FILE_DIRECTORY_FILE,&h)==STATUS_SUCCESS && h && query(h,3,0);
+    if (h) xbox_NtClose(h);
+    check(ok,"a new search after the abandoned ones starts at its first entry");
+}
 int main(void)
 {
     char root[]="/tmp/xbox-dir-search-XXXXXX",path[512];
@@ -108,7 +131,7 @@ int main(void)
         }
     }
     xbox_path_init(root,root);
-    lifetime();independent_searches();
+    lifetime();independent_searches();abandoned_searches();
     for(int i=0;i<8;i++) {
         for(int j=0;j<4;j++) {
             snprintf(path,sizeof path,"%s/Cache/dir%d/dir%d-%c.%s",root,i,i,'a'+j,j<3?"sav":"txt");unlink(path);
