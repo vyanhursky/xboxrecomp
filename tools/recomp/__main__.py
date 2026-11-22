@@ -289,7 +289,17 @@ def main():
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Body-lifting processes in --split mode (default: 1; spawn on every host)')
+    parser.add_argument('--chunk-lines', type=int,
+                        help='Function-body line budget per split chunk, except indivisible functions')
     args = parser.parse_args()
+    if args.workers < 1 or (args.chunk_lines is not None and args.chunk_lines < 1):
+        parser.error('--workers and --chunk-lines must be positive')
+    if sys.platform == 'win32' and args.workers > 61:
+        parser.error('Windows supports at most 61 worker processes')
+    if (args.workers != 1 or args.chunk_lines is not None) and not args.split:
+        parser.error('--workers and --chunk-lines require --split')
 
     # Reset on every CLI invocation, including one with no manual file.
     from . import translator as translator_module
@@ -516,6 +526,8 @@ def main():
             chunk_size=args.split,
             verbose=args.verbose,
             manual=manual,
+            workers=args.workers,
+            chunk_lines=args.chunk_lines,
         )
 
         t_translate = time.time() - t0

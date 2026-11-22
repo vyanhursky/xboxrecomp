@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import sys
+from contextlib import closing, nullcontext
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
@@ -199,6 +200,31 @@ def write_if_changed(path, text):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return True
+
+
+def split_translations(translations, chunk_size, chunk_lines=None):
+    """Keep source order while bounding each TU by function count and C lines.
+
+    A single large function is indivisible. The optional body-line budget avoids
+    placing many large functions together and leaving one compiler straggler.
+    The legacy function-count layout remains the default for existing callers.
+    """
+    if chunk_size < 1 or (chunk_lines is not None and chunk_lines < 1):
+        raise ValueError('chunk sizes must be positive')
+    if chunk_lines is None:
+        return [translations[i:i + chunk_size] for i in range(0, len(translations), chunk_size)]
+    chunks, current, lines = [], [], 0
+    for entry in translations:
+        cost = entry[2].count('\n') + 1
+        if current and (len(current) >= chunk_size or
+                        (chunk_lines is not None and lines + cost > chunk_lines)):
+            chunks.append(current)
+            current, lines = [], 0
+        current.append(entry)
+        lines += cost
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 # Hooked starts are protected before boundary repair by the CLI.
@@ -528,6 +554,17 @@ class FunctionTranslator:
         # The guest CPU's quantum check at every loop back edge
         # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
         self.back_edge_yield = False
+
+    def _warn_once(self, seen_name, key, text):
+        seen = getattr(self, seen_name)
+        if key in seen:
+            return
+        seen.add(key)
+        events = getattr(self, '_warning_events', None)
+        if events is None:
+            print(text, file=sys.stderr)
+        else:
+            events.append((seen_name, key, text))
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -1788,11 +1825,10 @@ class FunctionTranslator:
             readable = _config.readable_end(section)
             if section.is_code and end_va > readable:
                 key = (start_va, end_va)
-                if key not in self._unreadable_reported:
-                    self._unreadable_reported.add(key)
-                    print(f"  WARN: sub_{start_va:08X} ends at 0x{end_va:08X}, "
-                          f"past {section.name}'s readable end "
-                          f"0x{readable:08X}; not read", file=sys.stderr)
+                self._warn_once('_unreadable_reported', key,
+                                f"  WARN: sub_{start_va:08X} ends at 0x{end_va:08X}, "
+                                f"past {section.name}'s readable end "
+                                f"0x{readable:08X}; not read")
                 return None
             file_end = section.raw_addr + section.raw_size
             if file_end > len(self.xbe_data):
@@ -2693,14 +2729,14 @@ class FunctionTranslator:
                      or (last_insn.mnemonic == "pop"
                          and last_insn.op_str.strip() == "ebp"))
                 and (end, last_insn.address) not in self._teardown_reported):
-            self._teardown_reported.add((end, last_insn.address))
             section = _config.section_at(start)
             raw_end = (f"0x{section.va + section.raw_size:08X}"
                        if section else "unknown")
             text = f"{last_insn.mnemonic} {last_insn.op_str}".strip()
-            print(f"  WARN: sub_{start:08X} ends on `{text}` at "
-                  f"0x{last_insn.address:08X} with no terminator "
-                  f"(section raw end {raw_end})", file=sys.stderr)
+            self._warn_once('_teardown_reported', (end, last_insn.address),
+                            f"  WARN: sub_{start:08X} ends on `{text}` at "
+                            f"0x{last_insn.address:08X} with no terminator "
+                            f"(section raw end {raw_end})")
 
         # Ensure ebp tracked if function has tail jumps (lifter emits
         # g_seh_ebp = ebp before external jmp, external jcc, and indirect jmp,
@@ -3488,7 +3524,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              workers=1, chunk_lines=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -3509,6 +3546,12 @@ class BatchTranslator:
         """
         import sys
 
+        if workers < 1:
+            raise ValueError('workers must be positive')
+        if sys.platform == 'win32' and workers > 61:
+            raise ValueError('Windows supports at most 61 worker processes')
+        if chunk_size < 1 or (chunk_lines is not None and chunk_lines < 1):
+            raise ValueError('chunk sizes must be positive')
         os.makedirs(output_dir, exist_ok=True)
 
         func_list = [item for item in func_list
@@ -3530,28 +3573,38 @@ class BatchTranslator:
             "total_lines": 0,
         }
 
-        for i, (addr, func_info) in enumerate(func_list):
-            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
-            if verbose and (i % 500 == 0 or i == len(func_list) - 1):
-                print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
-                      file=sys.stderr)
+        if workers > 1:
+            work = [item for item in func_list if item[0] not in manual]
+            from .parallel import body_results
+            results = iter(body_results(self.translator, work, workers, ENTRY_HOOKS))
+        else:
+            results = None
 
-            if addr in manual:
-                # Hand-written elsewhere: declare it, emit nothing.
-                manual_decls[addr] = name
-                continue
-
-            code = self.translator.translate_function(addr, func_info)
-            if code:
-                translations.append((addr, name, code))
-                stats["translated"] += 1
-                stats["total_lines"] += code.count("\n")
-            else:
-                # Stub for failed translations
-                stub = f"/* FAILED: {name} at 0x{addr:08X} */\n"
-                stub += f"void {name}(void) {{ /* translation failed */ }}\n"
-                translations.append((addr, name, stub))
-                stats["failed"] += 1
+        with closing(results) if results is not None else nullcontext():
+            for i, (addr, func_info) in enumerate(func_list):
+                name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
+                if verbose and (i % 500 == 0 or i == len(func_list) - 1):
+                    print(f"  [{i+1}/{len(func_list)}] Translating {name}...", file=sys.stderr)
+                if addr in manual:
+                    manual_decls[addr] = name
+                    continue
+                if results is None:
+                    code = self.translator.translate_function(addr, func_info)
+                else:
+                    result_addr, code = next(results)
+                    if result_addr != addr:
+                        raise RuntimeError('parallel lifting returned functions out of order')
+                if code:
+                    translations.append((addr, name, code))
+                    stats['translated'] += 1
+                    stats['total_lines'] += code.count('\n')
+                else:
+                    stub = f"/* FAILED: {name} at 0x{addr:08X} */\n"
+                    stub += f"void {name}(void) {{ /* translation failed */ }}\n"
+                    translations.append((addr, name, stub))
+                    stats['failed'] += 1
+            if results is not None and next(results, None) is not None:
+                raise RuntimeError('parallel lifting returned extra functions')
 
         # A wrapped function's body is sub_X_gen; the hand-written sub_X is
         # what callers and indirect dispatch must reach, so declare it like
@@ -3673,8 +3726,7 @@ class BatchTranslator:
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
-        chunks = [translations[i:i+chunk_size]
-                  for i in range(0, len(translations), chunk_size)]
+        chunks = split_translations(translations, chunk_size, chunk_lines)
 
         # Remove chunk files a previous, larger run left behind. Projects glob
         # gen/*.c into their build, so a stale chunk keeps compiling: it still
@@ -3683,9 +3735,11 @@ class BatchTranslator:
         # code that looks perfectly correct. Nothing else cleans them, and the
         # count only has to shrink once -- which it does the first time a
         # detector fix changes how many functions are found.
-        for stale in sorted(glob.glob(os.path.join(output_dir,
-                                                   f"{prefix}_[0-9][0-9][0-9][0-9].c"))):
-            index = int(os.path.basename(stale)[len(prefix) + 1:-2])
+        for stale in sorted(glob.glob(os.path.join(output_dir, f'{glob.escape(prefix)}_*.c'))):
+            match = re.fullmatch(re.escape(prefix) + r'_([0-9]{4,})\.c', os.path.basename(stale))
+            if not match:
+                continue
+            index = int(match.group(1))
             if index >= len(chunks):
                 os.remove(stale)
                 if verbose:
@@ -3842,6 +3896,8 @@ class BatchTranslator:
         stats["files"] = generated_files
         stats["num_chunks"] = len(chunks)
         stats["chunk_size"] = chunk_size
+        stats["chunk_lines"] = chunk_lines
+        stats["workers"] = workers
         return stats
 
     def _write_dispatch_table(self, translations, output_path, header_name):
