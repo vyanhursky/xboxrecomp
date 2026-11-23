@@ -15,6 +15,7 @@ if(WIN32)
         d3d8_combiners.c
         d3d8_vsh.c
         d3d8_extvs.c
+        d3d8_shader_cache.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
 

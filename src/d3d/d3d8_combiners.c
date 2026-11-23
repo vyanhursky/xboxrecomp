@@ -888,7 +888,7 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
             LARGE_INTEGER f, t0, t1;
             QueryPerformanceFrequency(&f);
             QueryPerformanceCounter(&t0);
-            hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
+            hr = d3d8_compile_cached(hlsl, (SIZE_T)len, "ps_combiner",
                             NULL, NULL, "main", "ps_5_0",
                             D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                             &code, &errors);

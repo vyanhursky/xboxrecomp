@@ -13,6 +13,7 @@
 #include "d3d8_internal.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ================================================================
  * Cached D3D11 state objects
@@ -27,6 +28,82 @@ static ID3D11SamplerState      *g_sampler_states[4] = { NULL, NULL, NULL, NULL }
 static DWORD g_last_blend_hash = 0;
 static DWORD g_last_raster_hash = 0;
 static D3D11_DEPTH_STENCIL_DESC g_last_ds_desc;
+static D3D11_BLEND_DESC g_last_blend_desc;
+static D3D11_RASTERIZER_DESC g_last_raster_desc;
+static D3D11_SAMPLER_DESC g_last_sampler_desc[4];
+static int g_sampler_valid[4];
+
+/* A cache owns one reference, independent of the active state and context.
+ * Full zero-initialized descriptors are keys; dynamic bind values stay out. */
+#define STATE_SLOTS 32
+typedef struct { unsigned char desc[512]; IUnknown *object; uint64_t used; } StateEntry;
+static StateEntry g_state_cache[4][STATE_SLOTS];
+static uint64_t g_state_tick;
+static D3D8StateStats g_state_stats;
+static int g_reuse = -1, g_profile = -1;
+
+static int reuse_states(void)
+{
+    if (g_reuse < 0) {
+        const char *v = getenv("RECOMP_D3D11_STATE_CACHE");
+        g_reuse = v && *v == '1';
+    }
+    return g_reuse;
+}
+
+static void *find_state(unsigned kind, const void *desc, size_t size)
+{
+    unsigned i;
+    for (i = 0; i < STATE_SLOTS; i++) {
+        StateEntry *e = &g_state_cache[kind][i];
+        if (e->object && !memcmp(e->desc, desc, size)) {
+            e->used = ++g_state_tick;
+            IUnknown_AddRef(e->object);
+            g_state_stats.hits[kind]++;
+            return e->object;
+        }
+    }
+    return NULL;
+}
+
+static void keep_state(unsigned kind, const void *desc, size_t size, void *object)
+{
+    unsigned i, slot = 0;
+    StateEntry *e;
+    if (size > sizeof g_state_cache[0][0].desc) return;
+    for (i = 0; i < STATE_SLOTS; i++) {
+        if (!g_state_cache[kind][i].object) { slot = i; break; }
+        if (g_state_cache[kind][i].used < g_state_cache[kind][slot].used) slot = i;
+    }
+    e = &g_state_cache[kind][slot];
+    if (e->object) { IUnknown_Release(e->object); g_state_stats.evictions[kind]++; }
+    memcpy(e->desc, desc, size);
+    e->object = (IUnknown *)object;
+    IUnknown_AddRef(e->object);
+    e->used = ++g_state_tick;
+}
+
+void d3d8_states_get_stats(D3D8StateStats *out) { if (out) *out = g_state_stats; }
+
+static void state_report(void)
+{
+    static ULONGLONG last;
+    ULONGLONG now;
+    if (g_profile < 0) {
+        const char *v = getenv("RECOMP_STREAM2_STATS");
+        g_profile = v && *v == '1';
+    }
+    if (!g_profile) return;
+    now = GetTickCount64();
+    if (!last) last = now;
+    if (now - last < 2000) return;
+    last = now;
+    fprintf(stderr, "[S2STATE] enabled=%d draws=%llu creates=%llu,%llu,%llu,%llu hits=%llu,%llu,%llu,%llu fast=%llu,%llu,%llu,%llu\n",
+        reuse_states(), g_state_stats.draws,
+        g_state_stats.creates[0], g_state_stats.creates[1], g_state_stats.creates[2], g_state_stats.creates[3],
+        g_state_stats.hits[0], g_state_stats.hits[1], g_state_stats.hits[2], g_state_stats.hits[3],
+        g_state_stats.fast[0], g_state_stats.fast[1], g_state_stats.fast[2], g_state_stats.fast[3]);
+}
 
 /* ================================================================
  * D3D8 → D3D11 enum translation
@@ -142,13 +219,8 @@ static void update_blend_state(const DWORD *rs)
     D3D11_BLEND_DESC bd;
     HRESULT hr;
 
-    if (hash == g_last_blend_hash && g_blend_state) return;
+    if (!reuse_states() && hash == g_last_blend_hash && g_blend_state) return;
     g_last_blend_hash = hash;
-
-    if (g_blend_state) {
-        ID3D11BlendState_Release(g_blend_state);
-        g_blend_state = NULL;
-    }
 
     memset(&bd, 0, sizeof(bd));
     bd.RenderTarget[0].BlendEnable = rs[D3DRS_ALPHABLENDENABLE] ? TRUE : FALSE;
@@ -160,7 +232,18 @@ static void update_blend_state(const DWORD *rs)
     bd.RenderTarget[0].BlendOpAlpha = bd.RenderTarget[0].BlendOp;
     bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(rs[D3DRS_COLORWRITEENABLE] & 0x0F);
 
+    if (reuse_states() && g_blend_state && !memcmp(&bd, &g_last_blend_desc, sizeof bd)) {
+        g_state_stats.fast[0]++; return;
+    }
+    if (g_blend_state) { ID3D11BlendState_Release(g_blend_state); g_blend_state = NULL; }
+    if (reuse_states()) g_blend_state = (ID3D11BlendState *)find_state(0, &bd, sizeof bd);
+    if (g_blend_state) { g_last_blend_desc = bd; return; }
+    g_state_stats.creates[0]++;
     hr = ID3D11Device_CreateBlendState(d3d8_GetD3D11Device(), &bd, &g_blend_state);
+    if (SUCCEEDED(hr)) {
+        g_last_blend_desc = bd;
+        if (reuse_states()) keep_state(0, &bd, sizeof bd, g_blend_state);
+    }
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateBlendState failed: 0x%08lX\n", hr);
 }
@@ -187,17 +270,24 @@ static void update_depth_stencil_state(const DWORD *rs)
 
     /* Zeroed padding makes the complete descriptor comparable; the reference
      * is bound separately. */
-    if (g_ds_state && memcmp(&dsd, &g_last_ds_desc, sizeof(dsd)) == 0) return;
+    if (g_ds_state && memcmp(&dsd, &g_last_ds_desc, sizeof(dsd)) == 0) {
+        g_state_stats.fast[1]++; return;
+    }
     if (g_ds_state) {
         ID3D11DepthStencilState_Release(g_ds_state);
         g_ds_state = NULL;
     }
 
+    if (reuse_states()) g_ds_state = (ID3D11DepthStencilState *)find_state(1, &dsd, sizeof dsd);
+    if (g_ds_state) { g_last_ds_desc = dsd; return; }
+    g_state_stats.creates[1]++;
     hr = ID3D11Device_CreateDepthStencilState(d3d8_GetD3D11Device(), &dsd, &g_ds_state);
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateDepthStencilState failed: 0x%08lX\n", hr);
-    else
+    else {
         memcpy(&g_last_ds_desc, &dsd, sizeof(dsd));
+        if (reuse_states()) keep_state(1, &dsd, sizeof dsd, g_ds_state);
+    }
 }
 
 static void update_rasterizer_state(const DWORD *rs)
@@ -206,13 +296,8 @@ static void update_rasterizer_state(const DWORD *rs)
     D3D11_RASTERIZER_DESC rd;
     HRESULT hr;
 
-    if (hash == g_last_raster_hash && g_raster_state) return;
+    if (!reuse_states() && hash == g_last_raster_hash && g_raster_state) return;
     g_last_raster_hash = hash;
-
-    if (g_raster_state) {
-        ID3D11RasterizerState_Release(g_raster_state);
-        g_raster_state = NULL;
-    }
 
     memset(&rd, 0, sizeof(rd));
 
@@ -235,7 +320,18 @@ static void update_rasterizer_state(const DWORD *rs)
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
 
+    if (reuse_states() && g_raster_state && !memcmp(&rd, &g_last_raster_desc, sizeof rd)) {
+        g_state_stats.fast[2]++; return;
+    }
+    if (g_raster_state) { ID3D11RasterizerState_Release(g_raster_state); g_raster_state = NULL; }
+    if (reuse_states()) g_raster_state = (ID3D11RasterizerState *)find_state(2, &rd, sizeof rd);
+    if (g_raster_state) { g_last_raster_desc = rd; return; }
+    g_state_stats.creates[2]++;
     hr = ID3D11Device_CreateRasterizerState(d3d8_GetD3D11Device(), &rd, &g_raster_state);
+    if (SUCCEEDED(hr)) {
+        g_last_raster_desc = rd;
+        if (reuse_states()) keep_state(2, &rd, sizeof rd, g_raster_state);
+    }
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateRasterizerState failed: 0x%08lX\n", hr);
 }
@@ -298,12 +394,6 @@ void d3d8_states_apply_sampler(DWORD stage)
     tss = d3d8_GetTSS(stage);
     if (!tss) return;
 
-    /* Release old sampler */
-    if (g_sampler_states[stage]) {
-        ID3D11SamplerState_Release(g_sampler_states[stage]);
-        g_sampler_states[stage] = NULL;
-    }
-
     memset(&sd, 0, sizeof(sd));
     sd.Filter = d3d8_to_d3d11_filter(
         tss[D3DTSS_MAGFILTER],
@@ -329,8 +419,24 @@ void d3d8_states_apply_sampler(DWORD stage)
      * has no "no mip" filter, so the LOD range says it. */
     sd.MaxLOD = tss[D3DTSS_MIPFILTER] == D3DTEXF_NONE ? 0.0f : D3D11_FLOAT32_MAX;
 
-    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_sampler_states[stage]);
+    if (reuse_states() && g_sampler_states[stage] && g_sampler_valid[stage] &&
+        !memcmp(&sd, &g_last_sampler_desc[stage], sizeof sd)) {
+        g_state_stats.fast[3]++;
+        ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
+        return;
+    }
+    if (g_sampler_states[stage]) { ID3D11SamplerState_Release(g_sampler_states[stage]); g_sampler_states[stage] = NULL; }
+    g_sampler_valid[stage] = 0;
+    if (reuse_states()) g_sampler_states[stage] = (ID3D11SamplerState *)find_state(3, &sd, sizeof sd);
+    if (g_sampler_states[stage]) hr = S_OK;
+    else {
+        g_state_stats.creates[3]++;
+        hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_sampler_states[stage]);
+        if (SUCCEEDED(hr) && reuse_states()) keep_state(3, &sd, sizeof sd, g_sampler_states[stage]);
+    }
     if (SUCCEEDED(hr)) {
+        g_last_sampler_desc[stage] = sd;
+        g_sampler_valid[stage] = 1;
         ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
     }
 }
@@ -341,6 +447,7 @@ void d3d8_states_apply_sampler(DWORD stage)
 
 HRESULT d3d8_states_init(void)
 {
+    memset(&g_state_stats, 0, sizeof g_state_stats);
     /* States are created on first apply */
     return S_OK;
 }
@@ -359,6 +466,16 @@ void d3d8_states_shutdown(void)
     }
     g_last_blend_hash = 0;
     g_last_raster_hash = 0;
+    memset(g_sampler_valid, 0, sizeof g_sampler_valid);
+    {
+        unsigned kind, slot;
+        for (kind = 0; kind < 4; kind++) for (slot = 0; slot < STATE_SLOTS; slot++) {
+            StateEntry *e = &g_state_cache[kind][slot];
+            if (e->object) IUnknown_Release(e->object);
+        }
+        memset(g_state_cache, 0, sizeof g_state_cache);
+        g_state_tick = 0;
+    }
 }
 
 void d3d8_states_apply(void)
@@ -368,6 +485,8 @@ void d3d8_states_apply(void)
     float blend_factor[4] = { 1, 1, 1, 1 };
 
     if (!rs || !ctx) return;
+    g_state_stats.draws++;
+    state_report();
 
     /* The blend colour, for the constant factors. D3D11 has one factor and
      * applies its alpha to the alpha channel only, so a constant-ALPHA

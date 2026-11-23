@@ -31,6 +31,60 @@
 #include <pthread/qos.h>
 #endif
 
+/* Completion notifications are host state, independent of guest memory.
+ * A short timed recheck also covers software methods which write the guest
+ * semaphore directly. Lock ordering on POSIX must release the guest turn
+ * before taking this lock and restore it only after dropping the lock. */
+static INIT_ONCE progress_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION progress_lock;
+static CONDITION_VARIABLE progress_changed;
+static volatile LONG progress_epoch;
+static volatile LONG progress_active;
+
+static BOOL CALLBACK progress_initialize(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+    (void)once; (void)param; (void)context;
+    InitializeCriticalSection(&progress_lock);
+    InitializeConditionVariable(&progress_changed);
+    return TRUE;
+}
+
+uint32_t xbox_Nv2aProgressEpoch(void)
+{
+    /* Activate before the caller checks guest memory. Earlier completions
+     * are visible to that predicate and need no remembered notification. */
+    InterlockedExchange(&progress_active, 1);
+    return (uint32_t)InterlockedCompareExchange(&progress_epoch, 0, 0);
+}
+
+void xbox_Nv2aProgressNotify(void)
+{
+    if (!InterlockedCompareExchange(&progress_active, 0, 0)) return;
+    InitOnceExecuteOnce(&progress_once, progress_initialize, NULL, NULL);
+    EnterCriticalSection(&progress_lock);
+    InterlockedIncrement(&progress_epoch);
+    WakeAllConditionVariable(&progress_changed);
+    LeaveCriticalSection(&progress_lock);
+}
+
+int xbox_Nv2aProgressWait(uint32_t observed, unsigned milliseconds)
+{
+    int changed;
+#if !defined(_WIN32)
+    int left = guest_turn_leave();
+#endif
+    InitOnceExecuteOnce(&progress_once, progress_initialize, NULL, NULL);
+    EnterCriticalSection(&progress_lock);
+    if ((uint32_t)InterlockedCompareExchange(&progress_epoch, 0, 0) == observed)
+        SleepConditionVariableCS(&progress_changed, &progress_lock, milliseconds);
+    changed = (uint32_t)InterlockedCompareExchange(&progress_epoch, 0, 0) != observed;
+    LeaveCriticalSection(&progress_lock);
+#if !defined(_WIN32)
+    guest_turn_return(left);
+#endif
+    return changed;
+}
+
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
 #define XBE_BASE_ADDR_OFFSET    0x0104
@@ -1506,7 +1560,7 @@ void xbox_Nv2aSemaphoreRelease(uint32_t value)
 
 static void semaphore_release_now(uint32_t value)
 {
-    int i;
+    int i, changed = 0;
     s_last_release = value;
     s_releases++;
     /* The first release the executor meets ends completion-on-submit, whether
@@ -1540,10 +1594,13 @@ static void semaphore_release_now(uint32_t value)
     }
     for (i = 0; i < g_fence_mirror_count; i++) {
         volatile uint32_t *f = fence_location(i, NULL);
-        if (f)
+        if (f) {
+            changed |= *f != value;
             *f = value;
+        }
     }
     fence_note("the executor's release", value);
+    if (changed) xbox_Nv2aProgressNotify();
 }
 
 /* The executor is level with PUT and not waiting: every fence whose commands
@@ -1567,6 +1624,7 @@ static void fence_complete(volatile uint32_t *f, uint32_t v)
     *f = v;
     xbox_Nv2aRegWrite(NV2A_PGRAPH_PATT_COLOR0_VA,
                       (xbox_Nv2aRegRead(NV2A_PGRAPH_PATT_COLOR0_VA) & ~0x7Cu) | ((v & 0x1Fu) << 2));
+    xbox_Nv2aProgressNotify();
 }
 
 /* Whether a fence record's commands are behind a ring position, lap-aware.
@@ -1716,13 +1774,15 @@ static void fence_mirrors_tick(int on_submit)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
-            if (*fence != put)
+            int changed = *fence != put;
+            if (changed)
                 *fence = put;
             {
                 uint32_t get = xbox_Nv2aRegRead(NV2A_USER_DMA_GET_VA);
                 xbox_Nv2aRegWrite(NV2A_PGRAPH_PATT_COLOR0_VA,
                                   ((get & 0x07FFFFFCu) << 5) | ((put & 0x1Fu) << 2));
             }
+            if (changed) xbox_Nv2aProgressNotify();
         }
     }
 }

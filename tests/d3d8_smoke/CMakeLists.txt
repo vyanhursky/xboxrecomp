@@ -4,6 +4,9 @@
 # software conversions can be validated without a D3D11 device.
 
 if(WIN32)
+    add_executable(d3d8_shader_cache test_shader_cache.c ../../src/d3d/d3d8_shader_cache.c)
+    target_include_directories(d3d8_shader_cache PRIVATE ../../src/d3d)
+    target_link_libraries(d3d8_shader_cache PRIVATE d3dcompiler d3d11)
     add_executable(d3d8_gamma test_gamma.c)
     target_link_libraries(d3d8_gamma PRIVATE xbox_d3d8)
 
@@ -34,6 +37,7 @@ if(WIN32)
         ../../src/d3d/d3d8_formats.c
         ../../src/d3d/d3d8_shaders.c
         ../../src/d3d/d3d8_combiners.c
+        ../../src/d3d/d3d8_shader_cache.c
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)

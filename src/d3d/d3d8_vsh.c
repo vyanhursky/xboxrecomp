@@ -1208,7 +1208,7 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     }
 
     /* Compile HLSL to bytecode */
-    hr = D3DCompile(hlsl_buf, (SIZE_T)hlsl_len, "nv2a_vsh",
+    hr = d3d8_compile_cached(hlsl_buf, (SIZE_T)hlsl_len, "nv2a_vsh",
                     NULL, NULL, "main", "vs_5_0",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                     &code, &errors);

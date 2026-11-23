@@ -6,12 +6,13 @@
 static ID3D11Device *device;
 static ID3D11DeviceContext *context;
 static DWORD rs[256];
+static DWORD tss[4][32];
 static int failures;
 
 ID3D11Device *d3d8_GetD3D11Device(void) { return device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return context; }
 const DWORD *d3d8_GetRenderStates(void) { return rs; }
-const DWORD *d3d8_GetTSS(DWORD stage) { (void)stage; return NULL; }
+const DWORD *d3d8_GetTSS(DWORD stage) { return stage < 4 ? tss[stage] : NULL; }
 
 #define CHECK(name, cond) \
     do { if (!(cond)) { printf("FAIL: %s\n", name); failures++; } } while (0)
@@ -71,7 +72,46 @@ static void check_blend_factors(void)
     }
 }
 
-int main(void)
+static void check_reuse(void)
+{
+    D3D8StateStats before, after;
+    D3D11_DEPTH_STENCIL_DESC desc;
+    ID3D11SamplerState *sampler = NULL;
+    D3D11_SAMPLER_DESC sd;
+    unsigned i;
+    d3d8_states_get_stats(&before);
+    for (i = 0; i < 100; i++) apply();
+    d3d8_states_get_stats(&after);
+    CHECK("unchanged draws create no objects", !memcmp(before.creates, after.creates, sizeof before.creates));
+    rs[D3DRS_STENCILMASK] = 0x41; apply();
+    rs[D3DRS_STENCILMASK] = 0x42; apply();
+    d3d8_states_get_stats(&before);
+    rs[D3DRS_STENCILMASK] = 0x41; desc = apply();
+    d3d8_states_get_stats(&after);
+    CHECK("A/B/A reuses depth object", before.creates[1] == after.creates[1] && after.hits[1] > before.hits[1]);
+    CHECK("A/B/A binds A descriptor", desc.StencilReadMask == 0x41);
+    for (i = 0; i < 64; i++) { rs[D3DRS_STENCILMASK] = i; apply(); }
+    d3d8_states_get_stats(&before);
+    CHECK("bounded depth LRU evicts", before.evictions[1] > 0);
+    rs[D3DRS_STENCILMASK] = 0x41; desc = apply();
+    CHECK("evicted descriptor recreates correctly", desc.StencilReadMask == 0x41);
+    for (i = 0; i < 4; i++) tss[i][D3DTSS_MINFILTER] = D3DTEXF_LINEAR;
+    d3d8_set_texture_anisotropy(8); apply();
+    ID3D11DeviceContext_PSGetSamplers(context, 0, 1, &sampler);
+    CHECK("anisotropic sampler bound", sampler != NULL);
+    if (sampler) {
+        ID3D11SamplerState_GetDesc(sampler, &sd);
+        CHECK("anisotropy participates in key", sd.Filter == D3D11_FILTER_ANISOTROPIC && sd.MaxAnisotropy == 8);
+        ID3D11SamplerState_Release(sampler);
+    }
+    /* An overlay may clear the context: unchanged objects must still bind. */
+    ID3D11DeviceContext_ClearState(context); apply();
+    ID3D11DeviceContext_PSGetSamplers(context, 0, 1, &sampler);
+    CHECK("samplers rebound after context clear", sampler != NULL);
+    if (sampler) ID3D11SamplerState_Release(sampler);
+}
+
+int main(int argc, char **argv)
 {
     D3D11_DEPTH_STENCIL_DESC desc;
     HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0,
@@ -80,6 +120,7 @@ int main(void)
         fprintf(stderr, "D3D11CreateDevice(WARP) failed: 0x%08lX\n", hr);
         return 1;
     }
+    if (argc > 1 && !strcmp(argv[1], "cache")) _putenv("RECOMP_D3D11_STATE_CACHE=1");
 
     rs[D3DRS_ZENABLE] = TRUE;
     rs[D3DRS_ZWRITEENABLE] = TRUE;
@@ -150,6 +191,7 @@ int main(void)
     desc = apply();
     CHECK("cache recreates after shutdown", desc.StencilWriteMask == 0x5A);
     check_blend_factors();
+    if (argc > 1 && !strcmp(argv[1], "cache")) check_reuse();
     d3d8_states_shutdown();
     ID3D11DeviceContext_ClearState(context);
     ID3D11DeviceContext_Release(context);

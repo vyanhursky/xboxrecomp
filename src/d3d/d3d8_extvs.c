@@ -82,7 +82,7 @@ static ID3D11GeometryShader *point_gs(void)
     ID3DBlob *code = NULL, *err = NULL;
     if (s_point_gs || s_point_gs_failed)
         return s_point_gs;
-    if (FAILED(D3DCompile(s_point_gs_src, strlen(s_point_gs_src), "nv2a_points", NULL, NULL,
+    if (FAILED(d3d8_compile_cached(s_point_gs_src, strlen(s_point_gs_src), "nv2a_points", NULL, NULL,
                           "main", "gs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))
             || FAILED(ID3D11Device_CreateGeometryShader(d3d8_GetD3D11Device(),
                           ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
@@ -180,7 +180,7 @@ static ExtVs *compile(uint32_t hash, const char *hlsl, uint32_t used)
     e->hash = hash;
     e->used = used;
 
-    hr = D3DCompile(hlsl, strlen(hlsl), "nv2a_vsh", NULL, NULL, "main", "vs_4_0",
+    hr = d3d8_compile_cached(hlsl, strlen(hlsl), "nv2a_vsh", NULL, NULL, "main", "vs_4_0",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     if (FAILED(hr)) {
         static int told;

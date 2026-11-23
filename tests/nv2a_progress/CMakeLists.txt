@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_progress_test C)
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(nv2a_progress_test test_main.c)
+target_link_libraries(nv2a_progress_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME nv2a_progress COMMAND nv2a_progress_test)

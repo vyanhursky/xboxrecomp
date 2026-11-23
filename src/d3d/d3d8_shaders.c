@@ -513,7 +513,7 @@ static ID3D11PixelShader *ff_ps_get_shader(UINT sig)
     if (!src) return NULL;
     build_ps_source(sig, src, FF_PS_SRC_SIZE);
 
-    hr = D3DCompile(src, strlen(src), "ps_ffp", NULL, NULL,
+    hr = d3d8_compile_cached(src, strlen(src), "ps_ffp", NULL, NULL,
                     "main", "ps_5_0", 0, 0, &blob, &errors);
     free(src);
 
@@ -831,7 +831,7 @@ HRESULT d3d8_shaders_init(void)
     HRESULT hr;
 
     /* Compile vertex shader */
-    hr = D3DCompile(g_vs_source, strlen(g_vs_source), "vs_ffp",
+    hr = d3d8_compile_cached(g_vs_source, strlen(g_vs_source), "vs_ffp",
                     NULL, NULL, "main", "vs_5_0", 0, 0, &g_vs_blob, &errors);
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: VS compile failed: %s\n",

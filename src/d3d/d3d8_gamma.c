@@ -69,8 +69,8 @@ static HRESULT gamma_create_shaders(void)
     D3D11_BUFFER_DESC bd = {0};
     HRESULT hr;
     if (g_deferred) return S_OK;
-    hr = D3DCompile(shader, sizeof(shader) - 1, NULL, NULL, NULL, "vs", "vs_4_0", 0, 0, &vs, NULL);
-    if (SUCCEEDED(hr)) hr = D3DCompile(shader, sizeof(shader) - 1, NULL, NULL, NULL, "ps", "ps_4_0", 0, 0, &ps, NULL);
+    hr = d3d8_compile_cached(shader, sizeof(shader) - 1, NULL, NULL, NULL, "vs", "vs_4_0", 0, 0, &vs, NULL);
+    if (SUCCEEDED(hr)) hr = d3d8_compile_cached(shader, sizeof(shader) - 1, NULL, NULL, NULL, "ps", "ps_4_0", 0, 0, &ps, NULL);
     if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(device,
         ID3D10Blob_GetBufferPointer(vs), ID3D10Blob_GetBufferSize(vs), NULL, &g_vs);
     if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(device,

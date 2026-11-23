@@ -22,6 +22,7 @@ IDirect3DDevice8 *d3d8_GetDevice(void);
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include "d3d8_shader_cache.h"
 
 /* ================================================================
  * D3D11 device accessors (implemented in d3d8_device.c)
@@ -48,6 +49,10 @@ void                 d3d8_GetDrawPlacement(float *kx, float *bx);
 void                 d3d8_RequestSideFill(void);
 void                d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h);
 void                 d3d8_SetBlendColor(DWORD argb);
+typedef struct D3D8StateStats {
+    uint64_t draws, creates[4], hits[4], fast[4], evictions[4];
+} D3D8StateStats;
+void d3d8_states_get_stats(D3D8StateStats *out);
 
 /* Presentation-only gamma. End restores the saved backbuffer even if Present fails. */
 void d3d8_gamma_set(const D3DGAMMARAMP *ramp);

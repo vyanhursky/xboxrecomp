@@ -29,6 +29,12 @@
 extern "C" {
 #endif
 
+/* Host notification only: never advances a guest fence. Snapshot before
+ * testing the guest predicate, then wait; a changed epoch cannot be lost. */
+uint32_t xbox_Nv2aProgressEpoch(void);
+void xbox_Nv2aProgressNotify(void);
+int xbox_Nv2aProgressWait(uint32_t observed, unsigned milliseconds);
+
 /* ================================================================
  * Xbox memory map constants
  * ================================================================ */
