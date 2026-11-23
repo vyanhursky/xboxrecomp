@@ -35,7 +35,8 @@ int main(void)
     QueryPerformanceCounter(&a);
     if (xbox_Nv2aProgressWait(epoch, 10)) failures++;
     QueryPerformanceCounter(&b);
-    if ((double)(b.QuadPart - a.QuadPart) / frequency.QuadPart > 0.5) failures++;
+    if ((double)(b.QuadPart - a.QuadPart) / frequency.QuadPart > 0.5 ||
+        (double)(b.QuadPart - a.QuadPart) / frequency.QuadPart < 0.005) failures++;
     ready = CreateEvent(NULL, TRUE, FALSE, NULL);
     threads[0] = CreateThread(NULL, 0, waiter, NULL, 0, NULL);
     threads[1] = CreateThread(NULL, 0, waiter, NULL, 0, NULL);

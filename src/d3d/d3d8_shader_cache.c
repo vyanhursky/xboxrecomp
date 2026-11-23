@@ -201,7 +201,7 @@ static void store_blob(const wchar_t *path, const unsigned char *key, size_t key
     FILE *f;
     int ok;
     if (bytes < 4 || bytes > CACHE_LIMIT || memcmp(ID3D10Blob_GetBufferPointer(code), "DXBC", 4)) return;
-    if (_snwprintf(temp, sizeof temp / sizeof temp[0], L"%s.%lu.%lu.%ld.tmp", path,
+    if (_snwprintf(temp, sizeof temp / sizeof temp[0], L"%ls.%lu.%lu.%ld.tmp", path,
         GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&serial)) < 0) return;
     f = _wfopen(temp, L"wb");
     if (!f) return;
@@ -233,7 +233,7 @@ HRESULT d3d8_compile_cached(LPCVOID source, SIZE_T length, LPCSTR name,
     unsigned char *key = NULL;
     size_t key_bytes = 0;
     uint64_t identity = 0, cpu = 0;
-    LARGE_INTEGER a, b;
+    LARGE_INTEGER a = {0}, b = {0};
     wchar_t path[2200];
     HRESULT hr = S_OK;
     const char *cache_flag = getenv("RECOMP_D3D11_SHADER_CACHE");
@@ -250,7 +250,7 @@ HRESULT d3d8_compile_cached(LPCVOID source, SIZE_T length, LPCSTR name,
         key = compile_key(source, length, name, entry, profile, f1, f2, &key_bytes);
     if (key) {
         identity = hash_bytes(key, key_bytes, 14695981039346656037ull);
-        _snwprintf(path, sizeof path / sizeof path[0], L"%s/%016llx.dxbc", folder, identity);
+        _snwprintf(path, sizeof path / sizeof path[0], L"%ls/%016llx.dxbc", folder, identity);
         if (stats) QueryPerformanceCounter(&a);
         if (load_blob(path, key, key_bytes, identity, code)) {
             hits++;

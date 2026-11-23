@@ -38,11 +38,17 @@ int main(int argc, char **argv)
     ID3D11Device *device = NULL;
     ID3D11PixelShader *shader = NULL;
     FILE *file;
-    int off = argc > 1 && !strcmp(argv[1], "off"), i;
+    int disabled = argc > 1 && !strcmp(argv[1], "off");
+    int unavailable = argc > 1 && !strcmp(argv[1], "unavailable");
+    int off = disabled || unavailable, i;
     GetCurrentDirectoryA(sizeof temp, temp);
     snprintf(dir, sizeof dir, "%s/xrdxbc-test-%lu", temp, GetCurrentProcessId());
-    CreateDirectoryA(dir, NULL);
-    _putenv_s("RECOMP_D3D11_SHADER_CACHE", off ? "0" : "1");
+    if (unavailable) {
+        file = fopen(dir, "wb");
+        CHECK("create non-directory cache target", file != NULL);
+        if (file) fclose(file);
+    } else CreateDirectoryA(dir, NULL);
+    _putenv_s("RECOMP_D3D11_SHADER_CACHE", disabled ? "0" : "1");
     _putenv_s("RECOMP_STREAM2_STATS", "1");
     _putenv_s("RECOMP_D3D11_SHADER_CACHE_DIR", dir);
     cold = compile(source, NULL, "main", "ps_5_0", 0);
@@ -67,7 +73,11 @@ int main(int argc, char **argv)
             snprintf(path, sizeof path, "%s/%s", dir, data.cFileName);
             FindClose(find);
             file = fopen(path, "r+b");
-            if (file) { fseek(file, -1, SEEK_END); fputc(0xAB, file); fclose(file); }
+            if (file) {
+                int last;
+                fseek(file, -1, SEEK_END); last = fgetc(file);
+                fseek(file, -1, SEEK_END); fputc(last ^ 0xFF, file); fclose(file);
+            }
             warm = compile(source, NULL, "main", "ps_5_0", 0);
             if (warm) ID3D10Blob_Release(warm);
             d3d8_shader_cache_stats(&b);
@@ -78,6 +88,18 @@ int main(int argc, char **argv)
             if (warm) ID3D10Blob_Release(warm);
             d3d8_shader_cache_stats(&a);
             CHECK("truncated header recompiles", a.compiles == b.compiles + 1 && a.bad == b.bad + 1);
+            file = fopen(path, "r+b");
+            if (file) {
+                int first;
+                /* Fixed v1 header is 32 bytes; preserve the filename/hash but
+                 * alter the complete key to simulate a hash collision. */
+                fseek(file, 32, SEEK_SET); first = fgetc(file);
+                fseek(file, 32, SEEK_SET); fputc(first ^ 0xFF, file); fclose(file);
+            }
+            warm = compile(source, NULL, "main", "ps_5_0", 0);
+            if (warm) ID3D10Blob_Release(warm);
+            d3d8_shader_cache_stats(&b);
+            CHECK("complete key rejects filename collision", b.compiles == a.compiles + 1 && b.bad == a.bad + 1);
         }
         /* NULL name differs from empty; entry/profile/flags/source all key. */
         d3d8_shader_cache_stats(&a);
@@ -88,6 +110,22 @@ int main(int argc, char **argv)
         warm = compile("float4 main():SV_Target{return 0.5;}", NULL, "main", "ps_5_0", 0); if (warm) ID3D10Blob_Release(warm);
         d3d8_shader_cache_stats(&b);
         CHECK("all compile identity fields invalidate", b.compiles == a.compiles + 5);
+        /* Caller-supplied preprocessor dependencies deliberately bypass disk. */
+        {
+            D3D_SHADER_MACRO defines[] = {{"VALUE", "1"}, {NULL, NULL}};
+            ID3DBlob *errors = NULL;
+            a = b;
+            CHECK("macro compile bypass succeeds", SUCCEEDED(d3d8_compile_cached(source, strlen(source),
+                NULL, defines, NULL, "main", "ps_5_0", 0, 0, &warm, &errors)));
+            if (warm) ID3D10Blob_Release(warm);
+            if (errors) ID3D10Blob_Release(errors);
+            warm = NULL; errors = NULL;
+            CHECK("failed compile returns diagnostics", FAILED(d3d8_compile_cached("invalid HLSL", 12,
+                NULL, NULL, NULL, "main", "ps_5_0", 0, 0, &warm, &errors)) && !warm && errors);
+            if (errors) ID3D10Blob_Release(errors);
+            d3d8_shader_cache_stats(&b);
+            CHECK("macros and failed shaders not persisted", b.writes == a.writes && b.compiles == a.compiles + 2);
+        }
         a = b;
         for (i = 0; i < 4; i++) threads[i] = CreateThread(NULL, 0, worker, NULL, 0, NULL);
         WaitForMultipleObjects(4, threads, TRUE, INFINITE);
@@ -101,6 +139,7 @@ int main(int argc, char **argv)
         FindClose(find);
     }
     RemoveDirectoryA(dir);
+    if (unavailable) DeleteFileA(dir);
     printf("d3d8_shader_cache: %d FAILURE(S)\n", failures);
     return failures ? 1 : 0;
 }
