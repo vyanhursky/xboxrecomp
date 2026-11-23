@@ -37,7 +37,7 @@ int main(void)
     QueryPerformanceCounter(&b);
     if ((double)(b.QuadPart - a.QuadPart) / frequency.QuadPart > 0.5 ||
         (double)(b.QuadPart - a.QuadPart) / frequency.QuadPart < 0.005) failures++;
-    ready = CreateEvent(NULL, TRUE, FALSE, NULL);
+    ready = CreateEventW(NULL, TRUE, FALSE, NULL);
     threads[0] = CreateThread(NULL, 0, waiter, NULL, 0, NULL);
     threads[1] = CreateThread(NULL, 0, waiter, NULL, 0, NULL);
     if (WaitForSingleObject(ready, 1000) != WAIT_OBJECT_0) failures++;

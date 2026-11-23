@@ -88,3 +88,5 @@ void xbox_Nv2aRegWrite(uint32_t va, uint32_t value)
     if (r) *r = value;
 }
 void xbox_Nv2aSemaphoreRelease(uint32_t value) { (void)value; }
+/* Standalone executor fixtures have no host progress-wait subscribers. */
+void xbox_Nv2aProgressNotify(void) {}
