@@ -42,6 +42,8 @@
 #include "nv2a_backend.h"
 #if defined(_WIN32)
 #include <windows.h>
+#endif
+#if defined(_MSC_VER)
 #define NV_TLS __declspec(thread)
 #else
 #define NV_TLS __thread
