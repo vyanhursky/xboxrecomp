@@ -89,6 +89,8 @@ static void initialize(void)
     const char *root = getenv("DEFJAM_DATA");
     char local[2048];
     HMODULE dll = NULL;
+    HMODULE imported_compiler;
+    FARPROC compiler;
     wchar_t dll_path[2048];
     FILE *file;
     unsigned char block[65536];
@@ -107,9 +109,12 @@ static void initialize(void)
         if (stats) fprintf(stderr, "[S2SHADER] cache directory unavailable: %s (%lu)\n", dir, GetLastError());
         return;
     }
-    /* Exact compiler image identity, not a path or a timestamp guess. */
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        (LPCWSTR)(uintptr_t)D3DCompile, &dll)) {
+    /* A linked function address can be an import thunk in the executable.
+     * Resolve the export first so identity follows the actual compiler image. */
+    imported_compiler = GetModuleHandleW(D3DCOMPILER_DLL_W);
+    compiler = imported_compiler ? GetProcAddress(imported_compiler, "D3DCompile") : NULL;
+    if (!compiler || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCWSTR)(uintptr_t)compiler, &dll)) {
         if (stats) fprintf(stderr, "[S2SHADER] compiler module unavailable (%lu)\n", GetLastError());
         return;
     }

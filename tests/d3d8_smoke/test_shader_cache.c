@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 static const char source[] = "float4 main():SV_Target{return 1;} float4 other():SV_Target{return 0;}";
 static int failures;
@@ -26,6 +27,24 @@ static DWORD WINAPI worker(void *unused)
     b = compile(source, "threaded", "main", "ps_5_0", 0);
     if (b) ID3D10Blob_Release(b);
     return 0;
+}
+
+static uint64_t compiler_file_identity(void)
+{
+    HMODULE dll = GetModuleHandleW(D3DCOMPILER_DLL_W);
+    wchar_t path[2048];
+    unsigned char block[65536];
+    uint64_t h = 14695981039346656037ull;
+    FILE *file;
+    size_t count, i;
+    if (!dll || !GetModuleFileNameW(dll, path, 2048)) return 0;
+    file = _wfopen(path, L"rb");
+    if (!file) return 0;
+    while ((count = fread(block, 1, sizeof block, file)) != 0)
+        for (i = 0; i < count; i++) h = (h ^ block[i]) * 1099511628211ull;
+    if (ferror(file)) h = 0;
+    fclose(file);
+    return h;
 }
 
 int main(int argc, char **argv)
@@ -72,6 +91,16 @@ int main(int argc, char **argv)
         if (find != INVALID_HANDLE_VALUE) {
             snprintf(path, sizeof path, "%s/%s", dir, data.cFileName);
             FindClose(find);
+            /* Regression: &D3DCompile may identify the EXE's import thunk.
+             * The stored key must instead contain the loaded compiler DLL. */
+            file = fopen(path, "rb");
+            if (file) {
+                uint64_t identity = 0, expected = compiler_file_identity();
+                fseek(file, 32, SEEK_SET);
+                CHECK("compiler identity readable", fread(&identity, 1, sizeof identity, file) == sizeof identity);
+                CHECK("key hashes compiler DLL rather than executable", expected && identity == expected);
+                fclose(file);
+            } else CHECK("read compiler identity", 0);
             file = fopen(path, "r+b");
             if (file) {
                 int last;
