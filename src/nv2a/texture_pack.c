@@ -51,6 +51,8 @@ typedef struct PackEntry {
 } PackEntry;
 static PackEntry *g_entries;
 static size_t g_count, g_capacity;
+static char g_compositors[32][64];
+static unsigned g_compositor_count;
 #define MEMORY_SOURCES 32
 #define MEMORY_BUDGET (256u*1024u*1024u)
 struct Prepared;
@@ -114,7 +116,9 @@ static int file_exists(const char *path);
 static void make_directories(const char *path);
 static int memory_readable(const void *data, uint64_t bytes);
 static int write_png(const char *path, const uint8_t *bgra, uint32_t w, uint32_t h);
-static uint8_t *read_png(const char *path, uint32_t *w, uint32_t *h, int *retry);
+static uint8_t *read_png_bounded(const char *path,uint32_t *w,uint32_t *h,int *retry,uint32_t edge);
+static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
+{ return read_png_bounded(path,w,h,retry,16384); }
 typedef struct Sha Sha;
 #if defined(_WIN32)
 struct Sha { BCRYPT_HASH_HANDLE hash; };
@@ -240,7 +244,7 @@ static void index_wide(void)
 }
 static void read_pack(const char *root, const char *name)
 {
-    char path[PATH_CAP],line[2048],section[32]="";
+    char path[PATH_CAP],line[2048],section[32]="",compositor[64]="";
     FILE *file;
     size_t start=g_count;
     int schema=0,channel_mips=0,mips_valid=1;
@@ -261,6 +265,10 @@ static void read_pack(const char *root, const char *name)
         equal=strchr(s,'='); if(!equal) continue;
         *equal++=0; s=trim(s); equal=trim(equal);
         if(!strcmp(section,"pack") && !strcmp(s,"schema")) schema=!strcmp(equal,"1");
+        if(!strcmp(section,"pack") && !strcmp(s,"compositor")) {
+            if(strlen(equal)<sizeof compositor && valid_name(equal,0)) strcpy(compositor,equal);
+            else compositor[0]=0;
+        }
         if(!strcmp(section,"pack") && !strcmp(s,"png_mips")) {
             if(!strcmp(equal,"channels")) channel_mips=1;
             else if(!strcmp(equal,"opacity")) channel_mips=0;
@@ -283,6 +291,10 @@ static void read_pack(const char *root, const char *name)
     else {
         size_t i;
         for(i=start;i<g_count;i++) g_entries[i].channel_mips=channel_mips;
+        if(g_count>start && compositor[0]) {
+            unsigned n=0;while(n<g_compositor_count && strcmp(compositor,g_compositors[n]))n++;
+            if(n==g_compositor_count && n<32)strcpy(g_compositors[g_compositor_count++],compositor);
+        }
     }
 }
 /* "a;b;c", read in order so later packs take precedence. A list too long to hold
@@ -335,6 +347,12 @@ static void initialize(void)
     }
 }
 int texture_pack_active(void) { initialize(); return g_active || g_memory_count || g_memory_retired; }
+int texture_pack_compositor(const char *kind)
+{
+    if(!kind)return 0;initialize();
+    for(unsigned i=0;i<g_compositor_count;i++)if(!strcmp(kind,g_compositors[i]))return 1;
+    return 0;
+}
 
 static int readable(const void *data,uint64_t bytes)
 {
@@ -686,7 +704,7 @@ uint8_t *texture_pack_source_png(const char *id,uint32_t nw,uint32_t nh,uint32_t
     *w=*h=0; initialize();
     entry=lookup(id);
     if(!entry || strlen(entry->path)<4 || _stricmp(entry->path+strlen(entry->path)-4,".png")) return NULL;
-    pixels=read_png(entry->path,&x,&y,&retry);
+    pixels=read_png_bounded(entry->path,&x,&y,&retry,2048);
     if(!pixels) return NULL;
     if(!x || !y || x>2048 || y>2048 || x%nw || y%nh || x/nw!=y/nh || x/nw<1 || x/nw>8) {
         free(pixels); return NULL;
@@ -1081,6 +1099,7 @@ void texture_pack_shutdown(IDirect3DDevice8 *dev)
     g_wide_replay_filter=NULL; g_wide_replay_user=NULL;
     if(dev) for(i=0;i<g_count;i++) release_entry(dev,&g_entries[i]);
     free(g_entries); g_entries=NULL; g_count=g_capacity=0;
+    memset(g_compositors,0,sizeof g_compositors);g_compositor_count=0;
     free(g_wide);g_wide=NULL;g_wide_count=0;
     free(g_stretch);g_stretch=NULL;g_stretch_count=0;
     memset(g_sources,0,sizeof g_sources);
@@ -1144,7 +1163,7 @@ static int write_png(const char *path,const uint8_t *bgra,uint32_t w,uint32_t h)
     if(stream) IWICStream_Release(stream);
     return SUCCEEDED(hr);
 }
-static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
+static uint8_t *read_png_bounded(const char *path,uint32_t *w,uint32_t *h,int *retry,uint32_t edge)
 {
     IWICBitmapDecoder *decoder=NULL; IWICBitmapFrameDecode *frame=NULL; IWICFormatConverter *converter=NULL;
     WCHAR wide[PATH_CAP]; uint8_t *data=NULL; HRESULT hr=E_FAIL;
@@ -1152,7 +1171,7 @@ static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
     hr=IWICImagingFactory_CreateDecoderFromFilename(g_wic,wide,NULL,GENERIC_READ,WICDecodeMetadataCacheOnDemand,&decoder);
     if(SUCCEEDED(hr)) hr=IWICBitmapDecoder_GetFrame(decoder,0,&frame);
     if(SUCCEEDED(hr)) hr=IWICBitmapFrameDecode_GetSize(frame,w,h);
-    if(SUCCEEDED(hr) && (!*w || !*h || *w>16384 || *h>16384 || (uint64_t)*w**h*4>g_budget/4)) hr=E_INVALIDARG;
+    if(SUCCEEDED(hr) && (!*w || !*h || *w>edge || *h>edge || (uint64_t)*w**h*4>g_budget/4)) hr=E_INVALIDARG;
     if(SUCCEEDED(hr)) hr=IWICImagingFactory_CreateFormatConverter(g_wic,&converter);
     if(SUCCEEDED(hr)) hr=IWICFormatConverter_Initialize(converter,(IWICBitmapSource *)frame,&GUID_WICPixelFormat32bppBGRA,
                                   WICBitmapDitherTypeNone,NULL,0,WICBitmapPaletteTypeCustom);
@@ -1315,13 +1334,13 @@ static int write_png(const char *path,const uint8_t *bgra,uint32_t w,uint32_t h)
     return ok;
 }
 /* BGRA, as the Windows decoder returns it. A missing or malformed file is permanent (retry 0). */
-static uint8_t *read_png(const char *path,uint32_t *w,uint32_t *h,int *retry)
+static uint8_t *read_png_bounded(const char *path,uint32_t *w,uint32_t *h,int *retry,uint32_t edge)
 {
     int x=0,y=0,n=0;
     uint8_t *data;
     size_t i,count;
     *retry=0;
-    if(!stbi_info(path,&x,&y,&n) || x<=0 || y<=0 || x>16384 || y>16384 || (uint64_t)x*y*4>g_budget/4) return NULL;
+    if(!stbi_info(path,&x,&y,&n) || x<=0 || y<=0 || (uint32_t)x>edge || (uint32_t)y>edge || (uint64_t)x*y*4>g_budget/4) return NULL;
     data=stbi_load(path,&x,&y,&n,4);
     if(!data) return NULL;
     *w=(uint32_t)x; *h=(uint32_t)y;

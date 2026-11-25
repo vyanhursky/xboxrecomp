@@ -25,6 +25,9 @@ int texture_pack_memory_register(uint32_t owner,uint32_t address,uint32_t format
         uint32_t native_width,uint32_t native_height,const uint8_t *bgra,uint32_t width,uint32_t height);
 void texture_pack_memory_clear(uint32_t owner);
 int texture_pack_active(void);
+/* Named CPU compositor opt-in declared by a valid enabled pack's [pack]
+ * compositor key. Static GPU replacement does not require this marker. */
+int texture_pack_compositor(const char *kind);
 int texture_pack_hash(const RecompTextureSource *source, char out[65]);
 /* Render-thread-only CPU image lookup for host-side composition. Uses the same
  * enabled-pack precedence and validated paths as GPU replacement. PNG only;

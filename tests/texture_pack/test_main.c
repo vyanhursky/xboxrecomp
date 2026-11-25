@@ -230,6 +230,7 @@ int main(void)
     temp_root(root,sizeof root); assert(make_dir(root));
     _putenv_s("RECOMP_TEXTURE_DUMP_DIR",""); _putenv_s("RECOMP_TEXTURE_PACKS","");
     initialize();
+    assert(!texture_pack_compositor("unit-compositor-v1") && !texture_pack_compositor(NULL));
 #if defined(_WIN32)
     assert(SUCCEEDED(CoInitializeEx(NULL,COINIT_MULTITHREADED)));
     assert(SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory,NULL,CLSCTX_INPROC_SERVER,&IID_IWICImagingFactory,(void **)&g_wic)));
@@ -251,6 +252,15 @@ int main(void)
         assert(!texture_pack_source_png(id,0,1,&w,&h));
         strcpy(entries[1].path,"missing.png");
         assert(!texture_pack_source_png(id,1,1,&w,&h));
+        {
+            uint8_t large[2049*3*4]={0};int retry=0;
+            snprintf(entries[1].path,sizeof entries[1].path,"%s/oversized-source.png",root);
+            assert(write_png(entries[1].path,large,2049,3));
+            decoded=read_png(entries[1].path,&w,&h,&retry);
+            assert(decoded && w==2049 && h==3);free(decoded);
+            assert(!texture_pack_source_png(id,683,1,&w,&h) && !w && !h);
+            remove_file(entries[1].path);
+        }
         assert(!creates && !destroys && !g_resident && !g_memory_count);
         g_entries=NULL;g_count=0;
     }
@@ -328,13 +338,14 @@ int main(void)
             snprintf(manifest,sizeof manifest,"%s/manifest.ini",path);
             memcpy(pack_id,id,65); pack_id[0]="0123456789abcdef"[i];
             file=fopen(manifest,"wb"); assert(file);
-            fprintf(file,"[pack]\nschema=1\n[textures]\n%s=textures/p%u.png\n",pack_id,i); fclose(file);
+            fprintf(file,"[pack]\nschema=1\n%s[textures]\n%s=textures/p%u.png\n",i?"":"compositor=unit-compositor-v1\n",pack_id,i); fclose(file);
             if(i) strcat(list,";");
             strcat(list,name);
         }
         assert(strlen(list)>256);
         g_count=0; g_errors=0; read_packs(root,list);
         assert(g_count==count && g_errors==0);
+        assert(texture_pack_compositor("unit-compositor-v1") && !texture_pack_compositor("other-v1"));
         for(i=0;i<count;i++) assert(strstr(g_entries[i].path,"textures/p") && g_entries[i].path[strlen(g_entries[i].path)-5]==(char)('0'+i));
         while(strlen(list)<PACK_LIST_CAP+40) strcat(list,";faithful-hd-0123456789a0-opacity-with-a-longer-name");
         g_count=0; read_packs(root,list);
@@ -484,6 +495,7 @@ int main(void)
     texture_pack_set_wide_replay_filter(replay_source, NULL);
     texture_pack_shutdown(&device);
     assert(!g_wide_replay_filter && !g_wide_replay_user);
+    assert(!texture_pack_compositor("unit-compositor-v1"));
     {
         uint8_t hd[8*8*4];unsigned n;
         RecompTextureSource live={0};
