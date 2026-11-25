@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_backend.h"
+#include "nv2a_vsh_interp.h"
+extern int nv2a_pb_exec_elements_block(const uint32_t *params, uint32_t count);
+extern int nv2a_pb_exec_constant_block(uint32_t method, const uint32_t *params, uint32_t count);
 
 #define MEM_BYTES 0x10000u
 static uint8_t s_mem[MEM_BYTES];
@@ -105,6 +108,11 @@ static int near_(float a, float b) { return fabsf(a - b) < 1e-3f; }
 int main(void)
 {
     uint32_t i;
+#ifdef _WIN32
+    _putenv_s("RECOMP_D3D_HLE_BULK", "3");
+#else
+    setenv("RECOMP_D3D_HLE_BULK", "3", 1);
+#endif
 
     nv2a_backend_register(&s_backend);
 
@@ -236,6 +244,39 @@ int main(void)
 
         m(0x17FC, 5); m(0x1810, 0xFFFFFFu | (2u << 24)); m(0x17FC, 0);
         CHECK(s_be.draws == draws);
+    }
+
+    /* Scalar/bulk indexed delivery must produce the same complete vertices
+     * at END, including an odd trailing index. Reject no-BEGIN and overflow
+     * cases without changing the pending batch. */
+    {
+        uint32_t pair = 0x00010000u;
+        Nv2aVertex expected[3];
+        int draws;
+        CHECK(!nv2a_pb_exec_elements_block(&pair,1));
+        m(0x17fc,5); m(0x1800,pair); m(0x1808,2); m(0x17fc,0);
+        CHECK(s_be.count==3);
+        memcpy(expected,s_be.v,sizeof expected);
+        draws=s_be.draws;
+        m(0x17fc,5);
+        CHECK(!nv2a_pb_exec_elements_block(&pair,0xffffffffu));
+        CHECK(nv2a_pb_exec_elements_block(&pair,1));
+        m(0x1808,2); m(0x17fc,0);
+        CHECK(s_be.draws==draws+1 && s_be.count==3);
+        CHECK(!memcmp(expected,s_be.v,sizeof expected));
+    }
+    /* The executor block preserves all constant bits and the exact version,
+     * and refuses method ranges with other state mixed into the packet. */
+    {
+        uint32_t words[4]={0x7fc12345u,0x80000000u,0x3f800000u,0xff800000u},before,after;
+        m(0x1ea4,17);
+        nv2a_vsh_constants(&before);
+        CHECK(!nv2a_pb_exec_constant_block(0xb7c,words,4));
+        CHECK(!nv2a_pb_exec_constant_block(0xbfc,words,2));
+        CHECK(!nv2a_pb_exec_constant_block(0xb81,words,1));
+        CHECK(nv2a_pb_exec_constant_block(0xb80,words,4));
+        CHECK(!memcmp(nv2a_vsh_constants(&after)+17*4,words,sizeof words));
+        CHECK(after-before==4);
     }
 
     /* The semaphore release lands where the title said. */

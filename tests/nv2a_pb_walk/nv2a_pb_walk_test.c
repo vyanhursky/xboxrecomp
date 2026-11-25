@@ -47,6 +47,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_get_reg = s_title_get;
 }
 void nv2a_pb_exec_report(void) {}
+int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+{ (void)method; (void)param; return 0; }
+static unsigned s_bulk_calls;
+int nv2a_pb_exec_constant_block(uint32_t method, const uint32_t *params, uint32_t count)
+{
+    uint32_t i;
+    s_bulk_calls++;
+    for (i = 0; i < count; i++) nv2a_pb_exec_method(0, method + i * 4, params[i]);
+    return 1;
+}
+static unsigned s_index_calls;
+int nv2a_pb_exec_elements_block(const uint32_t *params, uint32_t count)
+{
+    uint32_t i;
+    s_index_calls++;
+    for(i=0;i<count;i++) nv2a_pb_exec_method(0,0x1800,params[i]);
+    return 1;
+}
 void xbox_Nv2aAckBusyBits(void) {}
 void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */
 
@@ -55,6 +73,7 @@ void xbox_Nv2aReleasePump(int at_put);
 void xbox_Nv2aReleasePump(int at_put) { (void)at_put; }
 void nv2a_pb_resync(uint32_t get_phys);
 void nv2a_pb_scan(uint32_t put_phys);
+uint32_t nv2a_pb_run(uint32_t get_va, uint32_t put_va, int *stalled);
 
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
@@ -229,6 +248,54 @@ int main(void)
         nv2a_pb_scan(0xE0C);                               /* in step again */
         CHECK(s_n == n0 + 1);
         expect(n0, 0x0710, 61);
+    }
+
+    /* The contiguous-run walker used by the real guest-ring executor. A
+     * complete constant packet can be bulk-delivered, but a truncated PUT,
+     * non-increasing packet, foreign subchannel or register-range crossing
+     * must retain scalar ordered delivery. The fence after the packet must
+     * not be reordered. A survey deliberately keeps the scalar walker. */
+    {
+        unsigned j;
+        int stalled = 0;
+        uint32_t base = 0x80000f00u;
+        const uint32_t kinds[] = {0x0b80u,0x40000b80u,0x2b80u,0x0bfcu,0x40001800u,0x40003800u};
+        for (j = 0; j < sizeof kinds/sizeof kinds[0]; j++) {
+            unsigned start_bulk = s_bulk_calls;
+            unsigned start_index = s_index_calls;
+            s_n = 0;
+            put(0xf00, hdr(2,0,0) | kinds[j]); put(0xf04,0x12345678); put(0xf08,0xabcdef01);
+            put(0xf0c,hdr(1,0,0x1d70)); put(0xf10,99);
+            CHECK(nv2a_pb_run(base,base+20,&stalled)==base+20);
+            CHECK(!stalled && s_n==3);
+            CHECK(s_seen[0].method==(kinds[j]&0x1ffc));
+            CHECK(s_seen[1].method==((kinds[j]&0x1ffc)+((kinds[j]&0x40000000u)?0:4)));
+            expect(2,0x1d70,99);
+            CHECK(s_bulk_calls-start_bulk==((j==0 && !getenv("RECOMP_PB_SCAN"))?1u:0u));
+            CHECK(s_index_calls-start_index==((j==4 && !getenv("RECOMP_PB_SCAN"))?1u:0u));
+        }
+        {
+            unsigned start_bulk = s_bulk_calls;
+            s_n=0;
+            put(0xf00,hdr(4,0,0xb80));
+            for(j=0;j<4;j++) put(0xf04+j*4,17+j);
+            CHECK(nv2a_pb_run(base,base+12,&stalled)==base+12);
+            CHECK(s_n==2);
+            CHECK(nv2a_pb_run(base+12,base+20,&stalled)==base+20);
+            CHECK(s_n==4 && s_bulk_calls==start_bulk);
+            for(j=0;j<4;j++) expect(j,0xb80+j*4,17+j);
+        }
+        {
+            unsigned start_index = s_index_calls;
+            s_n=0;
+            put(0xf00,hdr(4,0,0x1800)|0x40000000u);
+            for(j=0;j<4;j++) put(0xf04+j*4,31+j);
+            CHECK(nv2a_pb_run(base,base+12,&stalled)==base+12);
+            CHECK(s_n==2);
+            CHECK(nv2a_pb_run(base+12,base+20,&stalled)==base+20);
+            CHECK(s_n==4 && s_index_calls==start_index);
+            for(j=0;j<4;j++) expect(j,0x1800,31+j);
+        }
     }
 
     if (!s_fail)

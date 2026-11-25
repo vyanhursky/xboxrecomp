@@ -49,6 +49,8 @@ static uint32_t s_tot_calls;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_constant_block(uint32_t method, const uint32_t *params, uint32_t count);
+extern int nv2a_pb_exec_elements_block(const uint32_t *params, uint32_t count);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
@@ -696,8 +698,28 @@ static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            uint32_t i;
-            for (i = 0; i < count && va != end_va; i++) {
+            uint32_t i = 0;
+            /* Only a whole increasing constant packet in this contiguous
+             * segment. Partial PUT packets, surveys, other subchannels and
+             * every side-effecting method keep the established scalar walk. */
+            if (s_exec_enabled && subch == 0 && !noninc && count &&
+                method >= 0x0b80u && method < 0x0c00u &&
+                count <= (0x0c00u - method) / 4u && !SURVEY_ON() &&
+                end_va >= va && count <= (end_va - va) / 4u &&
+                nv2a_pb_exec_constant_block(method, (const uint32_t *)(mem + va), count)) {
+                va += count * 4u;
+                words += count;
+                i = count;
+            }
+            if (i == 0 && s_exec_enabled && subch == 0 && noninc &&
+                method == 0x1800u && count && !SURVEY_ON() &&
+                end_va >= va && count <= (end_va - va) / 4u &&
+                nv2a_pb_exec_elements_block((const uint32_t *)(mem + va), count)) {
+                va += count * 4u;
+                words += count;
+                i = count;
+            }
+            for (; i < count && va != end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 if (SURVEY_ON())
                     note(subch, m);

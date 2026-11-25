@@ -5528,6 +5528,78 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
     return 1;
 }
 
+/* Stream 3 companion experiment: retain packet ordering and all observable
+ * constant state, but cross the scalar dispatch boundary once per packet.
+ * Independent from title-side interception; default-off on every backend. */
+int nv2a_pb_exec_constant_block(uint32_t method, const uint32_t *params, uint32_t count)
+{
+    static int enabled = -1, fwd, stats;
+    static uint64_t blocks, words;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_D3D_HLE_BULK");
+        const char *scalar = getenv("RECOMP_PB_CONST_FAST");
+        enabled = e && (strtoul(e, NULL, 0) & 1u) && !(scalar && *scalar == '0');
+        fwd = getenv("RECOMP_PB_D3D11") != NULL;
+        e = getenv("RECOMP_D3D_HLE_STATS"); stats = e && *e == '1';
+        if (stats) fprintf(stderr, "[S3BULK] enabled=%d\n", enabled);
+    }
+    if (!enabled || !s_exec_inited || !count || (method & 3u) ||
+        method < 0x0b80u || method >= 0x0c00u || count > (0x0c00u - method) / 4u)
+        return 0;
+    memcpy(&s_reg[method / 4u], params, count * 4u);
+    if (s_et_on > 0) s_et_words[0] += count;
+    if (fwd) {
+        extern void pgraph_d3d11_count_methods(uint32_t n);
+        pgraph_d3d11_count_methods(count);
+    }
+    nv2a_vsh_constant_words(params, count);
+    if (stats) {
+        blocks++; words += count;
+        if (blocks == 1 || !(blocks & 1048575u))
+            fprintf(stderr, "[S3BULK] blocks=%llu words=%llu\n",
+                    (unsigned long long)blocks, (unsigned long long)words);
+    }
+    return 1;
+}
+
+int nv2a_pb_exec_elements_block(const uint32_t *params, uint32_t count)
+{
+    static int enabled = -1, fwd, stats;
+    static uint64_t blocks, words;
+    uint32_t i;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_D3D_HLE_BULK");
+        enabled = e && (strtoul(e, NULL, 0) & 2u);
+        fwd = getenv("RECOMP_PB_D3D11") != NULL;
+        e = getenv("RECOMP_D3D_HLE_STATS"); stats = e && *e == '1';
+        if (stats) fprintf(stderr, "[S3INDEX] enabled=%d\n", enabled);
+    }
+    /* Overflow/truncation warnings keep their original scalar budgets. */
+    if (!enabled || !s_exec_inited || !count || !s_gpu.prim ||
+        count > (NV_MAX_INDICES - s_gpu.idx_count) / 2u)
+        return 0;
+    s_reg[NV097_ARRAY_ELEMENT16 / 4u] = params[count - 1];
+    if (s_et_on > 0) s_et_words[2] += count;
+    if (fwd) {
+        /* ARRAY_ELEMENT16 has no translator-side effect beyond this counter.
+         * The executor owns the indices and submits the batch at END. */
+        extern void pgraph_d3d11_count_methods(uint32_t n);
+        pgraph_d3d11_count_methods(count);
+    }
+    for (i = 0; i < count; i++) {
+        s_gpu.idx[s_gpu.idx_count + i * 2u] = params[i] & 0xffffu;
+        s_gpu.idx[s_gpu.idx_count + i * 2u + 1u] = params[i] >> 16;
+    }
+    s_gpu.idx_count += count * 2u;
+    if (stats) {
+        blocks++; words += count;
+        if (blocks == 1 || !(blocks & 65535u))
+            fprintf(stderr, "[S3INDEX] blocks=%llu words=%llu\n",
+                    (unsigned long long)blocks, (unsigned long long)words);
+    }
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;

@@ -134,6 +134,26 @@ void nv2a_vsh_constant_word(uint32_t word)
     }
 }
 
+void nv2a_vsh_constant_words(const uint32_t *words, uint32_t count)
+{
+    uint32_t start;
+    /* The scalar path preserves diagnostic budgets, dropped out-of-range
+     * writes and cursor overflow for unusual inputs. */
+    if (vsh_dump_enabled() || s_const_load >= NV2A_VSH_CONSTANTS ||
+        count > NV2A_VSH_CONSTANTS * 4u - (s_const_load * 4u + s_const_word)) {
+        uint32_t i;
+        for (i = 0; i < count; i++) nv2a_vsh_constant_word(words[i]);
+        return;
+    }
+    start = s_const_load * 4u + s_const_word;
+    memcpy((uint8_t *)s_const + start * 4u, words, count * 4u);
+    /* Keep the exact revision count, not merely a single dirty increment. */
+    s_constant_version += count;
+    start += count;
+    s_const_load = start / 4u;
+    s_const_word = start & 3u;
+}
+
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
     if (index < NV2A_VSH_CONSTANTS) {
