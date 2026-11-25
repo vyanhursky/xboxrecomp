@@ -5581,10 +5581,10 @@ int nv2a_pb_exec_elements_block(const uint32_t *params, uint32_t count)
     s_reg[NV097_ARRAY_ELEMENT16 / 4u] = params[count - 1];
     if (s_et_on > 0) s_et_words[2] += count;
     if (fwd) {
-        /* ARRAY_ELEMENT16 has no translator-side effect beyond this counter.
+        /* ARRAY_ELEMENT16 has no translator-side effect beyond its counters.
          * The executor owns the indices and submits the batch at END. */
-        extern void pgraph_d3d11_count_methods(uint32_t n);
-        pgraph_d3d11_count_methods(count);
+        extern void pgraph_d3d11_count_ignored_methods(uint32_t n);
+        pgraph_d3d11_count_ignored_methods(count);
     }
     for (i = 0; i < count; i++) {
         s_gpu.idx[s_gpu.idx_count + i * 2u] = params[i] & 0xffffu;

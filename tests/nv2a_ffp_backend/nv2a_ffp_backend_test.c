@@ -25,6 +25,7 @@
 #include "nv2a_vsh_interp.h"
 extern int nv2a_pb_exec_elements_block(const uint32_t *params, uint32_t count);
 extern int nv2a_pb_exec_constant_block(uint32_t method, const uint32_t *params, uint32_t count);
+extern uint32_t stub_pgraph_handled, stub_pgraph_ignored;
 
 #define MEM_BYTES 0x10000u
 static uint8_t s_mem[MEM_BYTES];
@@ -105,14 +106,34 @@ static int s_fail;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
 static int near_(float a, float b) { return fabsf(a - b) < 1e-3f; }
 
-int main(void)
+int main(int argc, char **argv)
 {
     uint32_t i;
+    int counters = argc == 2 && strcmp(argv[1], "--counters") == 0;
 #ifdef _WIN32
     _putenv_s("RECOMP_D3D_HLE_BULK", "3");
+    if (counters) _putenv_s("RECOMP_PB_D3D11", "1");
 #else
     setenv("RECOMP_D3D_HLE_BULK", "3", 1);
+    if (counters) setenv("RECOMP_PB_D3D11", "1", 1);
 #endif
+
+    /* Forwarding selects a different rendering route. Check its bookkeeping
+     * in a fresh process with no vertex attributes, independently of the
+     * existing fake-backend rendering checks below. */
+    if (counters) {
+        uint32_t pair = 0x00010000u, handled, ignored, h0, i0;
+        m(0x17fc,5); m(0x1800,pair); m(0x1808,2); m(0x17fc,0);
+        handled = stub_pgraph_handled; ignored = stub_pgraph_ignored;
+        CHECK(handled == 4 && ignored == 2);
+        h0 = handled; i0 = ignored;
+        m(0x17fc,5);
+        CHECK(nv2a_pb_exec_elements_block(&pair,1));
+        m(0x1808,2); m(0x17fc,0);
+        CHECK(stub_pgraph_handled-h0 == handled);
+        CHECK(stub_pgraph_ignored-i0 == ignored);
+        return s_fail;
+    }
 
     nv2a_backend_register(&s_backend);
 

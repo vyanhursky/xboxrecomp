@@ -1805,6 +1805,17 @@ void pgraph_d3d11_count_methods(uint32_t n)
         g_pg.stats.methods_handled += n;
 }
 
+/* ARRAY_ELEMENT16 is consumed by the executor and otherwise falls through
+ * this translator's unhandled-method path. Its bulk path preserves both
+ * diagnostic counters, not only the handled count. */
+void pgraph_d3d11_count_ignored_methods(uint32_t n)
+{
+    if (g_pg.initialized) {
+        g_pg.stats.methods_handled += n;
+        g_pg.stats.methods_ignored += n;
+    }
+}
+
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out)
 {
     if (out) *out = g_pg.stats;

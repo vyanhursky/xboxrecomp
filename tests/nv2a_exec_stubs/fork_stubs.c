@@ -5,7 +5,8 @@
  * D3D11/Vulkan translator (nv2a_pgraph_d3d11.h), consults texture packs, and
  * stops at software methods (the kernel's interrupt model); none of that is on
  * these fixtures' path, which exercise upstream's software rasteriser and back
- * ends with RECOMP_PB_D3D11 unset. Every stub here is inert.
+ * ends. Rendering stubs are inert; the FFP fixture also observes forwarding
+ * counters while RECOMP_PB_D3D11 is set.
  */
 #include <stdint.h>
 #include <string.h>
@@ -44,9 +45,17 @@ void pgraph_d3d11_draw_ready(uint32_t nv2a_prim_mode, const PgraphReadyVertex *v
 { (void)nv2a_prim_mode; (void)verts; (void)count; }
 #endif
 void pgraph_d3d11_frame_end(void) {}
+uint32_t stub_pgraph_handled, stub_pgraph_ignored;
 int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
-{ (void)subchannel; (void)method; (void)param; return 0; }
-void pgraph_d3d11_count_methods(uint32_t n) { (void)n; }
+{
+    (void)subchannel; (void)param;
+    stub_pgraph_handled++;
+    if (method == 0x1800u || method == 0x1808u) stub_pgraph_ignored++;
+    return 0;
+}
+void pgraph_d3d11_count_methods(uint32_t n) { stub_pgraph_handled += n; }
+void pgraph_d3d11_count_ignored_methods(uint32_t n)
+{ stub_pgraph_handled += n; stub_pgraph_ignored += n; }
 int pgraph_d3d11_program_usable(void) { return 0; }
 int pgraph_d3d11_replace_texture_ready(uint32_t guest_addr, const void *data, uint32_t width,
                                        uint32_t height, uint32_t nv2a_format)
