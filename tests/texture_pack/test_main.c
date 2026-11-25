@@ -261,6 +261,23 @@ int main(void)
             assert(!texture_pack_source_png(id,683,1,&w,&h) && !w && !h);
             remove_file(entries[1].path);
         }
+        {
+            /* The CPU API promises PNG, rather than any WIC-supported image
+             * whose filename happens to have that suffix. */
+            uint8_t bmp[70]={0};int retry=0;
+            bmp[0]='B';bmp[1]='M';put32(bmp+2,70);put32(bmp+10,54);put32(bmp+14,40);
+            put32(bmp+18,2);put32(bmp+22,2);bmp[26]=1;bmp[28]=24;put32(bmp+34,16);
+            snprintf(entries[1].path,sizeof entries[1].path,"%s/wrong-codec.png",root);
+            file=fopen(entries[1].path,"wb");assert(file);assert(fwrite(bmp,1,sizeof bmp,file)==sizeof bmp);fclose(file);
+#if defined(_WIN32)
+            decoded=read_png(entries[1].path,&w,&h,&retry);
+            assert(decoded && w==2 && h==2);free(decoded); /* Existing GPU policy. */
+#else
+            (void)retry;
+#endif
+            assert(!texture_pack_source_png(id,1,1,&w,&h) && !w && !h);
+            remove_file(entries[1].path);
+        }
         assert(!creates && !destroys && !g_resident && !g_memory_count);
         g_entries=NULL;g_count=0;
     }

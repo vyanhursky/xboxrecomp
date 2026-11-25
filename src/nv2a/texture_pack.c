@@ -1169,6 +1169,11 @@ static uint8_t *read_png_bounded(const char *path,uint32_t *w,uint32_t *h,int *r
     WCHAR wide[PATH_CAP]; uint8_t *data=NULL; HRESULT hr=E_FAIL;
     if(!g_wic || !wide_path(path,wide)) return NULL;
     hr=IWICImagingFactory_CreateDecoderFromFilename(g_wic,wide,NULL,GENERIC_READ,WICDecodeMetadataCacheOnDemand,&decoder);
+    if(SUCCEEDED(hr) && edge<=2048) {
+        GUID container;
+        hr=IWICBitmapDecoder_GetContainerFormat(decoder,&container);
+        if(SUCCEEDED(hr) && memcmp(&container,&GUID_ContainerFormatPng,sizeof container))hr=E_INVALIDARG;
+    }
     if(SUCCEEDED(hr)) hr=IWICBitmapDecoder_GetFrame(decoder,0,&frame);
     if(SUCCEEDED(hr)) hr=IWICBitmapFrameDecode_GetSize(frame,w,h);
     if(SUCCEEDED(hr) && (!*w || !*h || *w>edge || *h>edge || (uint64_t)*w**h*4>g_budget/4)) hr=E_INVALIDARG;
