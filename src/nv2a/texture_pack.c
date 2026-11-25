@@ -582,7 +582,7 @@ int texture_pack_memory_register(uint32_t owner,uint32_t address,uint32_t format
     RecompTextureSource shape={0};Prepared *p;uint8_t *copy;
     initialize();shape.width=native_w;shape.height=native_h;
     if(!owner || !address || !bgra || !native_w || !native_h || w>2048 || h>2048 ||
-       (format!=0x06 && format!=0x12) || !valid_scale(w,h,&shape)) return 0;
+       (format!=0x06 && format!=0x12 && format!=0x0b) || !valid_scale(w,h,&shape)) return 0;
     for(i=0;i<MEMORY_SOURCES;i++) {
         if(g_memory[i].owner && g_memory[i].address==address) return 0;
         if(!g_memory[i].owner && !m) m=&g_memory[i];
@@ -611,7 +611,8 @@ static int memory_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureS
     for(i=0;i<MEMORY_SOURCES;i++) {
         struct MemorySource *m=&g_memory[i];
         if(!m->owner || m->address!=s->address || m->format!=s->format ||
-           m->width!=s->width || m->height!=s->height || s->row_texels!=s->width || s->palette_entries) continue;
+           m->width!=s->width || m->height!=s->height || s->row_texels!=s->width ||
+           (m->format==0x0b ? (!s->palette || !s->palette_entries || s->palette_entries>256) : s->palette_entries!=0)) continue;
         if(!m->entry.texture) {
             if(commit_prepared(dev,&m->entry,m->pixels)!=1) return 0;
             if(g_trace) fprintf(stderr,"[TEXPACK] owned HD owner=%08X source=%08X %ux%u -> %ux%u uploaded\n",
@@ -677,6 +678,20 @@ static PackEntry *lookup(const char *id)
     size_t a=0,b=g_count;
     while(a<b) { size_t mid=a+(b-a)/2; if(strcmp(g_entries[mid].id,id)<=0) a=mid+1; else b=mid; }
     return a && !strcmp(g_entries[a-1].id,id) ? &g_entries[a-1] : NULL;
+}
+uint8_t *texture_pack_source_png(const char *id,uint32_t nw,uint32_t nh,uint32_t *w,uint32_t *h)
+{
+    PackEntry *entry; uint8_t *pixels; uint32_t x=0,y=0; int retry=0;
+    if(!id || !valid_id(id) || !nw || !nh || nw>2048 || nh>2048 || !w || !h) return NULL;
+    *w=*h=0; initialize();
+    entry=lookup(id);
+    if(!entry || strlen(entry->path)<4 || _stricmp(entry->path+strlen(entry->path)-4,".png")) return NULL;
+    pixels=read_png(entry->path,&x,&y,&retry);
+    if(!pixels) return NULL;
+    if(!x || !y || x>2048 || y>2048 || x%nw || y%nh || x/nw!=y/nh || x/nw<1 || x/nw>8) {
+        free(pixels); return NULL;
+    }
+    *w=x; *h=y; return pixels;
 }
 static unsigned source_slot(const RecompTextureSource *s)
 {

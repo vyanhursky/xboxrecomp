@@ -235,6 +235,25 @@ int main(void)
     assert(SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory,NULL,CLSCTX_INPROC_SERVER,&IID_IWICImagingFactory,(void **)&g_wic)));
 #endif
     snprintf(path,sizeof path,"%s/alpha.png",root); assert(write_png(path,pixel,2,2));
+    {
+        /* CPU composition lookup uses the last enabled entry, preserves all
+         * channels, rejects nonuniform shapes/misses without touching the GPU. */
+        PackEntry entries[2]={{0}}; uint32_t w=99,h=99; uint8_t *decoded;
+        assert(!g_count && !g_entries);
+        strcpy(entries[0].id,id); strcpy(entries[1].id,id);
+        strcpy(entries[0].path,"missing.png"); strcpy(entries[1].path,path);
+        g_entries=entries;g_count=2;
+        decoded=texture_pack_source_png(id,1,1,&w,&h);
+        assert(decoded && w==2 && h==2 && !memcmp(decoded,pixel,16));free(decoded);
+        assert(!texture_pack_source_png(id,1,2,&w,&h) && !w && !h);
+        assert(!texture_pack_source_png("0000000000000000000000000000000000000000000000000000000000000000",1,1,&w,&h));
+        assert(!texture_pack_source_png("../bad",1,1,&w,&h));
+        assert(!texture_pack_source_png(id,0,1,&w,&h));
+        strcpy(entries[1].path,"missing.png");
+        assert(!texture_pack_source_png(id,1,1,&w,&h));
+        assert(!creates && !destroys && !g_resident && !g_memory_count);
+        g_entries=NULL;g_count=0;
+    }
     source=(RecompTextureSource){1,6,2,2,2,pixel,16,0,0,0,NULL,0};
     snprintf(entry.path,sizeof entry.path,"%s",path);
     assert(upload_png(&device,&entry,&source));
@@ -495,6 +514,17 @@ int main(void)
         }
         assert(texture_pack_memory_register(3,123,6,4,4,hd,8,8));
         assert(texture_pack_bind(&device,0,&live,NULL,NULL));
+        texture_pack_memory_clear(3);
+        /* A composited, quantized native atlas can be indexed. The host
+         * replacement is BGRA, while the bind still needs a valid palette. */
+        assert(texture_pack_memory_register(4,123,0x0b,4,4,hd,8,8));
+        live.format=0x0b;live.palette=NULL;live.palette_entries=0;
+        assert(!texture_pack_bind(&device,0,&live,NULL,NULL));
+        live.palette=palette;live.palette_entries=4;
+        assert(texture_pack_bind(&device,0,&live,NULL,NULL));
+        assert(!memcmp(((MockTexture *)bound[0])->mips[0],hd,sizeof hd));
+        texture_pack_memory_clear(4);
+        assert(!texture_pack_bind(&device,0,&live,NULL,NULL));
         texture_pack_shutdown(&device);
         assert(!g_memory_count && !g_memory_bytes && !bound[0]);
     }

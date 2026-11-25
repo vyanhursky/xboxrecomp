@@ -14,7 +14,10 @@ typedef struct RecompTextureSource {
 typedef int (*RecompTextureSample)(void *user, uint32_t x, uint32_t y, uint32_t *argb);
 /* Render-thread-only, address-scoped host textures. Register copies the BGRA
  * pixels and builds independent-channel mips; 1x–8x, at most 2048px. Owner must
- * clear before freeing/reusing its guest source. Clear retires GPU objects until
+ * clear before freeing/reusing/repainting its guest source (including palette).
+ * Formats 0x06/0x12 BGRA and 0x0b indexed are supported; indexed binds require
+ * a valid palette descriptor, but replacements are already composed BGRA.
+ * Clear retires GPU objects until
  * the next bind/shutdown, and does not affect ordinary content-addressed packs.
  * At most 32 sources / 256 MiB of host pixels, sharing the pack GPU cache budget.
  * Returns 0 on invalid input, duplicate address or budget/allocation failure. */
@@ -23,6 +26,13 @@ int texture_pack_memory_register(uint32_t owner,uint32_t address,uint32_t format
 void texture_pack_memory_clear(uint32_t owner);
 int texture_pack_active(void);
 int texture_pack_hash(const RecompTextureSource *source, char out[65]);
+/* Render-thread-only CPU image lookup for host-side composition. Uses the same
+ * enabled-pack precedence and validated paths as GPU replacement. PNG only;
+ * dimensions must be a uniform integer 1x..8x of the supplied native shape,
+ * at most 2048px. Returns malloc-owned BGRA (caller frees), NULL on any miss or
+ * failure; no GPU state, source cache or guest memory is changed. */
+uint8_t *texture_pack_source_png(const char *id,uint32_t native_width,uint32_t native_height,
+                               uint32_t *width,uint32_t *height);
 int texture_pack_bind(IDirect3DDevice8 *device, unsigned stage,
                       const RecompTextureSource *source, RecompTextureSample sample, void *user);
 void texture_pack_shutdown(IDirect3DDevice8 *device);
