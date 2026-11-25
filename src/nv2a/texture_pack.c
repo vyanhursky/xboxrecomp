@@ -1340,8 +1340,22 @@ static uint8_t *read_png_bounded(const char *path,uint32_t *w,uint32_t *h,int *r
     uint8_t *data;
     size_t i,count;
     *retry=0;
-    if(!stbi_info(path,&x,&y,&n) || x<=0 || y<=0 || (uint32_t)x>edge || (uint32_t)y>edge || (uint64_t)x*y*4>g_budget/4) return NULL;
-    data=stbi_load(path,&x,&y,&n,4);
+    if(edge<=2048) {
+        /* CPU composition validates and decodes one immutable encoded
+         * snapshot. Reopening the path after stbi_info would let an atomic
+         * file replacement bypass the pre-decode dimension bound. */
+        FILE *file=fopen(path,"rb");long length;uint8_t *encoded;
+        if(!file)return NULL;
+        if(fseek(file,0,SEEK_END) || (length=ftell(file))<=0 || length>64*1024*1024 || fseek(file,0,SEEK_SET)){fclose(file);return NULL;}
+        encoded=malloc((size_t)length);if(!encoded){fclose(file);return NULL;}
+        size_t got=fread(encoded,1,(size_t)length,file);int bad=ferror(file);fclose(file);
+        if(bad || got!=(size_t)length || !stbi_info_from_memory(encoded,(int)length,&x,&y,&n) ||
+           x<=0 || y<=0 || (uint32_t)x>edge || (uint32_t)y>edge || (uint64_t)x*y*4>g_budget/4){free(encoded);return NULL;}
+        data=stbi_load_from_memory(encoded,(int)length,&x,&y,&n,4);free(encoded);
+    } else {
+        if(!stbi_info(path,&x,&y,&n) || x<=0 || y<=0 || (uint32_t)x>edge || (uint32_t)y>edge || (uint64_t)x*y*4>g_budget/4) return NULL;
+        data=stbi_load(path,&x,&y,&n,4);
+    }
     if(!data) return NULL;
     *w=(uint32_t)x; *h=(uint32_t)y;
     count=(size_t)x*y;
