@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include "texture_pack.h"
 #include "../kernel/nv2a_combiner.h"
+#include "../kernel/nv2a_raw_draw.h"
 
 /* Initialize the PGRAPH→D3D11 translator. Call after D3D11 device is created. */
 void pgraph_d3d11_init(void);
@@ -146,6 +147,9 @@ int pgraph_d3d11_program_usable(void);
 int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used,
                               const uint16_t *idx, uint32_t nidx,
                               float tex_u_scale, float tex_v_scale);
+int pgraph_d3d11_draw_program_raw(const Nv2aRawDraw *raw, uint32_t used,
+                                  const uint16_t *idx, uint32_t nidx,
+                                  float tex_u_scale, float tex_v_scale);
 
 /* Set chyron scroll: pass frame counter to animate, 0 to disable.
  * Applies horizontal scroll offset to vertices in the chyron Y band. */

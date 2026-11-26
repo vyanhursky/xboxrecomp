@@ -16,6 +16,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "../kernel/nv2a_raw_draw.h"
 #include "d3d8_present.h"
 #include "d3d8_readback.h"
 #include <stdio.h>
@@ -1310,7 +1311,8 @@ void d3d8_SetExternalGS(ID3D11GeometryShader *gs)
 HRESULT d3d8_DrawIndexedExternalVS(const void *verts, UINT stride, UINT nverts,
                                    const uint16_t *idx, UINT nidx,
                                    ID3D11VertexShader *vs, ID3D11InputLayout *il,
-                                   ID3D11Buffer *cb1, ID3D11Buffer *cb2)
+                                   ID3D11Buffer *cb1, ID3D11Buffer *cb2,
+                                   const Nv2aRawLayout *raw)
 {
     /* Two dynamic buffers written as rings (NO_OVERWRITE until full, then
      * DISCARD), not a pair of immutable buffers created and released per
@@ -1326,12 +1328,11 @@ HRESULT d3d8_DrawIndexedExternalVS(const void *verts, UINT stride, UINT nverts,
 
     if (!verts || !idx || !stride || !nverts || nidx < (g_ext_gs ? 1u : 3u) || !vs || !il)
         return E_INVALIDARG;
-    vbytes = nverts * stride;
+    vbytes = raw ? nv2a_raw_offsets(raw, nverts, NULL) : nverts * stride;
+    if (!vbytes) return E_INVALIDARG;
     ibytes = nidx * 2;
     if (vbytes > EXT_VB_BYTES || ibytes > EXT_IB_BYTES)
         return E_INVALIDARG;
-    g_d3d_draw_count++;
-
     if (!ext_vb) {
         D3D11_BUFFER_DESC bd;
         memset(&bd, 0, sizeof(bd));
@@ -1369,7 +1370,24 @@ HRESULT d3d8_DrawIndexedExternalVS(const void *verts, UINT stride, UINT nverts,
     first_index = ib_at / 2;
     ib_at += ibytes;
 
-    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &ext_vb, &stride, &offset);
+    /* A failed upload can be retried through the gathered fallback. Count
+     * only the submission that reached the draw, not the rejected attempt. */
+    g_d3d_draw_count++;
+
+    if (raw) {
+        uint32_t relative[16], k;
+        ID3D11Buffer *buffers[16];
+        UINT strides[16], offsets[16];
+        (void)nv2a_raw_offsets(raw, nverts, relative);
+        for (k = 0; k < raw->streams; ++k) {
+            buffers[k] = ext_vb;
+            strides[k] = raw->stride[k];
+            offsets[k] = offset + relative[k];
+        }
+        ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, raw->streams, buffers, strides, offsets);
+    } else {
+        ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &ext_vb, &stride, &offset);
+    }
     ID3D11DeviceContext_IASetIndexBuffer(ctx, ext_ib, DXGI_FORMAT_R16_UINT, 0);
 
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);

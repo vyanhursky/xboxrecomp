@@ -14,6 +14,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_raw_input.h"
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,11 +24,13 @@
 HRESULT d3d8_DrawIndexedExternalVS(const void *verts, UINT stride, UINT nverts,
                                    const uint16_t *idx, UINT nidx,
                                    ID3D11VertexShader *vs, ID3D11InputLayout *il,
-                                   ID3D11Buffer *cb1, ID3D11Buffer *cb2);
+                                   ID3D11Buffer *cb1, ID3D11Buffer *cb2,
+                                   const Nv2aRawLayout *raw);
 
 void d3d8_SetExternalGS(ID3D11GeometryShader *gs);
 
 #define EXTVS_CACHE 256
+#define RAW_EXTVS_CACHE 128
 
 /* NV2A point sprites. Each point becomes a screen-aligned square of the size
  * the vertex program wrote to oPts (or the fixed SET_POINT_SIZE when it wrote
@@ -100,6 +103,7 @@ static ID3D11GeometryShader *point_gs(void)
 
 typedef struct {
     uint32_t hash, used;
+    Nv2aRawLayout raw;
     int      failed;                /* compile error: the caller falls back */
     ID3D11VertexShader *vs;
     ID3D11InputLayout  *il;
@@ -108,6 +112,8 @@ typedef struct {
 
 static ExtVs          s_cache[EXTVS_CACHE];
 static int            s_count;
+static ExtVs          s_raw_cache[RAW_EXTVS_CACHE];
+static int            s_raw_count;
 static uint64_t       s_tick;
 static ID3D11Buffer  *s_cb_consts;     /* b1: 192 float4 */
 static ID3D11Buffer  *s_cb_frame;      /* b2: Screen, TexScale */
@@ -146,39 +152,47 @@ static void upload(ID3D11Buffer *b, const void *data, size_t bytes)
     }
 }
 
-static ExtVs *lookup(uint32_t hash)
+static ExtVs *lookup(uint32_t hash, const Nv2aRawLayout *raw)
 {
+    ExtVs *cache = raw ? s_raw_cache : s_cache;
+    int count = raw ? s_raw_count : s_count;
     int i;
-    for (i = 0; i < s_count; i++)
-        if (s_cache[i].hash == hash)
-            return &s_cache[i];
+    for (i = 0; i < count; i++)
+        if (cache[i].hash == hash &&
+            (raw ? !memcmp(&cache[i].raw, raw, sizeof *raw) : !cache[i].raw.used))
+            return &cache[i];
     return NULL;
 }
 
-static ExtVs *compile(uint32_t hash, const char *hlsl, uint32_t used)
+static ExtVs *compile(uint32_t hash, const char *hlsl, uint32_t used,
+                       const Nv2aRawLayout *raw)
 {
     ID3DBlob *code = NULL, *err = NULL;
     D3D11_INPUT_ELEMENT_DESC el[16];
     static char names[16][8];
     ExtVs *e;
-    int slot, n = 0, a;
+    ExtVs *cache = raw ? s_raw_cache : s_cache;
+    int *count = raw ? &s_raw_count : &s_count;
+    int capacity = raw ? RAW_EXTVS_CACHE : EXTVS_CACHE;
+    int slot, n = 0, a, layout_ok = 1;
     HRESULT hr;
 
-    if (s_count < EXTVS_CACHE) {
-        slot = s_count++;
+    if (*count < capacity) {
+        slot = (*count)++;
     } else {
         int j;
         slot = 0;
-        for (j = 1; j < EXTVS_CACHE; j++)
-            if (s_cache[j].last_use < s_cache[slot].last_use)
+        for (j = 1; j < capacity; j++)
+            if (cache[j].last_use < cache[slot].last_use)
                 slot = j;
-        if (s_cache[slot].vs) ID3D11VertexShader_Release(s_cache[slot].vs);
-        if (s_cache[slot].il) ID3D11InputLayout_Release(s_cache[slot].il);
+        if (cache[slot].vs) ID3D11VertexShader_Release(cache[slot].vs);
+        if (cache[slot].il) ID3D11InputLayout_Release(cache[slot].il);
     }
-    e = &s_cache[slot];
+    e = &cache[slot];
     memset(e, 0, sizeof *e);
     e->hash = hash;
     e->used = used;
+    if (raw) e->raw = *raw;
 
     hr = d3d8_compile_cached(hlsl, strlen(hlsl), "nv2a_vsh", NULL, NULL, "main", "vs_4_0",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
@@ -203,14 +217,23 @@ static ExtVs *compile(uint32_t hash, const char *hlsl, uint32_t used)
             memset(&el[n], 0, sizeof el[n]);
             el[n].SemanticName = names[a];
             el[n].SemanticIndex = (UINT)a;
-            el[n].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-            el[n].AlignedByteOffset = (UINT)n * 16;
+            el[n].Format = raw ? d3d8_raw_format(raw->type[a], raw->size[a]) : DXGI_FORMAT_R32G32B32A32_FLOAT;
+            el[n].AlignedByteOffset = raw ? raw->offset[a] : (UINT)n * 16;
+            el[n].InputSlot = raw ? raw->binding[a] : 0;
+            if (raw) {
+                UINT support = 0;
+                if (FAILED(ID3D11Device_CheckFormatSupport(d3d8_GetD3D11Device(), el[n].Format, &support)) ||
+                    !(support & D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER)) {
+                    layout_ok = 0;
+                    break;
+                }
+            }
             el[n].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
             n++;
         }
-        hr = ID3D11Device_CreateInputLayout(d3d8_GetD3D11Device(), el, (UINT)n,
+        hr = layout_ok ? ID3D11Device_CreateInputLayout(d3d8_GetD3D11Device(), el, (UINT)n,
                                             ID3D10Blob_GetBufferPointer(code),
-                                            ID3D10Blob_GetBufferSize(code), &e->il);
+                                            ID3D10Blob_GetBufferSize(code), &e->il) : E_INVALIDARG;
     }
     ID3D10Blob_Release(code);
     if (FAILED(hr)) {
@@ -222,8 +245,8 @@ static ExtVs *compile(uint32_t hash, const char *hlsl, uint32_t used)
     } else {
         static unsigned compiled;
         if (compiled++ < 8 || (compiled & (compiled - 1)) == 0)
-            fprintf(stderr, "[EXTVS] compiled program %08X (%d inputs) (#%u)\n",
-                    hash, n, compiled);
+            fprintf(stderr, "[EXTVS] compiled program %08X (%d inputs%s) (#%u)\n",
+                    hash, n, raw ? ", raw" : "", compiled);
     }
     return e;
 }
@@ -234,24 +257,26 @@ int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
                          const float *consts, uint32_t consts_version,
                          float zscale, const float texscale[2],
                          const float *verts, uint32_t nverts,
-                         const uint16_t *idx, uint32_t nidx)
+                         const uint16_t *idx, uint32_t nidx,
+                         const Nv2aRawLayout *raw)
 {
     ExtVs *e;
     float frame[8];
 
     if (!d3d8_GetD3D11Device())
         return -1;
+    if (raw && (s_points || raw->used != used || !nv2a_raw_offsets(raw, nverts, NULL))) return -1;
     if (!s_cb_consts) {
         s_cb_consts = make_cb(192 * 16);
         s_cb_frame = make_cb(32);
         if (!s_cb_consts || !s_cb_frame)
             return -1;
     }
-    e = lookup(hash);
+    e = lookup(hash, raw);
     if (!e) {
         if (!hlsl)
             return 0;
-        e = compile(hash, hlsl, used);
+        e = compile(hash, hlsl, used, raw);
     }
     if (e->failed || !e->vs || !e->il)
         return -1;
@@ -285,11 +310,11 @@ int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
         d3d8_SetExternalGS(gs);
         hr = d3d8_DrawIndexedExternalVS(verts, (UINT)popcount16(used ? used : 1) * 16,
                                         nverts, idx, nidx, e->vs, e->il,
-                                        s_cb_consts, s_cb_frame);
+                                        s_cb_consts, s_cb_frame, NULL);
         d3d8_SetExternalGS(NULL);
         return SUCCEEDED(hr) ? 1 : -1;
     }
-    return SUCCEEDED(d3d8_DrawIndexedExternalVS(verts, (UINT)popcount16(used ? used : 1) * 16,
+    return SUCCEEDED(d3d8_DrawIndexedExternalVS(verts, raw ? raw->stride[0] : (UINT)popcount16(used ? used : 1) * 16,
                                                 nverts, idx, nidx, e->vs, e->il,
-                                                s_cb_consts, s_cb_frame)) ? 1 : -1;
+                                                s_cb_consts, s_cb_frame, raw)) ? 1 : -1;
 }

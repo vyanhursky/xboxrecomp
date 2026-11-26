@@ -32,6 +32,9 @@
  * One thread draws: the push-buffer executor's. Nothing here is locked.
  */
 
+#ifndef VK_ENABLE_BETA_EXTENSIONS
+#define VK_ENABLE_BETA_EXTENSIONS
+#endif
 #include "d3d8_xbox.h"
 #include "d3d8_swizzle.h"
 #include "d3d8_combiners.h"
@@ -39,12 +42,14 @@
 #include "d3d8_present.h"  /* d3d8_canvas_width */
 #include "d3d8_readback.h"
 #include "d3d8_vk_cache.h"
+#include "d3d8_raw_input.h"
 #include "win32_compat.h"   /* GetTickCount64 */
 
 #include <vulkan/vulkan.h>
 #include <shaderc/shaderc.h>
 
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -226,16 +231,22 @@ typedef struct {
     uint8_t  cw;
     uint8_t  ztest, zfunc, zwrite;
     uint8_t  stencil, sfunc, sfail, szfail, spass;
+    uint16_t raw_layout;        /* immutable full-layout registry id; 0 gathered */
 } PipeKey;
 
 typedef struct { PipeKey key; VkPipeline pipe; int used; } PipeEntry;
 #define PIPE_SLOTS 1024
+#define RAW_PIPE_SLOTS 256
 
-typedef struct { uint32_t hash, used; int points, failed; uint32_t shader; uint64_t last; } ProgEntry;
+typedef struct { uint32_t hash, used; Nv2aRawLayout raw; uint16_t raw_layout; int points, failed; uint32_t shader; uint64_t last; } ProgEntry;
 #define PROG_SLOTS 256
+#define RAW_PROG_SLOTS 128
+#define RAW_LAYOUT_SLOTS 256
 typedef struct { int used; NV2ACombinerState st; uint32_t shader; } CombEntry;
 #define COMB_SLOTS 256
-#define MAX_SHADERS 1024
+#define NORMAL_SHADER_SLOTS 1024
+#define RAW_SHADER_SLOTS 128
+#define MAX_SHADERS (NORMAL_SHADER_SLOTS + RAW_SHADER_SLOTS)
 /* Each HLSL text made into a module this run, by two hashes of it and its
  * stage: the same text gets the same module. Twice MAX_SHADERS, never full. */
 typedef struct { uint64_t key, check; uint32_t id; } ShaderSeen;
@@ -323,12 +334,20 @@ static struct {
     uint32_t perf_printed;
     VkShaderModule shaders[MAX_SHADERS];
     uint32_t       shader_n;
+    uint32_t       normal_shader_n, raw_shader_n;
+    uint32_t raw_stride_alignment;
+    int raw_portability;
     ShaderSeen     seen[SEEN_SLOTS];
     uint32_t       vs_fixed, ps_tex, ps_notex;
 
     PipeEntry pipes[PIPE_SLOTS];
+    PipeEntry raw_pipes[RAW_PIPE_SLOTS];
     ProgEntry progs[PROG_SLOTS];
+    ProgEntry raw_progs[RAW_PROG_SLOTS];
     int       prog_n;
+    int       raw_prog_n;
+    Nv2aRawLayout raw_layouts[RAW_LAYOUT_SLOTS];
+    uint16_t raw_layout_n, raw_layout_mru;
     uint64_t  prog_tick;
     CombEntry combs[COMB_SLOTS];
 
@@ -733,6 +752,23 @@ static VkDeviceSize ring_take(Ring *r, VkDeviceSize bytes, VkDeviceSize align)
     return at;
 }
 
+/* Reserve the whole draw before taking any offset. A later ring wrap switches
+ * frame slots, invalidating offsets already taken from the previous buffers.
+ * Include worst-case constant uploads even when this draw can reuse them. */
+static int draw_reserve(VkDeviceSize vb, VkDeviceSize ib, int program)
+{
+    VkDeviceSize ub = (program ? 192 * 16 : 0) + sizeof(NV2APSConstants) + 32 + 3 * vk.ubo_align;
+    if (vb + 16 > vk.vtx.size || (ib && ib + 2 > vk.idx.size) || ub > vk.ubo.size)
+        return 0;
+    frame_begin();
+    if (vk.vtx.at + vb + 16 > vk.vtx.size || (ib && vk.idx.at + ib + 2 > vk.idx.size) ||
+        vk.ubo.at + ub > vk.ubo.size) {
+        frame_submit();
+        frame_begin();
+    }
+    return 1;
+}
+
 /* ── Shaders ───────────────────────────────────────────────────────────── */
 
 /* The vertex shader's output and the pixel shader's input, as both
@@ -844,7 +880,7 @@ static ShaderSeen *shader_seen(const char *hlsl, size_t len, int vertex)
 
 /* Compile HLSL to a shader module, or take the SPIR-V an earlier run made from
  * the same text. Returns its id (1-based), 0 on failure. */
-static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
+static uint32_t shader_make_ex(const char *hlsl, int vertex, const char *name, int raw)
 {
     shaderc_compilation_result_t res;
     VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -857,7 +893,8 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
         vk.spv_reused++;
         return seen->id;
     }
-    if (vk.shader_n >= MAX_SHADERS)
+    if (vk.shader_n >= MAX_SHADERS || (raw ? vk.raw_shader_n >= RAW_SHADER_SLOTS :
+                                           vk.normal_shader_n >= NORMAL_SHADER_SLOTS))
         return 0;
     cached = vkc_spirv_load(hlsl, len, vertex, &bytes);
     if (cached) {
@@ -867,6 +904,7 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
             id = ++vk.shader_n;
         free(cached);
         if (id) {
+            if (raw) ++vk.raw_shader_n; else ++vk.normal_shader_n;
             vk.spv_hits++;
             vk.spv_load_us += usec_now() - t0;
             if (seen)
@@ -886,6 +924,7 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
         ci.pCode = (const uint32_t *)shaderc_result_get_bytes(res);
         if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS) {
             id = ++vk.shader_n;
+            if (raw) ++vk.raw_shader_n; else ++vk.normal_shader_n;
             vkc_spirv_store(hlsl, len, vertex, ci.pCode, ci.codeSize);
             if (seen)
                 seen->id = id;
@@ -895,6 +934,11 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
     vk.spv_misses++;
     vk.spv_compile_us += usec_now() - t0;
     return id;
+}
+
+static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
+{
+    return shader_make_ex(hlsl, vertex, name, 0);
 }
 
 /* The combiner program in force as a pixel shader, 0 for none. */
@@ -1034,6 +1078,7 @@ static VkStencilOp stencil_op(DWORD op)
 
 static VkPipeline pipeline_make(const PipeKey *k)
 {
+    const Nv2aRawLayout *raw = k->raw_layout ? &vk.raw_layouts[k->raw_layout - 1] : NULL;
     VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
     VkPipelineShaderStageCreateInfo st[2];
     VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
@@ -1045,7 +1090,7 @@ static VkPipeline pipeline_make(const PipeKey *k)
     VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     VkPipelineColorBlendAttachmentState att;
-    VkVertexInputBindingDescription bind;
+    VkVertexInputBindingDescription bind[16];
     VkVertexInputAttributeDescription attr[16];
     static const VkDynamicState dyn[] = {
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
@@ -1065,17 +1110,33 @@ static VkPipeline pipeline_make(const PipeKey *k)
     st[1].module = vk.shaders[k->ps - 1];
     st[1].pName = "main";
 
-    memset(&bind, 0, sizeof bind);
+    memset(bind, 0, sizeof bind);
     memset(attr, 0, sizeof attr);
-    bind.inputRate = k->instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
-    if (k->layout == 0) {
-        bind.stride = 28;
+    bind[0].inputRate = k->instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+    if (raw) {
+        for (a = 0; a < raw->streams; ++a) {
+            bind[a].binding = a;
+            bind[a].stride = raw->stride[a];
+            bind[a].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        }
+        for (a = 0; a < 16; ++a) if (raw->used & (1u << a)) {
+            VkFormatProperties props;
+            attr[n].location = n;
+            attr[n].format = d3d8_raw_format(raw->type[a], raw->size[a]);
+            attr[n].offset = raw->offset[a];
+            attr[n].binding = raw->binding[a];
+            vkGetPhysicalDeviceFormatProperties(vk.phys, attr[n].format, &props);
+            if (!(props.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) return VK_NULL_HANDLE;
+            ++n;
+        }
+    } else if (k->layout == 0) {
+        bind[0].stride = 28;
         attr[0].location = 0; attr[0].format = VK_FORMAT_R32G32B32A32_SFLOAT; attr[0].offset = 0;
         attr[1].location = 1; attr[1].format = VK_FORMAT_B8G8R8A8_UNORM;      attr[1].offset = 16;
         attr[2].location = 2; attr[2].format = VK_FORMAT_R32G32_SFLOAT;       attr[2].offset = 20;
         n = 3;
     } else {
-        bind.stride = (uint32_t)k->layout * 16;
+        bind[0].stride = (uint32_t)k->layout * 16;
         for (a = 0; a < k->layout; a++) {
             attr[a].location = a;
             attr[a].format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -1083,8 +1144,8 @@ static VkPipeline pipeline_make(const PipeKey *k)
         }
         n = k->layout;
     }
-    vi.vertexBindingDescriptionCount = 1;
-    vi.pVertexBindingDescriptions = &bind;
+    vi.vertexBindingDescriptionCount = raw ? raw->streams : 1;
+    vi.pVertexBindingDescriptions = bind;
     vi.vertexAttributeDescriptionCount = n;
     vi.pVertexAttributeDescriptions = attr;
 
@@ -1151,18 +1212,21 @@ static VkPipeline pipeline_get(const PipeKey *k)
 {
     uint32_t h = 2166136261u, i;
     const uint8_t *b = (const uint8_t *)k;
+    size_t key_bytes = k->raw_layout ? sizeof *k : offsetof(PipeKey, raw_layout);
+    PipeEntry *cache = k->raw_layout ? vk.raw_pipes : vk.pipes;
+    uint32_t capacity = k->raw_layout ? RAW_PIPE_SLOTS : PIPE_SLOTS;
 
-    for (i = 0; i < sizeof *k; i++)
+    for (i = 0; i < key_bytes; i++)
         h = (h ^ b[i]) * 16777619u;
-    for (i = 0; i < PIPE_SLOTS; i++) {
-        PipeEntry *e = &vk.pipes[(h + i) % PIPE_SLOTS];
+    for (i = 0; i < capacity; i++) {
+        PipeEntry *e = &cache[(h + i) % capacity];
         if (!e->used) {
             e->used = 1;
             e->key = *k;
             e->pipe = pipeline_make(k);
             return e->pipe;
         }
-        if (!memcmp(&e->key, k, sizeof *k))
+        if (!memcmp(&e->key, k, key_bytes))
             return e->pipe;
     }
     return VK_NULL_HANDLE;
@@ -1913,23 +1977,21 @@ static uint32_t frame_constants(float zscale, const float texscale[2])
     return (uint32_t)at;
 }
 
-/* Everything but the vertex data: pipeline, descriptor set, dynamic state.
- * The caller has taken its ring space already and is inside the pass. */
-static int bind_draw(uint32_t vs, uint8_t layout, uint8_t instanced, VkPrimitiveTopology topo)
+/* Check/create the pipeline without binding command state or taking uploads.
+ * A rejected raw variant can then fall back without consuming ring space. */
+static VkPipeline draw_pipeline(uint32_t vs, uint8_t layout, uint8_t instanced,
+                                 VkPrimitiveTopology topo, uint16_t raw_layout)
 {
     PipeKey k;
-    VkPipeline pipe;
-    VkImageView views[STAGES];
-    VkSampler samplers[STAGES];
     uint32_t ps = combiner_shader();
-    int i, same = vk.bound_set != VK_NULL_HANDLE;
 
     if (!ps)
         ps = (vk.tex[0] && vk.tex[0]->img) ? vk.ps_tex : vk.ps_notex;
     if (!vs || !ps)
-        return 0;
+        return VK_NULL_HANDLE;
 
     memset(&k, 0, sizeof k);
+    k.raw_layout = raw_layout;
     k.vs = vs; k.ps = ps; k.layout = layout; k.instanced = instanced; k.topology = (uint8_t)topo;
     k.blend = vk.rs[D3DRS_ALPHABLENDENABLE] ? 1 : 0;
     if (k.blend) {
@@ -1950,7 +2012,16 @@ static int bind_draw(uint32_t vs, uint8_t layout, uint8_t instanced, VkPrimitive
         k.szfail = (uint8_t)vk.rs[D3DRS_STENCILZFAIL];
         k.spass = (uint8_t)vk.rs[D3DRS_STENCILPASS];
     }
-    pipe = pipeline_get(&k);
+    return pipeline_get(&k);
+}
+
+/* Descriptor set and dynamic state. The caller reserved all its ring space,
+ * took its uploads and entered the pass with an already checked pipeline. */
+static int bind_draw(VkPipeline pipe)
+{
+    VkImageView views[STAGES];
+    VkSampler samplers[STAGES];
+    int i, same = vk.bound_set != VK_NULL_HANDLE;
     if (!pipe)
         return 0;
     if (pipe != vk.bound_pipe) {
@@ -2043,7 +2114,7 @@ static int bind_draw(uint32_t vs, uint8_t layout, uint8_t instanced, VkPrimitive
         vk.scissor_dirty = 0;
     }
     vkCmdSetBlendConstants(vk.cmd, vk.blend_color);
-    if (k.stencil) {
+    if (vk.rs[D3DRS_STENCILENABLE]) {
         vkCmdSetStencilReference(vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, vk.rs[D3DRS_STENCILREF] & 0xFF);
         vkCmdSetStencilCompareMask(vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, vk.rs[D3DRS_STENCILMASK] & 0xFF);
         vkCmdSetStencilWriteMask(vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, vk.rs[D3DRS_STENCILWRITEMASK] & 0xFF);
@@ -2121,13 +2192,31 @@ static int popcount16(uint32_t m)
     return n;
 }
 
-static ProgEntry *prog_find(uint32_t hash, int points)
+static ProgEntry *prog_find(uint32_t hash, int points, const Nv2aRawLayout *raw)
 {
+    ProgEntry *cache = raw ? vk.raw_progs : vk.progs;
+    int count = raw ? vk.raw_prog_n : vk.prog_n;
     int i;
-    for (i = 0; i < vk.prog_n; i++)
-        if (vk.progs[i].hash == hash && vk.progs[i].points == points)
-            return &vk.progs[i];
+    for (i = 0; i < count; i++)
+        if (cache[i].hash == hash && cache[i].points == points &&
+            (raw ? !memcmp(&cache[i].raw, raw, sizeof *raw) : !cache[i].raw.used))
+            return &cache[i];
     return NULL;
+}
+
+/* IDs never change meaning while pipelines can refer to them. Exhaustion
+ * takes the gathered path; raw variants cannot consume its cache capacity. */
+static uint16_t raw_layout_id(const Nv2aRawLayout *raw)
+{
+    uint16_t i;
+    if (!raw) return 0;
+    if (vk.raw_layout_mru && !memcmp(&vk.raw_layouts[vk.raw_layout_mru - 1], raw, sizeof *raw))
+        return vk.raw_layout_mru;
+    for (i = 0; i < vk.raw_layout_n; ++i)
+        if (!memcmp(&vk.raw_layouts[i], raw, sizeof *raw)) return vk.raw_layout_mru = i + 1;
+    if (vk.raw_layout_n == RAW_LAYOUT_SLOTS) return 0;
+    vk.raw_layouts[vk.raw_layout_n++] = *raw;
+    return vk.raw_layout_mru = vk.raw_layout_n;
 }
 
 /* Returns 1 if drawn, 0 if the program is not cached and hlsl was NULL (call
@@ -2136,65 +2225,88 @@ int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
                          const float *consts, uint32_t consts_version,
                          float zscale, const float texscale[2],
                          const float *verts, uint32_t nverts,
-                         const uint16_t *idx, uint32_t nidx)
+                         const uint16_t *idx, uint32_t nidx,
+                         const Nv2aRawLayout *raw)
 {
     ProgEntry *e;
     int points = vk.points, nattr = popcount16(used ? used : 1);
     VkDeviceSize stride = (VkDeviceSize)nattr * 16, vat, iat = 0;
     VkPrimitiveTopology topo;
+    VkPipeline pipe;
+    uint16_t layout_id;
+    uint32_t offsets[16], raw_bytes = raw ? nv2a_raw_offsets(raw, nverts, offsets) : 0;
+
+    if (raw && (points || raw->used != used || !raw_bytes)) return -1;
+    if (raw && vk.raw_portability) {
+        for (uint32_t b = 0; b < raw->streams; ++b)
+            if (raw->stride[b] < vk.raw_stride_alignment || raw->stride[b] % vk.raw_stride_alignment)
+                return -1;
+        /* The optional beyond-stride portability feature is not enabled. */
+        for (uint32_t a = 0; a < 16; ++a) if (used & (1u << a))
+            if (raw->offset[a] + nv2a_raw_fetch_bytes(raw->type[a], raw->size[a]) >
+                raw->stride[raw->binding[a]]) return -1;
+    }
+    layout_id = raw_layout_id(raw);
+    if (raw && !layout_id) return -1;
 
     if (!vk.ready || !verts || !idx || !nverts || nidx < (points ? 1u : 3u))
         return vk.ready ? 1 : -1;
-    e = prog_find(hash, points);
+    e = prog_find(hash, points, raw);
     if (!e) {
         char *alt = NULL;
+        ProgEntry *cache = raw ? vk.raw_progs : vk.progs;
+        int *count = raw ? &vk.raw_prog_n : &vk.prog_n;
+        int capacity = raw ? RAW_PROG_SLOTS : PROG_SLOTS;
         if (!hlsl)
             return 0;
-        if (vk.prog_n < PROG_SLOTS) {
-            e = &vk.progs[vk.prog_n++];
+        if (*count < capacity) {
+            e = &cache[(*count)++];
         } else {
             int j, old = 0;
-            for (j = 1; j < PROG_SLOTS; j++)
-                if (vk.progs[j].last < vk.progs[old].last)
+            for (j = 1; j < capacity; j++)
+                if (cache[j].last < cache[old].last)
                     old = j;
-            e = &vk.progs[old];     /* its module stays; modules are not reclaimed */
+            e = &cache[old];     /* its module stays; modules are not reclaimed */
         }
         memset(e, 0, sizeof *e);
         e->hash = hash;
         e->used = used;
+        if (raw) e->raw = *raw;
+        e->raw_layout = layout_id;
         e->points = points;
         if (points)
             alt = points_variant(hlsl);
-        e->shader = (points && !alt) ? 0 : shader_make(alt ? alt : hlsl, 1, "nv2a_vsh");
+        e->shader = (points && !alt) ? 0 : shader_make_ex(alt ? alt : hlsl, 1, "nv2a_vsh", raw != NULL);
         free(alt);
         e->failed = !e->shader;
         if (!e->failed) {
             static unsigned compiled;
             if (compiled++ < 8 || (compiled & (compiled - 1)) == 0)
                 LOG("compiled vertex program %08X (%d inputs%s) (#%u)", hash, nattr,
-                    points ? ", points" : "", compiled);
+                    points ? ", points" : raw ? ", raw" : "", compiled);
         }
     }
     if (e->failed)
         return points ? 1 : -1;     /* points cannot fall back: skip them */
     e->last = ++vk.prog_tick;
 
-    /* All ring space first: a full ring flushes the frame, which would end
-     * the pass under a bound pipeline. */
-    frame_begin();
+    topo = points ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    pipe = draw_pipeline(e->shader, (uint8_t)nattr, (uint8_t)points, topo, e->raw_layout);
+    if (!pipe) return raw ? -1 : 1;
+    if (!draw_reserve(raw ? raw_bytes : stride * (points ? nidx : nverts),
+                      points ? 0 : (VkDeviceSize)nidx * 2, 1)) return -1;
     if (points) {
         uint32_t i;
         vat = ring_take(&vk.vtx, stride * nidx, 16);
         for (i = 0; i < nidx; i++)
             memcpy(vk.vtx.map + vat + stride * i,
                    (const uint8_t *)verts + stride * (idx[i] < nverts ? idx[i] : 0), stride);
-        topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     } else {
-        vat = ring_take(&vk.vtx, stride * nverts, 16);
-        memcpy(vk.vtx.map + vat, verts, stride * nverts);
+        VkDeviceSize bytes = raw ? raw_bytes : stride * nverts;
+        vat = ring_take(&vk.vtx, bytes, 16);
+        memcpy(vk.vtx.map + vat, verts, bytes);
         iat = ring_take(&vk.idx, (VkDeviceSize)nidx * 2, 2);
         memcpy(vk.idx.map + iat, idx, (size_t)nidx * 2);
-        topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
     if (!vk.consts_frame_valid || consts_version != vk.consts_version) {
         VkDeviceSize at = ring_take(&vk.ubo, 192 * 16, vk.ubo_align);
@@ -2205,19 +2317,22 @@ int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
     }
     vk.dyn_off[0] = ps_constants();
     vk.dyn_off[2] = frame_constants(zscale, texscale);
-    /* Any of those can have flushed, which forgets the constants' place. */
-    if (!vk.consts_frame_valid) {
-        VkDeviceSize at = ring_take(&vk.ubo, 192 * 16, vk.ubo_align);
-        memcpy(vk.ubo.map + at, consts, 192 * 16);
-        vk.consts_off = (uint32_t)at;
-        vk.consts_frame_valid = 1;
-    }
     vk.dyn_off[1] = vk.consts_off;
 
     pass_begin();
-    if (!bind_draw(e->shader, (uint8_t)nattr, (uint8_t)points, topo))
-        return 1;
-    vkCmdBindVertexBuffers(vk.cmd, 0, 1, &vk.vtx.buf, &vat);
+    if (!bind_draw(pipe))
+        return raw ? -1 : 1;
+    if (raw) {
+        VkBuffer buffers[16];
+        VkDeviceSize at[16];
+        for (uint32_t b = 0; b < raw->streams; ++b) {
+            buffers[b] = vk.vtx.buf;
+            at[b] = vat + offsets[b];
+        }
+        vkCmdBindVertexBuffers(vk.cmd, 0, raw->streams, buffers, at);
+    } else {
+        vkCmdBindVertexBuffers(vk.cmd, 0, 1, &vk.vtx.buf, &vat);
+    }
     if (points) {
         vkCmdDraw(vk.cmd, 4, nidx, 0, 0);
     } else {
@@ -3070,6 +3185,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *s, D3DPRIMITIVETY
                                              UINT prims, const void *data, UINT stride)
 {
     VkPrimitiveTopology topo;
+    VkPipeline pipe;
     uint32_t count, i;
     VkDeviceSize vat;
     const uint8_t *src = data;
@@ -3087,7 +3203,9 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *s, D3DPRIMITIVETY
     default: return D3DERR_INVALIDCALL;
     }
 
-    frame_begin();
+    pipe = draw_pipeline(vk.vs_fixed, 0, 0, topo, 0);
+    if (!pipe || !draw_reserve((VkDeviceSize)count * 28, 0, 0))
+        return D3DERR_INVALIDCALL;
     vat = ring_take(&vk.vtx, (VkDeviceSize)count * 28, 4);
     if (pt == D3DPT_TRIANGLEFAN) {
         /* Metal has no fans: (0, i+1, i+2) for each triangle. */
@@ -3105,7 +3223,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *s, D3DPRIMITIVETY
     vk.dyn_off[1] = 0;                      /* unread by this vertex shader */
 
     pass_begin();
-    if (!bind_draw(vk.vs_fixed, 0, 0, topo))
+    if (!bind_draw(pipe))
         return D3DERR_INVALIDCALL;
     vkCmdBindVertexBuffers(vk.cmd, 0, 1, &vk.vtx.buf, &vat);
     vkCmdDraw(vk.cmd, count, 1, 0, 0);
@@ -3461,8 +3579,18 @@ static int device_make(void)
     vkEnumerateDeviceExtensionProperties(vk.phys, NULL, &n_dext, dext);
     if (vk.surface)
         dev_ext[n_dev++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    if (has_ext(dext, n_dext, "VK_KHR_portability_subset"))
+    vk.raw_stride_alignment = 1;
+    if (has_ext(dext, n_dext, "VK_KHR_portability_subset")) {
+        VkPhysicalDevicePortabilitySubsetPropertiesKHR portability = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_PROPERTIES_KHR };
+        VkPhysicalDeviceProperties2 properties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        properties.pNext = &portability;
+        vkGetPhysicalDeviceProperties2(vk.phys, &properties);
+        vk.raw_stride_alignment = portability.minVertexInputBindingStrideAlignment;
+        if (!vk.raw_stride_alignment) vk.raw_stride_alignment = 1;
+        vk.raw_portability = 1;
         dev_ext[n_dev++] = "VK_KHR_portability_subset";
+    }
     qci.queueFamilyIndex = vk.qfam;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
@@ -3605,14 +3733,14 @@ static int resources_make(void)
     }
     if (!image_make(vk.tw, vk.th, VK_FORMAT_R8G8B8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                    | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, &vk.color, &vk.color_mem, &vk.color_view)
             || !image_make_samples(vk.tw, vk.th, 1, vk.samples, vk.depth_fmt,
                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                                    daspect, &vk.depth, &vk.depth_mem, &vk.depth_view)
             || (vk.samples > VK_SAMPLE_COUNT_1_BIT
                 && !image_make_samples(vk.tw, vk.th, 1, vk.samples, VK_FORMAT_R8G8B8A8_UNORM,
-                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                        VK_IMAGE_ASPECT_COLOR_BIT, &vk.color_ms, &vk.color_ms_mem,
                                        &vk.color_ms_view))
             || !image_make(1, 1, VK_FORMAT_R8G8B8A8_UNORM,

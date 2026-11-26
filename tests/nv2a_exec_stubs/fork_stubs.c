@@ -30,16 +30,25 @@ void kernel_nv2a_software_method(uint32_t subch, uint32_t method, uint32_t data)
 void nv2a_pb_stall(void) {}
 
 /* the vertex-program HLSL adapter */
+#ifndef NV2A_RAW_DRAW_TEST
 uint32_t nv2a_vsh_inputs_used(int *writes_consts) { if (writes_consts) *writes_consts = 0; return 0; }
 int nv2a_vsh_run_ready(const float in[16][4], NvVshOutput *out) { (void)in; (void)out; return 0; }
+#endif
 
 /* the translator */
 void pgraph_d3d11_bind_stage(int stage) { (void)stage; }
 void pgraph_d3d11_unbind_stage(int stage) { (void)stage; }
+#ifndef NV2A_RAW_DRAW_TEST
 int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used,
                               const uint16_t *idx, uint32_t nidx,
                               float tex_u_scale, float tex_v_scale)
 { (void)verts; (void)nverts; (void)used; (void)idx; (void)nidx; (void)tex_u_scale; (void)tex_v_scale; return 0; }
+int pgraph_d3d11_draw_program_raw(const Nv2aRawDraw *raw, uint32_t used,
+                                  const uint16_t *idx, uint32_t nidx,
+                                  float tex_u_scale, float tex_v_scale)
+{ (void)raw; (void)used; (void)idx; (void)nidx; (void)tex_u_scale; (void)tex_v_scale; return -1; }
+int pgraph_d3d11_program_usable(void) { return 0; }
+#endif
 #ifndef NV2A_HOST_CLIP_TEST
 void pgraph_d3d11_draw_ready(uint32_t nv2a_prim_mode, const PgraphReadyVertex *verts, uint32_t count)
 { (void)nv2a_prim_mode; (void)verts; (void)count; }
@@ -56,7 +65,6 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 void pgraph_d3d11_count_methods(uint32_t n) { stub_pgraph_handled += n; }
 void pgraph_d3d11_count_ignored_methods(uint32_t n)
 { stub_pgraph_handled += n; stub_pgraph_ignored += n; }
-int pgraph_d3d11_program_usable(void) { return 0; }
 int pgraph_d3d11_replace_texture_ready(uint32_t guest_addr, const void *data, uint32_t width,
                                        uint32_t height, uint32_t nv2a_format)
 { (void)guest_addr; (void)data; (void)width; (void)height; (void)nv2a_format; return 0; }
@@ -66,7 +74,9 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data, uint32
 int pgraph_d3d11_set_texture_ready_mips(uint32_t guest_addr, const void *data, uint32_t width,
                                         uint32_t height, uint32_t nv2a_format, uint32_t levels)
 { (void)guest_addr; (void)data; (void)width; (void)height; (void)nv2a_format; (void)levels; return 0; }
+#ifndef NV2A_RAW_DRAW_TEST
 void pgraph_d3d11_set_combiner_state(const Nv2aCombiner *state) { (void)state; }
+#endif
 void pgraph_d3d11_set_placement(float kx, float bx) { (void)kx; (void)bx; }
 void pgraph_d3d11_set_point_mode(int on, float size) { (void)on; (void)size; }
 #ifndef NV2A_HOST_CLIP_TEST

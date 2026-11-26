@@ -1693,13 +1693,16 @@ void pgraph_d3d11_draw_ready(uint32_t nv2a_prim_mode,
  * src/kernel/nv2a_vsh_cpu.c, the compile, cache and draw from
  * src/d3d/d3d8_extvs.c. */
 extern int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used);
+extern int nv2a_vsh_emit_hlsl_raw(char *out, int size, uint32_t *inputs_used,
+                                  const Nv2aRawLayout *raw);
 extern uint32_t nv2a_vsh_program_hash(void);
 extern const float *nv2a_vsh_constants(uint32_t *version);
 extern int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
                                 const float *consts, uint32_t consts_version,
                                 float zscale, const float texscale[2],
                                 const float *verts, uint32_t nverts,
-                                const uint16_t *idx, uint32_t nidx);
+                                const uint16_t *idx, uint32_t nidx,
+                                const Nv2aRawLayout *raw);
 
 static uint32_t s_bad_prog[64];
 static int s_bad_prog_n;
@@ -1731,9 +1734,10 @@ int pgraph_d3d11_program_usable(void)
     return 1;
 }
 
-int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used,
+static int draw_program(const float *verts, uint32_t nverts, uint32_t used,
                               const uint16_t *idx, uint32_t nidx,
-                              float tex_u_scale, float tex_v_scale)
+                              float tex_u_scale, float tex_v_scale,
+                              const Nv2aRawLayout *raw)
 {
     uint32_t *bad = s_bad_prog;
     int bad_n = s_bad_prog_n;
@@ -1756,18 +1760,20 @@ int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used
     ts[1] = tex_v_scale;
     dev->lpVtbl->BeginScene(dev);
     r = d3d8_Nv2aProgramDraw(hash, NULL, used, consts, version, zscale, ts,
-                             verts, nverts, idx, nidx);
+                             verts, nverts, idx, nidx, raw);
     if (r == 0) {
         static char hlsl[96 * 1024];
         uint32_t u = 0;
-        if (nv2a_vsh_emit_hlsl(hlsl, (int)sizeof hlsl, &u) < 0 || u != used) {
+        if (nv2a_vsh_emit_hlsl_raw(hlsl, (int)sizeof hlsl, &u, raw) < 0 || u != used) {
             r = -1;
         } else {
             r = d3d8_Nv2aProgramDraw(hash, hlsl, used, consts, version, zscale, ts,
-                                     verts, nverts, idx, nidx);
+                                     verts, nverts, idx, nidx, raw);
         }
     }
     if (r < 0) {
+        /* A rejected raw layout does not poison the normal program cache. */
+        if (raw) return -1;
         if (s_bad_prog_n < 64)
             s_bad_prog[s_bad_prog_n++] = hash;
         {
@@ -1781,6 +1787,28 @@ int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += nidx;
     return 1;
+}
+
+int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used,
+                              const uint16_t *idx, uint32_t nidx,
+                              float tex_u_scale, float tex_v_scale)
+{
+    return draw_program(verts, nverts, used, idx, nidx, tex_u_scale, tex_v_scale, NULL);
+}
+
+int pgraph_d3d11_draw_program_raw(const Nv2aRawDraw *raw, uint32_t used,
+                                  const uint16_t *idx, uint32_t nidx,
+                                  float tex_u_scale, float tex_v_scale)
+{
+    static int force_fallback = -1;
+    if (force_fallback < 0) {
+        const char *e = getenv("RECOMP_GPU_DRAW_FORCE_FALLBACK");
+        force_fallback = e && !strcmp(e, "1");
+    }
+    if (force_fallback) return -1; /* differential failure-path test */
+    if (!raw || raw->layout.used != used) return -1;
+    return draw_program((const float *)raw->vertices, raw->nverts, used, idx, nidx,
+                        tex_u_scale, tex_v_scale, &raw->layout);
 }
 
 void pgraph_d3d11_flush(void)

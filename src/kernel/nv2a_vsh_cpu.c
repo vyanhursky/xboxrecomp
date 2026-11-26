@@ -265,7 +265,8 @@ static void hlsl_write(HlslBuf *b, const char *dst, const char *val, uint32_t ma
 /* The current program (from its start to its final instruction) as HLSL.
  * Returns the length, or -1 for a program the GPU path does not take (one
  * that writes a constant, or runs off the end of the program memory). */
-int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used)
+int nv2a_vsh_emit_hlsl_raw(char *out, int size, uint32_t *inputs_used,
+                          const Nv2aRawLayout *raw)
 {
     HlslBuf b;
     uint32_t pc, used;
@@ -275,6 +276,9 @@ int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used)
     used = nv2a_vsh_inputs_used(&wc);
     if (wc)
         return -1;
+    if (raw && (!used || raw->used != used))
+        return -1;
+    if (raw && !nv2a_raw_offsets(raw, 1, NULL)) return -1;
     if (inputs_used)
         *inputs_used = used;
 
@@ -284,8 +288,13 @@ int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used)
     hb(&b, "cbuffer VshFrame : register(b2) { float4 Screen; float4 TexScale; };\n");
     hb(&b, "struct VS_IN {\n");
     for (a = 0; a < 16; a++)
-        if ((used >> a) & 1)
-            hb(&b, "    float4 v%d : ATTR%d;\n", a, a);
+        if ((used >> a) & 1) {
+            const char *type = "float4";
+            if (raw && raw->type[a] != 2)
+                type = raw->type[a] == 6 ? "uint" :
+                       (raw->type[a] == 1 || raw->type[a] == 5) ? "int4" : "uint4";
+            hb(&b, "    %s v%d : ATTR%d;\n", type, a, a);
+        }
     if (!used)
         hb(&b, "    float4 unused : ATTR0;\n");
     hb(&b, "};\n");
@@ -303,8 +312,25 @@ int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used)
            "};\n");
     hb(&b, "VS_OUT main(VS_IN i) {\n");
     for (a = 0; a < 16; a++)
-        if ((used >> a) & 1)
-            hb(&b, "    float4 v%d = i.v%d;\n", a, a);
+        if ((used >> a) & 1) {
+            if (!raw) {
+                hb(&b, "    float4 v%d = i.v%d;\n", a, a);
+            } else if (raw->type[a] == 6) {
+                hb(&b, "    float4 v%d = float4((float)(asint(i.v%d << 21) >> 21) / 1023.0, "
+                       "(float)(asint(i.v%d << 10) >> 21) / 1023.0, "
+                       "(float)(asint(i.v%d) >> 22) / 511.0, 1.0);\n", a, a, a, a);
+            } else {
+                const char *swizzle = raw && raw->type[a] == 0 ? ".zyxw" : "";
+                const char *scale = raw && raw->type[a] == 1 ? " / 32767.0" :
+                                    raw && (raw->type[a] == 0 || raw->type[a] == 4) ? " / 255.0" : "";
+                hb(&b, "    float4 v%d = (float4)i.v%d%s%s;\n", a, a, swizzle, scale);
+                if (raw && raw->type[a] != 0) {
+                    int c;
+                    for (c = (int)raw->size[a]; c < 4; ++c)
+                        hb(&b, "    v%d.%c = %s;\n", a, "xyzw"[c], c == 3 ? "1.0" : "0.0");
+                }
+            }
+        }
     hb(&b, "    float4 R[13];\n    float4 O[13];\n    int a0 = 0;\n"
            "    [unroll] for (int k = 0; k < 13; k++) { R[k] = float4(0, 0, 0, 0); O[k] = float4(0, 0, 0, 0); }\n"
            "    O[3].w = 1.0; O[4].w = 1.0;\n"
@@ -402,6 +428,11 @@ int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used)
            "    return o;\n"
            "}\n");
     return b.bad ? -1 : (int)(size - b.left);
+}
+
+int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used)
+{
+    return nv2a_vsh_emit_hlsl_raw(out, size, inputs_used, NULL);
 }
 
 /* A hash of the current program from its start through its final

@@ -8,6 +8,7 @@
  * them, and the first call says so.
  */
 #include "d3d8_xbox.h"
+#include "../kernel/nv2a_raw_draw.h"
 #include <stdint.h>
 #include <stdio.h>
 
@@ -35,10 +36,12 @@ int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
                          const float *consts, uint32_t consts_version,
                          float zscale, const float texscale[2],
                          const float *verts, uint32_t nverts,
-                         const uint16_t *idx, uint32_t nidx)
+                         const uint16_t *idx, uint32_t nidx,
+                         const Nv2aRawLayout *raw)
 {
     (void)hash; (void)hlsl; (void)used; (void)consts; (void)consts_version;
     (void)zscale; (void)texscale; (void)verts; (void)nverts; (void)idx; (void)nidx;
+    (void)raw;
     pending("d3d8_Nv2aProgramDraw");
     return -1;
 }

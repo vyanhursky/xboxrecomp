@@ -11,6 +11,7 @@
 #define XBOXRECOMP_NV2A_VSH_CPU_H
 
 #include <stdint.h>
+#include "nv2a_raw_draw.h"
 
 /* What one run of the program produced for one vertex. */
 typedef struct {
@@ -40,6 +41,9 @@ uint32_t nv2a_vsh_inputs_used(int *writes_consts);
 /* The current program as HLSL (M4e, docs/research/m4e-gpu-vertex-programs.md):
  * returns its length, or -1 for a program the GPU path does not take. */
 int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used);
+/* Same program, native packed vertex inputs decoded by the GPU. */
+int nv2a_vsh_emit_hlsl_raw(char *out, int size, uint32_t *inputs_used,
+                          const Nv2aRawLayout *raw);
 
 /* The GPU path's cache key for the current program. */
 uint32_t nv2a_vsh_program_hash(void);

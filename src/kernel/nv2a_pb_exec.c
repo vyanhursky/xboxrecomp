@@ -252,12 +252,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 
 /* One vertex attribute stream, as the title describes it. Attribute 0 is
  * position; the rest are colours, texture coordinates and so on. */
-typedef struct {
-    uint32_t offset;      /* guest address of element 0 */
-    uint32_t type;        /* NV097 data type nibble */
-    uint32_t size;        /* components per element */
-    uint32_t stride;      /* bytes between elements */
-} VertexAttr;
+typedef Nv2aRawAttr VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  65536
@@ -1058,6 +1053,118 @@ slow:
         if (!fetch_attr(&s_gpu.attr[g->slot], vi, dst))
             nv2a_vsh_current(g->slot, dst);
     }
+}
+
+static int s_raw_on = -1, s_raw_stats;
+static uint64_t s_raw_attempts, s_raw_planned, s_raw_draws, s_raw_fallbacks, s_raw_bytes;
+static uint64_t s_raw_missing, s_raw_split, s_raw_layout, s_raw_span, s_raw_points;
+static unsigned char s_raw_snapshot[4u * 1024u * 1024u];
+
+static int raw_bridge_on(void)
+{
+    if (s_raw_on < 0) {
+        const char *e = getenv("RECOMP_GPU_DRAW_BRIDGE");
+        const char *s = getenv("RECOMP_GPU_DRAW_STATS");
+        s_raw_on = e && !strcmp(e, "1");
+        s_raw_stats = s_raw_on && s && !strcmp(s, "1");
+        if (s_raw_on) fprintf(stderr, "[RAW-DRAW] enabled=1 stats=%d\n", s_raw_stats);
+    }
+    return s_raw_on;
+}
+
+static void raw_bridge_report(void)
+{
+    if (s_raw_stats)
+        fprintf(stderr, "[RAW-DRAW] attempts=%llu planned=%llu accepted=%llu fallback=%llu planned_bytes=%llu"
+                        " missing=%llu split=%llu layout=%llu span=%llu points=%llu\n",
+                (unsigned long long)s_raw_attempts, (unsigned long long)s_raw_planned,
+                (unsigned long long)s_raw_draws, (unsigned long long)s_raw_fallbacks,
+                (unsigned long long)s_raw_bytes, (unsigned long long)s_raw_missing,
+                (unsigned long long)s_raw_split, (unsigned long long)s_raw_layout,
+                (unsigned long long)s_raw_span, (unsigned long long)s_raw_points);
+}
+
+static int raw_prepare(uint32_t used, uint32_t count, Nv2aRawDraw *out)
+{
+    Nv2aRawPlan plan;
+    uint32_t a, s, offsets[16], sizes[16];
+    const unsigned char *source[16];
+    if (!raw_bridge_on()) return 0;
+    if (s_raw_stats && (++s_raw_attempts % 8192u) == 0) raw_bridge_report();
+    if (s_gpu.prim == 1) { if (s_raw_stats) ++s_raw_points; return 0; }
+    if (!s_gpu.inline_active) for (a = 0; a < 16; ++a)
+        if ((used & (1u << a)) && !s_gpu.attr[a].offset) {
+            if (s_raw_stats) ++s_raw_missing;
+            return 0; /* offset zero is absent for guest arrays, even at a high index */
+        }
+    if (!nv2a_raw_plan(s_gpu.attr, used, s_gpu.idx, count, &plan)) {
+        if (s_raw_stats) {
+            uint32_t a, stride = 0;
+            int missing = 0, split = 0;
+            for (a = 0; a < 16; ++a) if (used & (1u << a)) {
+                const VertexAttr *v = &s_gpu.attr[a];
+                if (!v->size || !v->stride) missing = 1;
+                if (stride && stride != v->stride) split = 1;
+                stride = v->stride;
+            }
+            if (missing) ++s_raw_missing;
+            else if (split) ++s_raw_split;
+            else ++s_raw_layout;
+        }
+        return 0;
+    }
+    (void)nv2a_raw_spans(&plan.layout, plan.nverts, offsets, sizes);
+    for (s = 0; s < plan.layout.streams; ++s) {
+        uint32_t bytes = (plan.nverts - 1) * plan.source_stride[s] + plan.source_extent[s];
+        if (s_gpu.inline_active) {
+            if ((uint64_t)plan.source[s] + bytes > (uint64_t)s_gpu.inline_count * 4) {
+                if (s_raw_stats) ++s_raw_span;
+                return 0;
+            }
+            source[s] = (const uint8_t *)s_gpu.inline_buf + plan.source[s];
+        } else {
+            if (plan.source[s] < 0x1000u || !guest_span_ok(plan.source[s], bytes)) {
+                if (s_raw_stats) ++s_raw_span;
+                return 0;
+            }
+            source[s] = (const uint8_t *)xbox_GetMemoryOffset() + plan.source[s];
+        }
+    }
+    out->layout = plan.layout;
+    /* Snapshot at the same point as the old gather, before texture uploads
+     * or shader compilation can wait. No mutable guest pointer is deferred. */
+    for (s = 0; s < plan.layout.streams; ++s) {
+        uint32_t bytes = sizes[s];
+        uint32_t end = s + 1 < plan.layout.streams ? offsets[s + 1] : plan.bytes;
+        uint32_t extent = bytes - (plan.nverts - 1) * plan.layout.stride[s];
+        nv2a_raw_copy_rows(s_raw_snapshot + offsets[s], source[s], plan.nverts,
+                          plan.layout.stride[s], plan.source_stride[s], extent, plan.source_extent[s]);
+        memset(s_raw_snapshot + offsets[s] + bytes, 0, end - offsets[s] - bytes);
+    }
+    out->vertices = s_raw_snapshot;
+    out->first = plan.first;
+    out->nverts = plan.nverts;
+    if (s_raw_stats) { ++s_raw_planned; s_raw_bytes += plan.bytes; }
+    return 1;
+}
+
+/* Both the main draw and widescreen slab redraws use the same bridge/fallback.
+ * A raw layout failure retains the gathered shader and the same expanded
+ * index list. No guest pointer survives this synchronous backend call. */
+static int draw_gpu_batch(const Nv2aRawDraw *raw, float *gv, uint32_t nverts,
+                           uint32_t used, const uint16_t *indices, uint32_t count,
+                           float su, float sv)
+{
+    if (raw) {
+        int r = pgraph_d3d11_draw_program_raw(raw, used, indices, count, su, sv);
+        if (r >= 0) {
+            if (s_raw_stats) ++s_raw_draws;
+            return r;
+        }
+        if (s_raw_stats) ++s_raw_fallbacks;
+        nv2a_raw_gather(raw, gv);
+    }
+    return pgraph_d3d11_draw_program(gv, nverts, used, indices, count, su, sv);
 }
 
 /* Widescreen 2D placement (docs/widescreen in the Def Jam port).
@@ -4338,9 +4445,9 @@ static void bind_texture_ready(const Texture *t)
  * beyond the 4:3 picture -- so a menu background's extension moves, scales and fades with the
  * layer it extends. Assumes an unrotated layer. RECOMP_WS_WIDE=0 turns it off;
  * RECOMP_WS_WIDE_TRACE=1 logs the geometry it measured. */
-static void ws_wide_sides(int gpu, const float *gv, uint32_t gnv, uint32_t used,
+static void ws_wide_sides(int gpu, float *gv, uint32_t gnv, uint32_t used,
                           const uint16_t *gtri, uint32_t gnt, float gsu, float gsv,
-                          const PgraphReadyVertex *ready, uint32_t n)
+                          const PgraphReadyVertex *ready, uint32_t n, const Nv2aRawDraw *raw)
 {
     static int off = -1, trace = -1;
     static unsigned traced;
@@ -4383,7 +4490,7 @@ static void ws_wide_sides(int gpu, const float *gv, uint32_t gnv, uint32_t used,
             pgraph_d3d11_set_placement(k, d * k / 320.0f);
             pgraph_d3d11_set_surface_clip(cx, s_gpu.clip_raw_v & 0xFFFF, cw ? cw : 1, s_gpu.clip_raw_v >> 16);
             if (gpu)
-                (void)pgraph_d3d11_draw_program(gv, gnv, used, gtri, gnt, gsu, gsv);
+                (void)draw_gpu_batch(raw, gv, gnv, used, gtri, gnt, gsu, gsv);
             else
                 pgraph_d3d11_draw_ready(s_gpu.prim, ready, n);
             drew++;
@@ -4595,6 +4702,8 @@ static void draw_primitive_body(void)
             static float    gv[NV_MAX_INDICES * 16 * 4];
             static uint16_t gtri[NV_MAX_INDICES * 3];
             uint32_t gnv = 0, gnt = 0;
+            Nv2aRawDraw raw_draw;
+            int raw = 0;
             float gsu = 1.0f, gsv = 1.0f;
             int gpu = 0;
             {
@@ -4631,14 +4740,22 @@ static void draw_primitive_body(void)
                 uint32_t k, cnt = s_gpu.idx_count < NV_MAX_INDICES ? s_gpu.idx_count : NV_MAX_INDICES;
                 LONGLONG et_g0 = s_et_on > 0 ? et_now() : 0;
                 GatherAttr plan[16];
-                uint32_t nplan = gather_plan_on() ? gather_prepare(used, plan) : 0;
-                int planned = gather_plan_on();
+                uint32_t nplan;
+                int planned;
+                raw = raw_prepare(used, cnt, &raw_draw);
+                if (raw) gnv = raw_draw.nverts;
+                planned = raw || gather_plan_on();
+                nplan = !raw && planned ? gather_prepare(used, plan) : 0;
                 if (++gm_cur == 0) {
                     memset(gm_gen, 0, sizeof(gm_gen));
                     gm_cur = 1;
                 }
                 for (k = 0; k < cnt; k++) {
                     uint32_t vi = s_gpu.idx[k], slot = vi & (VC_SIZE - 1), a;
+                    if (raw) {
+                        lidx[k] = (uint16_t)(vi - raw_draw.first);
+                        continue;
+                    }
                     if (gm_gen[slot] == gm_cur && gm_tag[slot] == vi) {
                         lidx[k] = gm_val[slot];
                         continue;
@@ -5003,13 +5120,13 @@ static void draw_primitive_body(void)
                     LONGLONG et_d0 = s_et_on > 0 ? et_now() : 0;
                     if (n >= 3 && gpu) {
                         pgraph_d3d11_set_point_mode(s_gpu.prim == 1, s_point_size);
-                        (void)pgraph_d3d11_draw_program(gv, gnv, used, gtri, gnt, gsu, gsv);
+                        (void)draw_gpu_batch(raw ? &raw_draw : NULL, gv, gnv, used, gtri, gnt, gsu, gsv);
                         pgraph_d3d11_set_point_mode(0, 0.0f);
                     }
                     else if (n >= 3)
                         pgraph_d3d11_draw_ready(s_gpu.prim, ready, n);
                     if (n >= 3)
-                        ws_wide_sides(gpu, gv, gnv, used, gtri, gnt, gsu, gsv, ready, n);
+                        ws_wide_sides(gpu, gv, gnv, used, gtri, gnt, gsu, gsv, ready, n, raw ? &raw_draw : NULL);
                     if (s_et_on > 0)
                         s_et_draw += et_now() - et_d0;
                 }
@@ -6430,6 +6547,7 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
+    raw_bridge_report();
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {
