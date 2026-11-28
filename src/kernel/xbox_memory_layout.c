@@ -1532,7 +1532,7 @@ static void semaphore_release_now(uint32_t value)
         volatile uint32_t *f = fence_location(0, &latest);
         if (f && (value - *f - 1u) >= (latest - *f)) {
             static int told;
-            if (told++ < 10)
+            if (told < 10 && ++told)
                 fprintf(stderr, "  [FENCE] ignoring release 0x%X: fence 0x%X, latest 0x%X\n",
                         value, *f, latest);
             return;
@@ -1617,7 +1617,7 @@ static void fence_catch_up(uint32_t put_va, uint32_t pb_size)
         /* Before PUT in the current lap: behind it by less than the buffer. */
         if (put_va - rpos - 1u < pb_size && fence_record_behind(dev, rpos, put_va, put_va)) {
             static int told;
-            if (told++ < 10)
+            if (told < 10 && ++told)
                 fprintf(stderr, "  [FENCE] caught up with PUT; completing 0x%X -> 0x%X"
                                 " (its commands at 0x%08X are behind PUT 0x%08X)\n",
                         *f, ref, rpos, put_va);
@@ -1684,7 +1684,7 @@ static void fence_follow_executor(uint32_t exec_va, uint32_t put_va, int no_marg
     }
     if (done) {
         static int told;
-        if (told++ < 10)
+        if (told < 10 && ++told)
             fprintf(stderr, "  [FENCE] executor passed 0x%X..0x%X (commands before 0x%08X);"
                             " completing\n", *f + 2, done, exec_va);
         fence_note("follow", done);
@@ -5191,7 +5191,7 @@ int xbox_ContiguousFree(uint32_t va)
     n = (va & (CONTIG_PAGE - 1)) ? 0 : g_contig_len[first];
     if (!n) {
         contig_unlock();
-        if (warned++ < 8) {
+        if (warned < 8 && ++warned) {
             fprintf(stderr, "  [CONTIG] free of 0x%08X: not the start of a "
                     "block, ignored\n", va);
             fflush(stderr);

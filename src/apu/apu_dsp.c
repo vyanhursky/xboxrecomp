@@ -179,7 +179,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         uint32_t *slot = dsp_ack_auto_slot(d);
         if (slot && *slot) {
             static int shown;
-            if (shown++ < 3)
+            if (shown < 3 && ++shown)
                 fprintf(stderr, "[APU] DSP doorbell (auto): command 0x%08X"
                                 " acknowledged\n", *slot);
             *slot = 0;

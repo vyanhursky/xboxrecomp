@@ -1228,7 +1228,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
      * return address and the stack above it (the XDK wrapper's callers). */
     if (!xbox_va) {
         static int n;
-        if (n++ < 8) {
+        if (n < 8 && ++n) {
             int k;
             fprintf(stderr, "  [CONTIG] refused: caller 0x%08X size=%u low=0x%08X "
                     "high=0x%08X align=%u prot=0x%X stack:", g_xbox_kernel_caller,
@@ -1344,7 +1344,7 @@ static void bridge_NtAllocateVirtualMemory(void)
      */
     if (base_hint >= (g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram)) {
         static unsigned warned;
-        if (warned++ < 8)
+        if (warned < 8 && ++warned)
             fprintf(stderr,
                     "  [KERNEL] WARNING: allocation at 0x%08X is above "
                     "%u MB mapped; it aliases 0x%08X\n",
@@ -1609,7 +1609,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
     if ((free_type != BRIDGE_MEM_DECOMMIT && free_type != BRIDGE_MEM_RELEASE)
             || (free_type == BRIDGE_MEM_RELEASE && size != 0)) {
         g_eax = 0xC00000F0u;           /* STATUS_INVALID_PARAMETER_2..3 */
-        if (refused++ < 8) {
+        if (refused < 8 && ++refused) {
             fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X "
                     "size=%u type=0x%X refused (bad type/size)\n",
                     base, size, free_type);
@@ -1624,7 +1624,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
     page_base = base & ~0xFFFu;
     if (page_base < XBOX_HEAP_BASE || page_base >= mapped) {
         g_eax = 0xC00000A0u;                /* STATUS_MEMORY_NOT_ALLOCATED */
-        if (refused++ < 8) {
+        if (refused < 8 && ++refused) {
             fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X "
                     "type=0x%X outside guest memory\n", base, free_type);
             fflush(stderr);
@@ -1636,7 +1636,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
     if (free_type == BRIDGE_MEM_RELEASE) {
         if (base != page_base || bridge_heap_interior(page_base, left)) {
             g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
-            if (refused++ < 8) {
+            if (refused < 8 && ++refused) {
                 fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X "
                         "release inside a block refused\n", base);
                 fflush(stderr);
@@ -2262,7 +2262,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t timeout_ptr = STACK_ARG(3);
 
     static int logged = 0;
-    if (logged++ < 20) {
+    if (logged < 20 && ++logged) {
         fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
                 "handle=%p timeout=%s\n",
                 STACK_ARG(0), handle, timeout_ptr ? "finite" : "INFINITE");
@@ -2332,7 +2332,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
 
     {
         static int logged;
-        if (logged++ < 20) {
+        if (logged < 20 && ++logged) {
             fprintf(stderr, "  [KERNEL] NtWaitForMultipleObjectsEx: count=%u type=%u timeout=%s\n",
                     count, wait_type, timeout_ptr ? "finite" : "INFINITE");
             for (i = 0; i < count; i++)
@@ -2679,7 +2679,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
         {
             static unsigned n;
-            if (n++ < 8)
+            if (n < 8 && ++n)
                 fprintf(stderr, "  [DPC] running routine 0x%08X\n", routine);
             fflush(stderr);
         }
@@ -3318,7 +3318,7 @@ static void kernel_vblank_deliver(void)
         InterlockedExchange(&g_vbl_tick_busy, 0);
     if (claimed == 0)
         InterlockedIncrement(&g_vbl_declined);
-    if (n++ < 3) {
+    if (n < 3 && ++n) {
         fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                 claimed < 0 ? "not callable" :
                 claimed ? "claimed it" : "declined it");
@@ -3768,7 +3768,7 @@ void kernel_nv2a_software_method(uint32_t subch, uint32_t method, uint32_t data)
     LONG tail = g_swm_tail, next = (tail + 1) % PGRAPH_SWM_QUEUE;
     if (next == g_swm_head) {
         static int dropped;
-        if (dropped++ < 3)
+        if (dropped < 3 && ++dropped)
             fprintf(stderr, "  [PGRAPH] software-method queue full; dropping 0x%X(0x%X)\n",
                     method, data);
         return;
@@ -5752,7 +5752,7 @@ static void bridge_NtQuerySymbolicLinkObject(void)
 
         if (!buf_va || len >= max_len) {
             static unsigned warned;
-            if (warned++ < 4) {
+            if (warned < 4 && ++warned) {
                 fprintf(stderr,
                         "  [KERNEL] NtQuerySymbolicLinkObject: buffer 0x%08X "
                         "max=%u cannot hold %u bytes; returning "
@@ -6400,7 +6400,7 @@ static void bridge_KeSetBasePriorityThread(void)
     SetThreadPriority(host, want);
     {
         static int told;
-        if (told++ < 16)
+        if (told < 16 && ++told)
             fprintf(stderr, "  [KERNEL] KeSetBasePriorityThread object 0x%08X increment %ld"
                             " -> host priority %d (was %d)\n",
                     object, (long)increment, want, prev);
@@ -7428,7 +7428,7 @@ static void bridge_NtDuplicateObject(void)
     if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
                          &dup, 0, FALSE, opts)) {
         static int logged = 0;
-        if (logged++ < 8) {
+        if (logged < 8 && ++logged) {
             fprintf(stderr, "  [KERNEL] NtDuplicateObject: token=0x%08X "
                     "handle=%p failed (error %lu)\n",
                     STACK_ARG(0), src, (unsigned long)GetLastError());
@@ -8558,12 +8558,12 @@ static HANDLE ke_object_resolve(uint32_t guest_va)
         ke_shadow_insert(guest_va, h);
     LeaveCriticalSection(&g_ke_shadow_cs);
     if (h) {
-        if (s_logged++ < 8)
+        if (s_logged < 8 && ++s_logged)
             fprintf(stderr, "  [KERNEL] lazy shadow: guest object VA=0x%08X type=%u signal=%d\n",
                     guest_va, type, (int)BRIDGE_MEM32(guest_va + 4));
         return h;
     }
-    if (s_logged++ < 8)
+    if (s_logged < 8 && ++s_logged)
         fprintf(stderr, "  [KERNEL] no shadow for guest object VA=0x%08X type=%u (raw)\n",
                 guest_va, type);
     return XBOX_TO_NATIVE(guest_va);
@@ -8657,7 +8657,7 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
     LeaveCriticalSection(&g_ke_shadow_cs);
     if (h) {
         static int shown;
-        if (shown++ < 16)
+        if (shown < 16 && ++shown)
             fprintf(stderr, "  [KERNEL] event 0x%08X built by the title: host event created "
                             "(%s)\n", guest_va, *type ? "synchronization" : "notification");
     }
@@ -11857,7 +11857,7 @@ static void kernel_gpu_preempt(void)
             if (backlog0 && xbox_Nv2aBacklog() == backlog0) {
                 static int told;
                 pause_until = t1.QuadPart + f.QuadPart;
-                if (told++ < 5)
+                if (told < 5 && ++told)
                     fprintf(stderr, "  [GPU] executor not moving (backlog 0x%X); not holding"
                                     " the title for a second (#%d)%c", backlog0, told, 10);
             }

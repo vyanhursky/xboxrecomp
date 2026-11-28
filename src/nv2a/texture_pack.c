@@ -136,7 +136,7 @@ static void host_shutdown(void);
 
 static void warn(const char *what, const char *path)
 {
-    if (g_errors++ < 32) fprintf(stderr,"[TEXPACK] %s: %s\n",what,path ? path : "");
+    if (g_errors < 32 && ++g_errors) fprintf(stderr,"[TEXPACK] %s: %s\n",what,path ? path : "");
 }
 static char *trim(char *s)
 {

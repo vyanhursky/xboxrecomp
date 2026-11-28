@@ -185,7 +185,7 @@ static ExtVs *compile(uint32_t hash, const char *hlsl, uint32_t used)
     if (FAILED(hr)) {
         static int told;
         e->failed = 1;
-        if (told++ < 4)
+        if (told < 4 && ++told)
             fprintf(stderr, "[EXTVS] program %08X did not compile: %s\n", hash,
                     err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
         if (err) ID3D10Blob_Release(err);
@@ -216,7 +216,7 @@ static ExtVs *compile(uint32_t hash, const char *hlsl, uint32_t used)
     if (FAILED(hr)) {
         static int told;
         e->failed = 1;
-        if (told++ < 4)
+        if (told < 4 && ++told)
             fprintf(stderr, "[EXTVS] program %08X: shader or layout creation failed 0x%08lX\n",
                     hash, (unsigned long)hr);
     } else {

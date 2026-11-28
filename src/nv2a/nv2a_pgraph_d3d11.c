@@ -1105,7 +1105,7 @@ static int ready_bind(uint32_t guest_addr, const void *data, uint32_t width,
         bytes = ready_tex_bytes(nv2a_format, width, height, &compressed, &bpp);
         if (!bytes) {
             static uint32_t moaned;
-            if (moaned++ < 8)
+            if (moaned < 8 && ++moaned)
                 fprintf(stderr, "[PGRAPH-D3D11] texture format 0x%02X has"
                                 " no known size (%ux%u)\n",
                         nv2a_format, width, height);
@@ -1182,7 +1182,7 @@ static int ready_bind(uint32_t guest_addr, const void *data, uint32_t width,
          * atlas thousands of times. */
         {
             static uint32_t reported;
-            if (reported++ < 12)
+            if (reported < 12 && ++reported)
                 fprintf(stderr, "[PGRAPH-D3D11] uploaded %s texture 0x%08X "
                                 "%ux%u fmt 0x%02X (%u bytes)\n",
                         compressed ? "compressed"
@@ -1772,7 +1772,7 @@ int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used
             s_bad_prog[s_bad_prog_n++] = hash;
         {
             static int told;
-            if (told++ < 8)
+            if (told < 8 && ++told)
                 fprintf(stderr, "[PGRAPH-D3D11] vertex program %08X takes the CPU path%c",
                         hash, 10);
         }

@@ -366,7 +366,7 @@ static int apu_call_isr(void)
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     {
         static unsigned n;
-        if (n++ < 3) {
+        if (n < 3 && ++n) {
             fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
                     routine, (g_eax & 1) ? "claimed" : "declined");
             fflush(stderr);
@@ -1019,7 +1019,7 @@ static void apu_fork_tap(MCPXAPUState *d, const int16_t (*pcm)[2], int n)
     }
     if (++periods < 48000 / MIXER_FRAME_SAMPLES)
         return;
-    if (lines++ < 600) {
+    if (lines < 600 && ++lines) {
         extern int mcpx_apu_vp_count_voices(MCPXAPUState *d);
         fprintf(stderr, "[APU] output peak %d over the last second; %d voices,"
                         " SECTL %08X FECTL %08X; buffers dropped %d, device ran dry %d\n",

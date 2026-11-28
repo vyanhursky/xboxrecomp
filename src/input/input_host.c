@@ -222,7 +222,7 @@ static int g_virtual_count;
 static bool SDLCALL virtual_rumble(void *userdata, Uint16 low, Uint16 high)
 {
     static int logged;
-    if (logged++ < 80)
+    if (logged < 80 && ++logged)
         fprintf(stderr, "[INPUT] virtual pad %d rumble: %u %u\n", (int)(intptr_t)userdata + 1,
                 (unsigned)low, (unsigned)high);
     return true;

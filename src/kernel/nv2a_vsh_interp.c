@@ -115,14 +115,14 @@ void nv2a_vsh_constant_word(uint32_t word)
     }
     else if (vsh_dump_enabled()) {
         static int warned;
-        if (warned++ < 8)
+        if (warned < 8 && ++warned)
             fprintf(stderr, "  [VSH] constant write DROPPED (c[%u] >= %u)\n",
                     s_const_load, NV2A_VSH_CONSTANTS);
     }
     if (vsh_dump_enabled() && s_const_word == 3 && s_const_load >= 64
             && s_const_load < NV2A_VSH_CONSTANTS) {
         static int shown;
-        if (shown++ < 96)
+        if (shown < 96 && ++shown)
             fprintf(stderr, "  [VSH] c[%u] = %.6g %.6g %.6g %.6g\n",
                     s_const_load, s_const[s_const_load][0],
                     s_const[s_const_load][1], s_const[s_const_load][2],
@@ -561,7 +561,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         r2 = vsh_run_decoded(in, out);
         if (r1 != r2 || (r1 && memcmp(&ref, out, sizeof ref) != 0)) {
             static unsigned told;
-            if (told++ < 16)
+            if (told < 16 && ++told)
                 fprintf(stderr, "[VSH-CHECK] decoded run differs (fields %d, decoded %d): pos %g %g %g %g vs %g %g %g %g%c",
                         r1, r2, ref.pos[0], ref.pos[1], ref.pos[2], ref.pos[3],
                         out->pos[0], out->pos[1], out->pos[2], out->pos[3], 10);

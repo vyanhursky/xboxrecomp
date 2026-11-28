@@ -879,7 +879,7 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
                                    name, "main", vk.sc_opts);
     if (shaderc_result_get_compilation_status(res) != shaderc_compilation_status_success) {
         static int told;
-        if (told++ < 6)
+        if (told < 6 && ++told)
             LOG("%s did not compile: %s", name, shaderc_result_get_error_message(res));
     } else {
         ci.codeSize = shaderc_result_get_length(res);
@@ -1136,7 +1136,7 @@ static VkPipeline pipeline_make(const PipeKey *k)
     t0 = usec_now();
     if (vkCreateGraphicsPipelines(vk.dev, vk.pcache, 1, &ci, NULL, &pipe) != VK_SUCCESS) {
         static int told;
-        if (told++ < 6)
+        if (told < 6 && ++told)
             LOG("pipeline creation failed (vs %u ps %u)", k->vs, k->ps);
         return VK_NULL_HANDLE;
     }
@@ -1478,7 +1478,7 @@ static int tex_to_rgba_in(const VkTex *t, uint8_t *dst)
         for (y = 0; y < h; y++) {
             if (!row_to_argb(fmt, src + (size_t)y * t->pitch, w, argb + (size_t)y * w)) {
                 static uint32_t told;
-                if (told++ < 8)
+                if (told < 8 && ++told)
                     LOG("texture format 0x%02X is not converted; drawn white", (unsigned)t->format);
                 memset(dst, 0xFF, (size_t)w * h * 4);
                 break;

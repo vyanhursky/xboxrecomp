@@ -302,7 +302,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * happened. This answers "did it arrive" on its own. */
         if (getenv("RECOMP_KEY_TRACE")) {
             static unsigned n;
-            if (n++ < 40) {
+            if (n < 40 && ++n) {
                 fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
                 fflush(stderr);
             }

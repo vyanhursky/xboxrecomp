@@ -664,7 +664,7 @@ static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
             uint32_t target = w & 0xFFFFFFFCu;
             if (s_sub_active || (target & 0x0FFFFFFFu) >= XBOX_CONTIG_WINDOW) {
                 static int told;
-                if (told++ < 3)
+                if (told < 3 && ++told)
                     fprintf(stderr, "  [PB] CALL 0x%08X at 0x%08X %s; skipped\n", w, va - 4,
                             s_sub_active ? "inside a subroutine" : "outside memory");
                 continue;
@@ -736,7 +736,7 @@ static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
              * on the command stream (misaligned, or in memory that is not a
              * push buffer). Where it happens is the lead. */
             static int told;
-            if (told++ < 20)
+            if (told < 20 && ++told)
                 fprintf(stderr, "  [PB] not a command: 0x%08X at 0x%08X%s\n", w, va - 4,
                         s_sub_active ? " (in a subroutine)" : "");
             if (told <= 3) {

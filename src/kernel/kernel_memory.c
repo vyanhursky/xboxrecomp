@@ -174,7 +174,7 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
         MemoryStatistics->TotalPhysicalPages = TOTAL / PAGE;               /* 16384 */
         MemoryStatistics->AvailablePages =
             used >= TOTAL ? 0 : (ULONG)((TOTAL - used) / PAGE);
-        if (logged++ < 4)
+        if (logged < 4 && ++logged)
             fprintf(stderr, "  [MM] MmQueryStatistics: %lu of %lu pages available "
                             "(image %u KB, heap %u KB, contiguous %u KB)\n",
                     (unsigned long)MemoryStatistics->AvailablePages,

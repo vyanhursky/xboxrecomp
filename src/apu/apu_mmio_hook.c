@@ -104,7 +104,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
      * wait. */
     if (apu_env_on("RECOMP_APU_TRACE")) {
         static unsigned n;
-        if (n++ < 400) {
+        if (n < 400 && ++n) {
             /* The value as well as the offset: finding which register carries
              * the command-block address means recognising the address when it
              * goes past, and an offset alone never shows it. */
@@ -143,7 +143,7 @@ bool apu_hook_handle_mmio(void *ctx, uintptr_t fault_addr,
     ok = mmio_trap_emulate(ctx, off, g_apu_state, apu_trap_read, apu_trap_write) != 0;
     if (getenv("RECOMP_APU_TRACE")) {
         static unsigned n;
-        if (n++ < 400)
+        if (n < 400 && ++n)
             fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
                     is_write ? "write" : "read ", off,
                     (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4),

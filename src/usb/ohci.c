@@ -262,7 +262,7 @@ static uint64_t ohci_read_locked(void *dev, uint32_t off, int size)
 
     if (s_trace) {
         static unsigned n;
-        if (n++ < 600)
+        if (n < 600 && ++n)
             fprintf(stderr, "  [OHCI%d] read  +0x%02X = %08X\n",
                     hc->index, off, (uint32_t)v);
     }
@@ -282,7 +282,7 @@ static void ohci_write_locked(void *dev, uint32_t off, uint64_t val, int size)
 
     if (s_trace) {
         static unsigned n;
-        if (n++ < 600)
+        if (n < 600 && ++n)
             fprintf(stderr, "  [OHCI%d] write +0x%02X = %08X\n",
                     hc->index, off, v);
     }
@@ -664,7 +664,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
 
     if (s_trace) {
         static unsigned n;
-        if (n++ < 80) {
+        if (n < 80 && ++n) {
             fprintf(stderr, "  [OHCI%d] TD %08X dp=%u ep=%u cbp=%08X be=%08X "
                             "len=%d\n", hc->index, td, dp, endpoint, cbp, be,
                     len);
@@ -787,7 +787,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
      * of the three is missing. */
     if (s_trace) {
         static unsigned n;
-        if (n++ < 60) {
+        if (n < 60 && ++n) {
             /* The buffer address as well as the length. Where the bytes
              * landed is what a watchpoint needs, and deriving it afterwards
              * from a dump of the descriptor words invites reading a physical
@@ -1162,7 +1162,7 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     claimed = ohci_call_isr(hc);
     if (s_trace || claimed >= 0) {
         static unsigned n;
-        if (n++ < 20) {
+        if (n < 20 && ++n) {
             fprintf(stderr, "  [OHCI%d] raised %08X -> ISR %s\n",
                     hc->index, source,
                     claimed < 0 ? "not callable" :

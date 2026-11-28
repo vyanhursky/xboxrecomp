@@ -4300,7 +4300,7 @@ static void bind_texture_ready(const Texture *t)
                     for (x = 0; x < w; x++)
                         fwrite(&argb[y * w + x], 4, 1, f);
                 fclose(f);
-                if (done++ < 8)
+                if (done < 8 && ++done)
                     fprintf(stderr, "  [PAL] wrote 0x%08X (%ux%u, palette 0x%08X) to %s%c",
                             t->offset, w, h, t->palette, name, 10);
             }
@@ -4327,7 +4327,7 @@ static void bind_texture_ready(const Texture *t)
     }
     {
         static int shown;
-        if (shown++ < 8)
+        if (shown < 8 && ++shown)
             fprintf(stderr, "  [GPU] palettised texture 0x%08X %ux%u expanded "
                             "through palette 0x%08X (%u entries)\n",
                     t->offset, w, h, t->palette, t->palette_len);
@@ -5022,7 +5022,7 @@ static void draw_primitive_body(void)
                  * another slot or they never arrive as an array at all, and
                  * the slot map is what separates those two. */
                 static int shown;
-                if (shown++ < 2) {
+                if (shown < 2 && ++shown) {
                     uint32_t k;
                     for (k = 0; k < NV_VERTEX_ATTRS; k++)
                         if (s_gpu.attr[k].size || s_gpu.attr[k].stride)
@@ -5038,7 +5038,7 @@ static void draw_primitive_body(void)
 
     if (pb_exec_verbose()) {
         static int shown;
-        if (shown++ < 6) {
+        if (shown < 6 && ++shown) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
                             " off 0x%08X type %u size %u stride %u\n",
                     s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
@@ -6054,7 +6054,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             exec_timing_frame(et_flip, et_sleep, et_present);
         if (pb_exec_verbose()) {
             static unsigned n;
-            if (n++ < 8) {
+            if (n < 8 && ++n) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
                         s_gpu.flips, s_gpu.flip_read, s_gpu.flip_write);
                 fflush(stderr);

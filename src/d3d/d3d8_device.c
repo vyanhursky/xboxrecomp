@@ -397,7 +397,7 @@ static LONG CALLBACK d3d11_debug_break_handler(EXCEPTION_POINTERS *ep)
         return EXCEPTION_CONTINUE_SEARCH;
     n = ID3D11InfoQueue_GetNumStoredMessages(g_info_queue);
     first = n > 6 ? n - 6 : 0;
-    if (reports++ < 8) {
+    if (reports < 8 && ++reports) {
         fprintf(stderr, "[D3D11-DEBUG] debug layer break (thread %lu); last %u of %u message(s):\n",
                 GetCurrentThreadId(), (unsigned)(n - first), (unsigned)n);
         for (i = first; i < n; i++) {
